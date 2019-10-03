@@ -1,0 +1,23 @@
+version: '3'
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2017-CU14-ubuntu
+    ports:
+      - '1433:1433'
+    environment:
+      ACCEPT_EULA: 'Y'
+      MSSQL_AGENT_ENABLED: 'true'
+      SA_PASSWORD: 'TestLocalPassword123'
+  confluent:
+    image: landoop/fast-data-dev:2.3
+    ports:
+      - '2181:2181'
+      - '3030:3030'
+      - '8081-8083:8081-8083'
+      - '9581-9585:9581-9585'
+      - '9092:9092'
+    environment:
+      RUNTESTS: '0'
+      SAMPLEDATA: '0'
+      RUNNING_SAMPLEDATA: '0'
+      ADV_HOST: '127.0.0.1'
