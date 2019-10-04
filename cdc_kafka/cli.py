@@ -8,6 +8,7 @@ import time
 from typing import List
 
 import sqlalchemy
+from tabulate import tabulate
 
 from . import kafka, tracked_tables, constants
 
@@ -33,7 +34,7 @@ def main() -> None:
 
     # Optional
     p.add_argument('--kafka-timeout-seconds',
-                   type=int, 
+                   type=int,
                    default=os.environ.get('KAFKA_TIMEOUT_SECONDS', 10),
                    help="Timeout to use when interacting with Kafka during startup for checking topic watermarks and "
                         "pulling messages to check existing progress.")
@@ -63,7 +64,7 @@ def main() -> None:
                         "data for with this tool. Tables names are specified in dot-separated 'schema_name.table_name' "
                         "form.")
 
-    p.add_argument('--topic-name-template',  
+    p.add_argument('--topic-name-template',
                    default=os.environ.get('TOPIC_NAME_TEMPLATE', '{schema_name}_{table_name}_cdc'),
                    help="Template by which the Kafka topics will be named. Uses curly braces to specify substituted "
                         "values. Values available for substitution are `schema_name`, `table_name`, and `capture_"
@@ -83,7 +84,7 @@ def main() -> None:
                         "Tables names are specified in dot-separated 'schema_name.table_name' form.")
 
     p.add_argument('--capture-instance-version-strategy',
-                   choices=('regex', 'create_date'), 
+                   choices=('regex', 'create_date'),
                    default=os.environ.get('CAPTURE_INSTANCE_VERSION_STRATEGY', 'create_date'),
                    help="If there is more than one capture instance following a given source table, how do you want to "
                         "select which one this tool reads? `create_date` (the default) will follow the one most "
@@ -96,97 +97,135 @@ def main() -> None:
                    default=os.environ.get('CAPTURE_INSTANCE_VERSION_REGEX'),
                    help="Regex to use if specifying option `regex` for argument `capture-instance-version-strategy`")
 
+    p.add_argument('--progress-topic-name',
+                   default=os.environ.get('PROGRESS_TOPIC_NAME', '_cdc_to_kafka_progress'),
+                   help="Name of the topic used to store progress details reading change tables (and also source "
+                        "tables, in the case of snapshots). This process will create the topic if it does not yet "
+                        "exist. It should have only one partition.")
+
+    p.add_argument('--disable-deletion-tombstones',
+                   action='store_true',
+                   default=bool(os.environ.get('DISABLE_DELETION_TOMBSTONES', False)),
+                   help="Name of the topic used to store progress details reading change tables (and also source "
+                        "tables, in the case of snapshots). This process will create the topic if it does not yet "
+                        "exist. It should have only one partition.")
+
     opts = p.parse_args()
 
     if not (opts.schema_registry_url and opts.kafka_bootstrap_servers and opts.db_conn_string):
         raise Exception('Arguments schema_registry_url, kafka_bootstrap_servers, and db_conn_string are all required.')
-        
+
     logger.debug('Parsed configuration: \n%s', json.dumps(vars(opts), indent=4))
 
-    with sqlalchemy.create_engine(opts.db_conn_string).connect() as db_conn, \
-            kafka.KafkaClient(opts.kafka_bootstrap_servers, opts.schema_registry_url, opts.kafka_timeout_seconds,
-                              opts.extra_kafka_consumer_config, opts.extra_kafka_producer_config) as kafka_client:
+    with kafka.KafkaClient(opts.kafka_bootstrap_servers,
+                           opts.schema_registry_url,
+                           opts.kafka_timeout_seconds,
+                           opts.progress_topic_name,
+                           tracked_tables.TrackedTable.progress_message_extractor,
+                           opts.extra_kafka_consumer_config,
+                           opts.extra_kafka_producer_config) as kafka_client, \
+            sqlalchemy.create_engine(opts.db_conn_string).connect() as db_conn:
 
-        tables = tracked_tables.build_tracked_tables_from_cdc_metadata(
-            db_conn, opts.topic_name_template, opts.table_whitelist_regex, opts.table_blacklist_regex,
-            opts.snapshot_table_whitelist_regex, opts.snapshot_table_blacklist_regex,
-            opts.capture_instance_version_strategy, opts.capture_instance_version_regex)
+        tables = tracked_tables.build_tracked_tables_from_cdc_metadata(db_conn,
+                                                                       opts.topic_name_template,
+                                                                       opts.table_whitelist_regex,
+                                                                       opts.table_blacklist_regex,
+                                                                       opts.snapshot_table_whitelist_regex,
+                                                                       opts.snapshot_table_blacklist_regex,
+                                                                       opts.capture_instance_version_strategy,
+                                                                       opts.capture_instance_version_regex)
 
         determine_start_points_and_finalize_tables(kafka_client, tables)
 
         logger.info('Beginning processing for %s tracked tables.', len(tables))
 
-        # Prioritization in this queue is based on the commit time of the change data rows pulled from SQL. It will hold
-        # one item per tracked table, which will be replaced with the next item for that table after it's pulled off.
+        # Prioritization in this queue is based on the commit time of the change data rows pulled from SQL. It will
+        # hold one entry per tracked table, which will be replaced with the next entry for that table after the
+        # current one is pulled off:
         pq = queue.PriorityQueue(len(tables))
 
         for table in tables:
-            change_time, change_index, msg_key, msg_value = table.pop_next() or (
-                datetime.datetime.now() + constants.TABLE_POLL_INTERVAL,
-                constants.BEGINNING_CHANGE_TABLE_INDEX, None, None)
-            pq.put((change_time, change_index, msg_key, msg_value, table))
+            priority, msg_key, msg_value = table.pop_next()
+            pq.put((priority, msg_key, msg_value, table))
 
-        last_log_time = datetime.datetime.now()
-        published_ctr = 0
+        last_published_counts_log_time = datetime.datetime.now()
+        published_messages_ctr = 0
 
         while True:
-            if (datetime.datetime.now() - last_log_time) > datetime.timedelta(minutes=1):
-                logger.info('Published %s change rows in the past minute.', published_ctr)
-                last_log_time = datetime.datetime.now()
-                published_ctr = 0
+            if (datetime.datetime.now() - last_published_counts_log_time) > constants.PUBLISHED_COUNTS_LOGGING_INTERVAL:
+                logger.info('Published %s change rows in the last interval.', published_messages_ctr)
+                last_published_counts_log_time = datetime.datetime.now()
+                published_messages_ctr = 0
 
-            change_time, change_index, msg_key, msg_value, table = pq.get()
+            _, msg_key, msg_value, table = pq.get()
 
             if msg_key is not None:
                 kafka_client.produce(table.topic_name, msg_key, table.key_schema, msg_value, table.value_schema)
-                published_ctr += 1
+                if msg_value['_cdc_operation'] == 'Delete' and not opts.disable_deletion_tombstones:
+                    kafka_client.produce(table.topic_name, msg_key, table.key_schema, None, table.value_schema)
+                    published_messages_ctr += 1
+                published_messages_ctr += 1
 
-            # Put the next entry for the table back on the queue:
-            change_time, change_index, msg_key, msg_value = table.pop_next() or (
-                datetime.datetime.now() + constants.TABLE_POLL_INTERVAL,
-                constants.BEGINNING_CHANGE_TABLE_INDEX, None, None)
-            pq.put((change_time, change_index, msg_key, msg_value, table))
+            # Put the next entry for the table just handled back on the priority queue:
+            priority, msg_key, msg_value = table.pop_next()
+            pq.put((priority, msg_key, msg_value, table))
 
 
 def determine_start_points_and_finalize_tables(kafka_client: kafka.KafkaClient,
                                                tables: List[tracked_tables.TrackedTable]) -> None:
     topic_names = [t.topic_name for t in tables]
 
-    last_messages_by_topic = kafka_client.get_last_messages_for_topics(topic_names)
-
+    first_check_watermarks = json.dumps(kafka_client.get_topic_watermarks(topic_names), indent=4)
     logger.info('Pausing briefly to ensure target topics are not receiving new messages from elsewhere...')
-    time.sleep(5)
+    time.sleep(constants.STABLE_WATERMARK_CHECKS_INTERVAL_SECONDS)
 
-    rechecked_last_messages = kafka_client.get_last_messages_for_topics(topic_names)
+    # This takes a little time so we'll throw it in here too to up the delay between watermark checks:
+    prior_progress = kafka_client.get_prior_progress_or_create_progress_topic()
 
-    for topic_name, rechecked_messages in rechecked_last_messages.items():
-        rechecked_offsets = {(msg.partition(), msg.offset()) for msg in rechecked_messages}
-        original_offsets = {(msg.partition(), msg.offset()) for msg in last_messages_by_topic[topic_name]}
+    second_check_watermarks = json.dumps(kafka_client.get_topic_watermarks(topic_names), indent=4)
 
-        if rechecked_offsets != original_offsets:
-            raise Exception(f'Topic {topic_name}: offsets of final messages moved between two successive checks. '
-                            f'Another process may be producing to the topic. Bailing.\nFirst check: '
-                            f'{original_offsets}\nSecond check: {rechecked_offsets}')
+    if first_check_watermarks != second_check_watermarks:
+        raise Exception(f'Watermarks for one or more target topics changed between successive checks. '
+                        f'Another process may be producing to the topic(s). Bailing.\nFirst check: '
+                        f'{first_check_watermarks}\nSecond check: {second_check_watermarks}')
 
-    logger.info('Processing will pick up from these values obtained from the last message in each topic:')
+    prior_progress_log_table_data = []
 
     for table in tables:
-        if table.topic_name in last_messages_by_topic:
-            msgs = last_messages_by_topic[table.topic_name]
+        prior_change_rows_progress = prior_progress.get((
+            ('capture_instance_name', table.capture_instance_name),
+            ('progress_kind', constants.CHANGE_ROWS_PROGRESS_KIND),
+            ('topic_name', table.topic_name)
+        ))
+        prior_snapshot_rows_progress = prior_progress.get((
+            ('capture_instance_name', table.capture_instance_name),
+            ('progress_kind', constants.SNAPSHOT_ROWS_PROGRESS_KIND),
+            ('topic_name', table.topic_name)
+        ))
 
-            lasts = [(
-                tracked_tables.ChangeTableIndex(msg.value()['_cdc_start_lsn'],
-                                                msg.value()['_cdc_seqval'],
-                                                msg.value()['_cdc_operation']),
-                msg.value()['_cdc_tran_end_time']
-            ) for msg in msgs]
+        start_change_index = prior_change_rows_progress and tracked_tables.ChangeTableIndex(
+            prior_change_rows_progress['last_published_change_table_lsn'],
+            prior_change_rows_progress['last_published_change_table_seqval'],
+            prior_change_rows_progress['last_published_change_table_operation']
+        )
+        start_snapshot_value = \
+            prior_snapshot_rows_progress and prior_snapshot_rows_progress['last_published_incrementing_column_value']
 
-            last_published_change_table_index, last_published_change_time = sorted(lasts, key=lambda x: x[0])[-1]
+        table.finalize_table(start_change_index or constants.BEGINNING_CHANGE_TABLE_INDEX, start_snapshot_value)
+
+        if table.last_read_incrementing_column_value is None:
+            snapshot_state = '<not snapshotting>'
+        elif table.last_read_incrementing_column_value <= 1:
+            snapshot_state = '<already completed>'
         else:
-            last_published_change_table_index, last_published_change_time = \
-                constants.BEGINNING_CHANGE_TABLE_INDEX, constants.BEGINNING_DATETIME
+            snapshot_state = f'From ID {table.last_read_incrementing_column_value}'
 
-        table.finalize_table(last_published_change_table_index, last_published_change_time)
+        prior_progress_log_table_data.append((table.capture_instance_name, table.fq_name, table.topic_name,
+                                              start_change_index or '<beginning>', snapshot_state))
 
-        logger.info('Capture instance %s: change table index %s, change time %s', table.capture_instance_name,
-                    last_published_change_table_index, last_published_change_time)
+    headers = ('Capture instance name', 'Source table name', 'Topic name', 'From change table index', 'Snapshots')
+    table = tabulate(prior_progress_log_table_data, headers, tablefmt='fancy_grid')
+
+    logger.info('Processing will proceed from the following positions based on the last message from each topic '
+                'and/or the snapshot progress committed in Kafka (NB: snapshot reads occur BACKWARDS from high to '
+                'low identity column values):\n%s', table)

@@ -21,3 +21,5 @@ services:
       SAMPLEDATA: '0'
       RUNNING_SAMPLEDATA: '0'
       ADV_HOST: '127.0.0.1'
+    volumes:
+      - /Users/martywoodlee/Downloads/sqljdbc_7.4/enu/mssql-jdbc-7.4.1.jre8.jar:/opt/landoop/connectors/third-party/kafka-connect-jdbc/mssql-jdbc-7.4.1.jre8.jar

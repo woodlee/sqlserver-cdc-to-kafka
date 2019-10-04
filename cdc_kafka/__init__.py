@@ -1,5 +1,4 @@
 import logging.config
-import os
 
 from .avro_from_sql import *
 from .cli import *
@@ -7,7 +6,7 @@ from .constants import *
 from .kafka import *
 from .tracked_tables import *
 
-log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
+log_level = os.getenv('LOG_LEVEL', 'DEBUG').upper()
 
 logging.config.dictConfig({
     'version': 1,
