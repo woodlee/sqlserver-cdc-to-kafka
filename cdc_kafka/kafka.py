@@ -46,7 +46,7 @@ class KafkaClient(object):
         self.producer.flush(self.kafka_timeout_seconds)
         logger.info("Done.")
 
-    delivery_success_logging_counter = 1000  # to get it to log the first success; will be every 1,000th afterwards
+    successful_delivery_counter = 0
     last_producer_poll_time = datetime.datetime.now()
 
     @staticmethod
@@ -54,11 +54,10 @@ class KafkaClient(object):
         if err is not None:
             logger.error(f'Message delivery failed for topic {msg.topic()} with error: {err}')
         else:
-            KafkaClient.delivery_success_logging_counter += 1
-            if KafkaClient.delivery_success_logging_counter >= 1000:
-                KafkaClient.delivery_success_logging_counter = 0
-                logger.debug(f'Message successfully produced to {msg.topic()}[{msg.partition()}]@{msg.offset()}. '
-                             f'(This message appears only on every 1,000th success.)')
+            KafkaClient.successful_delivery_counter += 1
+            if KafkaClient.successful_delivery_counter % 1000 == 0:
+                logger.debug(f'{KafkaClient.successful_delivery_counter} messages successfully produced to Kafka '
+                             f'so far.')
 
     def produce(self, topic: str, key: Dict[str, object], key_schema: avro.schema.RecordSchema,
                 value: Dict[str, object], value_schema: avro.schema.RecordSchema) -> None:

@@ -301,7 +301,8 @@ def build_tracked_tables_from_cdc_metadata(
             logger.debug('Table %s will NOT be snapshotted due to blacklisting', fq_table_name)
             can_snapshot = False
 
-        # ORDER BY in the SQL query ensures this means we're on to a new table:
+        # ORDER BY in the SQL query ensures this means we're on to a new table. Since we'll hit this condition
+        # for the first row we see for each table, calling `tracked_table.add_field` just below should be safe:
         if cdc_metadata_row['change_table_ordinal'] == 1:
             topic_name = topic_name_template.format(**cdc_metadata_row)
             tracked_table = TrackedTable(
