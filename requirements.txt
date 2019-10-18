@@ -4,6 +4,7 @@ backcall==0.1.0
 certifi==2019.9.11
 chardet==3.0.4
 confluent-kafka==1.1.0
+Cython==0.29.13
 decorator==4.4.0
 fastavro==0.22.5
 idna==2.8
@@ -21,6 +22,7 @@ python-dateutil==2.8.0
 requests==2.22.0
 six==1.12.0
 SQLAlchemy==1.3.8
+tabulate==0.8.5
 traitlets==4.3.2
 urllib3==1.25.6
 wcwidth==0.1.7
