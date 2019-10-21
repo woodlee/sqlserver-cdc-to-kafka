@@ -7,7 +7,7 @@ import queue
 import time
 from typing import List
 
-import sqlalchemy
+import pyodbc
 from tabulate import tabulate
 
 from . import kafka, tracked_tables, constants
@@ -21,8 +21,7 @@ def main() -> None:
     # Required
     p.add_argument('--db-conn-string',
                    default=os.environ.get('DB_CONN_STRING'),
-                   help='URL-form connection string for the DB from which you wish to consume CDC logs (see '
-                        'https://docs.sqlalchemy.org/en/13/core/engines.html#database-urls)')
+                   help='ODBC connection string for the DB from which you wish to consume CDC logs')
 
     p.add_argument('--kafka-bootstrap-servers',
                    default=os.environ.get('KAFKA_BOOTSTRAP_SERVERS'),
@@ -124,7 +123,7 @@ def main() -> None:
                            tracked_tables.TrackedTable.progress_message_extractor,
                            opts.extra_kafka_consumer_config,
                            opts.extra_kafka_producer_config) as kafka_client, \
-            sqlalchemy.create_engine(opts.db_conn_string).connect() as db_conn:
+            pyodbc.connect(opts.db_conn_string) as db_conn:
 
         tables = tracked_tables.build_tracked_tables_from_cdc_metadata(db_conn,
                                                                        opts.topic_name_template,
@@ -209,16 +208,17 @@ def determine_start_points_and_finalize_tables(kafka_client: kafka.KafkaClient,
             prior_change_rows_progress['last_published_change_table_operation']
         )
         start_snapshot_value = \
-            prior_snapshot_rows_progress and prior_snapshot_rows_progress['last_published_incrementing_column_value']
+            prior_snapshot_rows_progress and \
+            tuple(kf['value_as_string']
+                  for kf in prior_snapshot_rows_progress['last_published_snapshot_key_field_values'])
 
         table.finalize_table(start_change_index or constants.BEGINNING_CHANGE_TABLE_INDEX, start_snapshot_value)
 
-        if table.last_read_incrementing_column_value is None:
-            snapshot_state = '<not snapshotting>'
-        elif table.last_read_incrementing_column_value <= 1:
-            snapshot_state = '<already completed>'
+        if table.last_read_key_for_snapshot is None:
+            snapshot_state = 'N/A'
         else:
-            snapshot_state = f'From ID {table.last_read_incrementing_column_value}'
+            key_spec = ', '.join([f'{k}: {v}' for k, v in zip(table.key_field_names, table.last_read_key_for_snapshot)])
+            snapshot_state = f'From {key_spec}'
 
         prior_progress_log_table_data.append((table.capture_instance_name, table.fq_name, table.topic_name,
                                               start_change_index or '<beginning>', snapshot_state))

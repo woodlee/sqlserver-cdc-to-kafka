@@ -16,14 +16,14 @@ KAFKA_DELIVERY_SUCCESS_LOG_EVERY_NTH_MSG = 1000
 BEGINNING_CHANGE_TABLE_INDEX = ChangeTableIndex(b'\x00' * 10, b'\x00' * 10, 0)
 BEGINNING_DATETIME = datetime.datetime(2000, 1, 1)
 MESSAGE_KEY_FIELD_NAME_WHEN_PK_ABSENT = 'row_hash'
-AVRO_SCHEMA_NAMESPACE = 'cdc_to_kafka'
 
 # Progress tracking schema
 
+AVRO_SCHEMA_NAMESPACE = "cdc_to_kafka"
 CHANGE_ROWS_PROGRESS_KIND = "change_rows"
 SNAPSHOT_ROWS_PROGRESS_KIND = "snapshot_rows"
 PROGRESS_MESSAGE_AVRO_KEY_SCHEMA = confluent_kafka.avro.loads(json.dumps({
-    "name": f"{AVRO_SCHEMA_NAMESPACE}_progress_key",
+    "name": f"{AVRO_SCHEMA_NAMESPACE}__progress_tracking__key",
     "namespace": AVRO_SCHEMA_NAMESPACE,
     "type": "record",
     "fields": [
@@ -35,14 +35,25 @@ PROGRESS_MESSAGE_AVRO_KEY_SCHEMA = confluent_kafka.avro.loads(json.dumps({
     ]
 }))
 PROGRESS_MESSAGE_AVRO_VALUE_SCHEMA = confluent_kafka.avro.loads(json.dumps({
-    "name": f"{AVRO_SCHEMA_NAMESPACE}_progress_value",
+    "name": f"{AVRO_SCHEMA_NAMESPACE}__progress_tracking__value",
     "namespace": AVRO_SCHEMA_NAMESPACE,
     "type": "record",
     "fields": [
         {"name": "last_published_change_table_lsn", "type": ["null", "bytes"]},
         {"name": "last_published_change_table_seqval", "type": ["null", "bytes"]},
         {"name": "last_published_change_table_operation", "type": ["null", "int"]},
-        {"name": "last_published_incrementing_column_value", "type": ["null", "int"]},
+        {"name": "last_published_snapshot_key_field_values", "type": ["null", {
+            "type": "array",
+            "items": {
+                "name": "key_field_value",
+                "type": "record",
+                "fields": [
+                    {"name": "field_name", "type": "string"},
+                    {"name": "sql_type", "type": "string"},
+                    {"name": "value_as_string", "type": "string"}
+                ]
+            }
+        }]}
     ]
 }))
 
@@ -82,21 +93,27 @@ SELECT
     , ic.index_ordinal AS primary_key_ordinal
     , sc.precision AS decimal_precision
     , sc.scale AS decimal_scale
-    , sc.is_nullable AS is_nullable
-    , sc.is_identity AS is_identity
 FROM
     cdc.change_tables AS ct
     INNER JOIN cdc.captured_columns AS cc ON (ct.object_id = cc.object_id)
     LEFT JOIN cdc.index_columns AS ic ON (cc.object_id = ic.object_id AND cc.column_id = ic.column_id)
     LEFT JOIN sys.columns AS sc ON (sc.object_id = ct.source_object_id AND sc.column_id = cc.column_id)
-WHERE ct.capture_instance IN :latest_capture_instance_names
+WHERE ct.capture_instance IN (?)
 ORDER BY ct.object_id, cc.column_ordinal
 '''
 
-CDC_EARLIEST_LSN_QUERY = 'SELECT start_lsn FROM cdc.change_tables WHERE capture_instance = :capture_instance'
+CDC_EARLIEST_LSN_QUERY = 'SELECT start_lsn FROM cdc.change_tables WHERE capture_instance = ?'
+
+NBR_METADATA_COLS = 5
+
+LSN_POS = 0
+SEQVAL_POS = 1
+OPERATION_POS = 2
+UPDATE_MASK_POS = 3
+TRAN_END_TIME_POS = 4
 
 CHANGE_ROWS_QUERY_TEMPLATE = '''
-SELECT TOP :number_to_get
+SELECT TOP (?)
     ct.__$start_lsn AS _cdc_start_lsn
     , ct.__$seqval AS _cdc_seqval
     , ct.__$operation AS _cdc_operation
@@ -109,15 +126,15 @@ FROM
 WHERE
     __$operation != 3 AND
     (
-        __$start_lsn > :lsn
-        OR (__$start_lsn = :lsn AND __$seqval > :seqval)
-        OR (__$start_lsn = :lsn AND __$seqval = :seqval AND __$operation > :operation)
+        __$start_lsn > ?
+        OR (__$start_lsn = ? AND __$seqval > ?)
+        OR (__$start_lsn = ? AND __$seqval = ? AND __$operation > ?)
     )
 ORDER BY __$start_lsn, __$seqval, __$operation
 '''
 
 SNAPSHOT_ROWS_QUERY_TEMPLATE = '''
-SELECT TOP :number_to_get
+SELECT TOP (?)
     0x00000000000000000000 AS _cdc_start_lsn
     , 0x00000000000000000000 AS _cdc_seqval
     , ''' + str(SNAPSHOT_OPERATION_ID) + ''' AS _cdc_operation
@@ -126,6 +143,6 @@ SELECT TOP :number_to_get
     , {fields}
 FROM
     [{schema_name}].[{table_name}] AS ct
-WHERE [{incrementing_column}] < :increment_value
-ORDER BY [{incrementing_column}] DESC
+WHERE {where_spec} 
+ORDER BY {order_spec}
 '''

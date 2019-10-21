@@ -196,6 +196,7 @@ class KafkaClient(object):
             return
 
         key, key_schema, value, value_schema = self._progress_message_extractor(msg.topic(), orig_message_value)
+
         self._progress_messages_awaiting_commit[(tuple(key.items()), key_schema)] = (value, value_schema)
 
     def _commit_progress(self):

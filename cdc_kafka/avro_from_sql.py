@@ -35,34 +35,39 @@ def get_cdc_metadata_fields_avro_schemas(source_field_names: List[str]) -> List[
 # In CDC tables, are fields are nullable so that if the column is dropped from the source table, the capture instance
 # does not have to be updated. We align with that by making that Avro schema for all captured fields nullable.
 def avro_schema_from_sql_type(source_field_name: str, sql_type_name: str, decimal_precision: int,
-                              decimal_scale: int) -> Dict[str, object]:
+                              decimal_scale: int, make_nullable: bool) -> Dict[str, object]:
+    def maybe_null_union(avro_type):
+        if make_nullable:
+            return ["null", avro_type]
+        return avro_type
+
     if sql_type_name in ('decimal', 'numeric'):
         if not decimal_precision or not decimal_scale:
             raise Exception(
                 f"Field '{source_field_name}': For SQL decimal or numeric types, the scale and precision must be"
                 f"provided.")
-        return {"name": source_field_name, "type": ["null", {
+        return {"name": source_field_name, "type": maybe_null_union({
             "type": "bytes",
             "logicalType": "decimal",
             "precision": decimal_precision,
             "scale": decimal_scale
-        }]}
+        })}
     elif sql_type_name == 'bigint':
-        return {"name": source_field_name, "type": ["null", "long"]}
+        return {"name": source_field_name, "type": maybe_null_union("long")}
     elif sql_type_name == 'bit':
-        return {"name": source_field_name, "type": ["null", "boolean"]}
+        return {"name": source_field_name, "type": maybe_null_union("boolean")}
     elif sql_type_name == 'date':
-        return {"name": source_field_name, "type": ["null", {"type": "int", "logicalType": "date"}]}
+        return {"name": source_field_name, "type": maybe_null_union({"type": "int", "logicalType": "date"})}
     elif sql_type_name in ('int', 'smallint', 'tinyint'):
-        return {"name": source_field_name, "type": ["null", "int"]}
+        return {"name": source_field_name, "type": maybe_null_union("int")}
     elif sql_type_name in ('datetime', 'datetime2', 'char', 'nchar', 'varchar', 'ntext', 'nvarchar', 'text'):
-        return {"name": source_field_name, "type": ["null", "string"]}
+        return {"name": source_field_name, "type": maybe_null_union("string")}
     elif sql_type_name == 'time':
-        return {"name": source_field_name, "type": ["null", {"type": "int", "logicalType": "time-millis"}]}
+        return {"name": source_field_name, "type": maybe_null_union({"type": "int", "logicalType": "time-millis"})}
     elif sql_type_name == 'uniqueidentifier':
-        return {"name": source_field_name, "type": ["null", {"type": "string", "logicalType": "uuid"}]}
+        return {"name": source_field_name, "type": maybe_null_union({"type": "string", "logicalType": "uuid"})}
     elif sql_type_name in ('binary', 'image', 'varbinary'):
-        return {"name": source_field_name, "type": ["null", "bytes"]}
+        return {"name": source_field_name, "type": maybe_null_union("bytes")}
     else:
         raise Exception(f"Field '{source_field_name}': I am unsure how to convert SQL type {sql_type_name} to Avro")
 
