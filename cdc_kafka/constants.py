@@ -10,7 +10,6 @@ from .tracked_tables import ChangeTableIndex
 DB_ROW_BATCH_SIZE = 1000
 DB_TABLE_POLL_INTERVAL = datetime.timedelta(seconds=3)
 STABLE_WATERMARK_CHECKS_INTERVAL_SECONDS = 5
-PUBLISHED_COUNTS_LOGGING_INTERVAL = datetime.timedelta(seconds=60)
 PROGRESS_COMMIT_INTERVAL = datetime.timedelta(seconds=3)
 KAFKA_DELIVERY_SUCCESS_LOG_EVERY_NTH_MSG = 1000
 BEGINNING_CHANGE_TABLE_INDEX = ChangeTableIndex(b'\x00' * 10, b'\x00' * 10, 0)
@@ -104,6 +103,10 @@ ORDER BY ct.object_id, cc.column_ordinal
 '''
 
 CDC_EARLIEST_LSN_QUERY = 'SELECT start_lsn FROM cdc.change_tables WHERE capture_instance = ?'
+LAG_QUERY = '''
+SELECT TOP 1 tran_end_time, DATEDIFF(ms, tran_end_time, GETDATE()) 
+FROM cdc.lsn_time_mapping ORDER BY tran_end_time DESC
+'''
 
 CDC_METADATA_COL_COUNT = 5
 

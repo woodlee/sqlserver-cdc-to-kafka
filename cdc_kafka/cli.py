@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import importlib
 import json
 import logging
 import os
@@ -11,7 +12,7 @@ import pyodbc
 from tabulate import tabulate
 
 from cdc_kafka import validation
-from . import kafka, tracked_tables, constants
+from . import kafka, tracked_tables, constants, metric_reporters
 
 logger = logging.getLogger(__name__)
 
@@ -116,12 +117,43 @@ def main() -> None:
                    help="Runs count validations between messages in the Kafka topic and rows in the change and"
                         "source tables, then quits. Respects the table whitelist/blacklist regexes.")
 
+    p.add_argument('--sentry-dsn',
+                   default=os.environ.get('SENTRY_DSN'),
+                   help="Use sentry.io? If so, specify your DSN here and this app will report in to it.")
+
+    p.add_argument('--metric-reporters',
+                   default=os.environ.get('METRIC_REPORTERS', 'cdc_kafka.metric_reporters.stdout.StdoutReporter'),
+                   help="Comma-separated list of <modulename>.<classname>s of metric reporters you want this app to "
+                        "emit to.")
+
+    p.add_argument('--metric-reporting-interval',
+                   type=int,
+                   default=os.environ.get('METRIC_REPORTING_INTERVAL', 10),
+                   help="Interval in seconds between calls to metric reporters.")
+
     opts = p.parse_args()
 
-    if not (opts.schema_registry_url and opts.kafka_bootstrap_servers and opts.db_conn_string):
-        raise Exception('Arguments schema_registry_url, kafka_bootstrap_servers, and db_conn_string are all required.')
+    if opts.sentry_dsn:
+        import sentry_sdk
+        sentry_sdk.init(opts.sentry_dsn)
+
+    reporters = []
+    if opts.metric_reporters:
+        for class_path in opts.metric_reporters.split(','):
+            package_module, class_name = class_path.rsplit('.', 1)
+            module = importlib.import_module(package_module)
+            reporter = getattr(module, class_name)()
+            reporters.append(reporter)
+            reporter.add_arguments(p)
+
+        opts = p.parse_args()
+
+        for reporter in reporters:
+            reporter.set_options(opts)
 
     logger.debug('Parsed configuration: \n%s', json.dumps(vars(opts), indent=4))
+    if not (opts.schema_registry_url and opts.kafka_bootstrap_servers and opts.db_conn_string):
+        raise Exception('Arguments schema_registry_url, kafka_bootstrap_servers, and db_conn_string are all required.')
 
     with kafka.KafkaClient(opts.kafka_bootstrap_servers,
                            opts.schema_registry_url,
@@ -160,25 +192,32 @@ def main() -> None:
             priority_tuple, msg_key, msg_value = table.pop_next()
             pq.put((priority_tuple, msg_key, msg_value, table))
 
-        last_published_counts_log_time = datetime.datetime.now()
-        published_messages_ctr = 0
+        metrics_interval = datetime.timedelta(seconds=opts.metric_reporting_interval)
+        last_metrics_emission_time = datetime.datetime.now()
+        last_published_msg_db_time = None
+        metrics_accum = metric_reporters.MetricsAccumulator(db_conn)
 
         try:
             while True:
-                if (datetime.datetime.now() - last_published_counts_log_time) > \
-                        constants.PUBLISHED_COUNTS_LOGGING_INTERVAL:
-                    logger.info('Published %s change rows in the last interval.', published_messages_ctr)
-                    last_published_counts_log_time = datetime.datetime.now()
-                    published_messages_ctr = 0
+                if (datetime.datetime.now() - last_metrics_emission_time) > metrics_interval:
+                    metrics_accum.determine_lags(last_published_msg_db_time)
+                    for reporter in reporters:
+                        reporter.emit(metrics_accum)
+                    last_metrics_emission_time = datetime.datetime.now()
+                    metrics_accum = metric_reporters.MetricsAccumulator(db_conn)
 
-                _, msg_key, msg_value, table = pq.get()
+                priority_tuple, msg_key, msg_value, table = pq.get()
 
                 if msg_key is not None:
                     kafka_client.produce(table.topic_name, msg_key, table.key_schema, msg_value, table.value_schema)
+                    metrics_accum.record_publish += 1
+
                     if msg_value[constants.OPERATION_NAME] == 'Delete' and not opts.disable_deletion_tombstones:
                         kafka_client.produce(table.topic_name, msg_key, table.key_schema, None, table.value_schema)
-                        published_messages_ctr += 1
-                    published_messages_ctr += 1
+                        metrics_accum.tombstone_publish += 1
+
+                    if msg_value[constants.OPERATION_NAME] != 'Snapshot':
+                        last_published_msg_db_time = priority_tuple[0]
 
                 # Put the next entry for the table just handled back on the priority queue:
                 priority_tuple, msg_key, msg_value = table.pop_next()

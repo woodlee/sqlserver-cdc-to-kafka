@@ -4,7 +4,9 @@ confluent-kafka==1.2.0
 Cython==0.29.13
 fastavro==0.22.5
 ipython==7.8.0
+newrelic>=5.2.1.129
 pyodbc==4.0.27
 python-dateutil==2.8.0
 requests==2.22.0
+sentry-sdk==0.13.0
 tabulate==0.8.5
