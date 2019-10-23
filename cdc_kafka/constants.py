@@ -5,11 +5,11 @@ import confluent_kafka.avro
 
 from .tracked_tables import ChangeTableIndex
 
-# General
+# General; some of these things could be made configurable later if needed:
 
 DB_ROW_BATCH_SIZE = 1000
 DB_TABLE_POLL_INTERVAL = datetime.timedelta(seconds=3)
-STABLE_WATERMARK_CHECKS_INTERVAL_SECONDS = 1
+STABLE_WATERMARK_CHECKS_INTERVAL_SECONDS = 5
 PUBLISHED_COUNTS_LOGGING_INTERVAL = datetime.timedelta(seconds=60)
 PROGRESS_COMMIT_INTERVAL = datetime.timedelta(seconds=3)
 KAFKA_DELIVERY_SUCCESS_LOG_EVERY_NTH_MSG = 1000
@@ -22,6 +22,7 @@ MESSAGE_KEY_FIELD_NAME_WHEN_PK_ABSENT = 'row_hash'
 AVRO_SCHEMA_NAMESPACE = "cdc_to_kafka"
 CHANGE_ROWS_PROGRESS_KIND = "change_rows"
 SNAPSHOT_ROWS_PROGRESS_KIND = "snapshot_rows"
+
 PROGRESS_MESSAGE_AVRO_KEY_SCHEMA = confluent_kafka.avro.loads(json.dumps({
     "name": f"{AVRO_SCHEMA_NAMESPACE}__progress_tracking__key",
     "namespace": AVRO_SCHEMA_NAMESPACE,
@@ -104,24 +105,29 @@ ORDER BY ct.object_id, cc.column_ordinal
 
 CDC_EARLIEST_LSN_QUERY = 'SELECT start_lsn FROM cdc.change_tables WHERE capture_instance = ?'
 
-NBR_METADATA_COLS = 5
+CDC_METADATA_COL_COUNT = 5
 
 LSN_POS = 0
+LSN_NAME = '_cdc_start_lsn'
 SEQVAL_POS = 1
+SEQVAL_NAME = '_cdc_seqval'
 OPERATION_POS = 2
+OPERATION_NAME = '_cdc_operation'
 UPDATE_MASK_POS = 3
+UPDATE_MASK_NAME = '_cdc_update_mask'
 TRAN_END_TIME_POS = 4
+TRAN_END_TIME_NAME = '_cdc_tran_end_time'
 
-CHANGE_ROWS_QUERY_TEMPLATE = '''
+CHANGE_ROWS_QUERY_TEMPLATE = f'''
 SELECT TOP (?)
-    ct.__$start_lsn AS _cdc_start_lsn
-    , ct.__$seqval AS _cdc_seqval
-    , ct.__$operation AS _cdc_operation
-    , ct.__$update_mask AS _cdc_update_mask
-    , ltm.tran_end_time AS _cdc_tran_end_time
-    , {fields}
+    ct.__$start_lsn AS {LSN_NAME}
+    , ct.__$seqval AS {SEQVAL_NAME}
+    , ct.__$operation AS {OPERATION_NAME}
+    , ct.__$update_mask AS {UPDATE_MASK_NAME}
+    , ltm.tran_end_time AS {TRAN_END_TIME_NAME}
+    , {{fields}}
 FROM
-    cdc.[{capture_instance_name}_CT] AS ct WITH (NOLOCK)
+    cdc.[{{capture_instance_name}}_CT] AS ct WITH (NOLOCK)
     LEFT JOIN cdc.lsn_time_mapping AS ltm WITH (NOLOCK) ON (ct.__$start_lsn = ltm.start_lsn)
 WHERE
     __$operation != 3 AND
@@ -133,16 +139,16 @@ WHERE
 ORDER BY __$start_lsn, __$seqval, __$operation
 '''
 
-SNAPSHOT_ROWS_QUERY_TEMPLATE = '''
+SNAPSHOT_ROWS_QUERY_TEMPLATE = f'''
 SELECT TOP (?)
-    0x00000000000000000000 AS _cdc_start_lsn
-    , 0x00000000000000000000 AS _cdc_seqval
-    , ''' + str(SNAPSHOT_OPERATION_ID) + ''' AS _cdc_operation
-    , NULL AS _cdc_update_mask
-    , GETDATE() AS _cdc_tran_end_time
-    , {fields}
+    0x00000000000000000000 AS {LSN_NAME}
+    , 0x00000000000000000000 AS {SEQVAL_NAME}
+    , {SNAPSHOT_OPERATION_ID} AS {OPERATION_NAME}
+    , NULL AS {UPDATE_MASK_NAME}
+    , GETDATE() AS {TRAN_END_TIME_NAME}
+    , {{fields}}
 FROM
-    [{schema_name}].[{table_name}] AS ct
-WHERE {where_spec} 
-ORDER BY {order_spec}
+    [{{schema_name}}].[{{table_name}}] AS ct
+WHERE {{where_spec}}
+ORDER BY {{order_spec}}
 '''

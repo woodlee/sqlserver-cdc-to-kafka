@@ -6,7 +6,7 @@ This repo is currently a *work in progress* and should not be considered ready f
 
 ## Run it
 
-These scenarios presume you are using the provided `docker-compose` file, and that you have pre-provisioned and enable CDC upon a DB called `MyDbName` in the SQL Server DB.
+These scenarios presume you are using the provided `docker-compose` file, and that you have pre-provisioned and enabled CDC upon a DB called `MyTestDb` in the SQL Server DB.
 
 You will need to have [installed the Microsoft ODBC Driver for SQL Server](https://docs.microsoft.com/en-us/sql/connect/odbc/linux-mac/installing-the-microsoft-odbc-driver-for-sql-server?view=sql-server-ver15) for this to work.
 

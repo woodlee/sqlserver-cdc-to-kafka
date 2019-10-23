@@ -34,7 +34,7 @@ class KafkaClient(object):
 
         self._kafka_timeout_seconds: int = kafka_timeout_seconds
         self._progress_topic_name: str = progress_topic_name
-        self._progress_message_extractor = progress_message_extractor
+        self._progress_message_extractor: Callable = progress_message_extractor
 
         consumer_config = {
             'bootstrap.servers': bootstrap_servers,
@@ -44,7 +44,7 @@ class KafkaClient(object):
         }
         producer_config = {
             'bootstrap.servers': bootstrap_servers,
-            'linger.ms': '20',
+            'linger.ms': '100',
             'schema.registry.url': schema_registry_url
         }
         admin_config = {
@@ -77,15 +77,18 @@ class KafkaClient(object):
         self._producer = confluent_kafka.avro.AvroProducer(producer_config)
         self._admin = confluent_kafka.admin.AdminClient(admin_config)
 
-        self._cluster_metadata = self._admin.list_topics(timeout=self._kafka_timeout_seconds)
-        if self._cluster_metadata is None:
-            raise Exception(f'Cluster metadata request to Kafka at {bootstrap_servers} timed out')
+        self._refresh_cluster_metadata()
 
         self._last_progress_commit_time: datetime.datetime = datetime.datetime.now()
         self._successfully_delivered_messages_counter: int = 0
         self._progress_messages_awaiting_commit: Dict[Tuple, Tuple] = {}
 
         KafkaClient.__instance = self
+
+    def _refresh_cluster_metadata(self):
+        self._cluster_metadata = self._admin.list_topics(timeout=self._kafka_timeout_seconds)
+        if self._cluster_metadata is None:
+            raise Exception(f'Cluster metadata request to Kafka timed out')
 
     def __enter__(self):
         return self
@@ -112,6 +115,39 @@ class KafkaClient(object):
             self._commit_progress()
             self._last_progress_commit_time = datetime.datetime.now()
 
+    def consume_all(self, topic_name: str):
+        topic_metadata = self._cluster_metadata.topics.get(topic_name)
+
+        if not topic_metadata:
+            logger.warning(
+                'consume_all: Requested topic %s does not appear to existing. Returning nothing.', topic_name)
+            return
+
+        self._consumer.assign([confluent_kafka.TopicPartition(topic_name, part_id, confluent_kafka.OFFSET_BEGINNING)
+                               for part_id in topic_metadata.partitions.keys()])
+
+        finished_parts = [False] * len(topic_metadata.partitions.keys())
+        ctr = 0
+
+        while True:
+            msg = self._consumer.poll(self._kafka_timeout_seconds)
+
+            if msg is None:
+                time.sleep(1)
+                continue
+            if msg.error() and msg.error().code() == confluent_kafka.KafkaError._PARTITION_EOF:
+                finished_parts[msg.partition()] = True
+                if all(finished_parts):
+                    break
+            if msg.error():
+                raise confluent_kafka.KafkaException(msg.error())
+
+            ctr += 1
+            if ctr % 100000 == 0:
+                logger.debug('consume_all has yielded %s messages so far from topic %s', ctr, topic_name)
+
+            yield msg
+
     def get_prior_progress_or_create_progress_topic(self) -> Dict[Tuple, Dict[str, Any]]:
         result = {}
 
@@ -122,28 +158,15 @@ class KafkaClient(object):
             progress_topic = confluent_kafka.admin.NewTopic(self._progress_topic_name, 1, replication_factor,
                                                             config={'cleanup.policy': 'compact'})
             self._admin.create_topics([progress_topic])[self._progress_topic_name].result()
+            self._refresh_cluster_metadata()
             return {}
 
-        self._consumer.assign([confluent_kafka.TopicPartition(self._progress_topic_name, 0,
-                                                              confluent_kafka.OFFSET_BEGINNING)])
         progress_msg_ctr = 0
-
-        while True:
-            msg = self._consumer.poll(self._kafka_timeout_seconds)
-
-            if msg is None:
-                time.sleep(1)
-                continue
-            if msg.error() and msg.error().code() == confluent_kafka.KafkaError._PARTITION_EOF:
-                break
-            if msg.error():
-                raise confluent_kafka.KafkaException(msg.error())
-
+        for progress_msg in self.consume_all(self._progress_topic_name):
             progress_msg_ctr += 1
-
-            # Need to reform the key into a tuple of kv pairs so it can be used as a dictionary key:
-            key = tuple(sorted(msg.key().items(), key=lambda kv: kv[0]))
-            result[key] = msg.value()  # last read for a given key will win
+            # Need to reform the key into a stably-sorted tuple of kv pairs so it can be used as a dictionary key:
+            key = tuple(sorted(progress_msg.key().items(), key=lambda kv: kv[0]))
+            result[key] = progress_msg.value()  # last read for a given key will win
 
         logger.debug('Read %s prior progress messages from Kafka topic %s', progress_msg_ctr,
                      self._progress_topic_name)
@@ -196,7 +219,6 @@ class KafkaClient(object):
             return
 
         key, key_schema, value, value_schema = self._progress_message_extractor(msg.topic(), orig_message_value)
-
         self._progress_messages_awaiting_commit[(tuple(key.items()), key_schema)] = (value, value_schema)
 
     def _commit_progress(self):

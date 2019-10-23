@@ -6,7 +6,7 @@ from .constants import *
 from .kafka import *
 from .tracked_tables import *
 
-log_level = os.getenv('LOG_LEVEL', 'DEBUG').upper()
+log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
 
 logging.config.dictConfig({
     'version': 1,
