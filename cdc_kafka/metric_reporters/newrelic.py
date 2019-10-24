@@ -58,5 +58,5 @@ distributed_tracing.enabled = false
             ''')
         import newrelic.agent
         newrelic.agent.initialize('newrelic.ini')
-        self._nr_app = newrelic.agent.application(name=self._nr_app_name)
+        self._nr_app = newrelic.agent.register_application(name=self._nr_app_name)
 

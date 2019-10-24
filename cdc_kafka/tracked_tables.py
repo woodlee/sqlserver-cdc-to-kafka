@@ -77,6 +77,7 @@ class TrackedTable(object):
         self.snapshot_complete: bool = False
         self.key_schema: Union[None, avro.schema.RecordSchema] = None
         self.value_schema: Union[None, avro.schema.RecordSchema] = None
+        self.lagging: bool = False
 
         self._key_fields: Union[None, List[TrackedField]] = None
         self._key_field_names: Union[None, List[str]] = None
@@ -96,7 +97,6 @@ class TrackedTable(object):
         self._last_db_poll_time: datetime.datetime = constants.BEGINNING_DATETIME
         self._finalized: bool = False
         self._has_pk: bool = False
-        self._lagging: bool = False
 
     @property
     def last_read_key_for_snapshot_display(self):
@@ -364,7 +364,7 @@ class TrackedTable(object):
         if len(self._row_buffer) > 0:
             return
 
-        if not self._lagging and (datetime.datetime.now() - self._last_db_poll_time) < constants.DB_TABLE_POLL_INTERVAL:
+        if not self.lagging and (datetime.datetime.now() - self._last_db_poll_time) < constants.DB_TABLE_POLL_INTERVAL:
             return
 
         change_rows_read_ctr, snapshot_rows_read_ctr = 0, 0
@@ -415,7 +415,7 @@ class TrackedTable(object):
                 self._last_read_key_for_snapshot = None
                 self.snapshot_complete = True
 
-        self._lagging = change_rows_read_ctr == constants.DB_ROW_BATCH_SIZE or snapshot_rows_read_ctr
+        self.lagging = (change_rows_read_ctr == constants.DB_ROW_BATCH_SIZE) or snapshot_rows_read_ctr
 
     def _get_max_key_value(self):
         order_by_spec = ", ".join([f'{fn} DESC' for fn in self._quoted_key_field_names])

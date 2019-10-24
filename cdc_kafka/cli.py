@@ -208,7 +208,8 @@ def main() -> None:
         try:
             while True:
                 if (datetime.datetime.now() - last_metrics_emission_time) > metrics_interval:
-                    metrics_accum.determine_lags(last_published_msg_db_time)
+                    lagging = any([t.lagging for t in tables])
+                    metrics_accum.determine_lags(last_published_msg_db_time if lagging else datetime.datetime.now())
                     for reporter in reporters:
                         reporter.emit(metrics_accum)
                     last_metrics_emission_time = datetime.datetime.now()
