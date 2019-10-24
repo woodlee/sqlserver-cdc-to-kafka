@@ -12,4 +12,6 @@ RUN pip install -r requirements.txt
 
 COPY cdc_kafka cdc_kafka
 
+STOPSIGNAL SIGINT
+
 CMD ["python", "-m", "cdc_kafka"]

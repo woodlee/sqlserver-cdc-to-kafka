@@ -47,8 +47,7 @@ class NewRelicReporter(base.BaseMetricReporter):
 license_key = {self._license_key}
 app_name = {self._nr_app_name}
 monitor_mode = true
-log_level = debug
-log_file = /var/log/newrel.log
+log_level = info
 high_security = false
 error_collector.enabled = true
 error_collector.ignore_errors = false
