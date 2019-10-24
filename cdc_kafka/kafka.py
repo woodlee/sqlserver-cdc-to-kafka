@@ -26,8 +26,8 @@ class KafkaClient(object):
                  progress_message_extractor: Callable[[str, Dict[str, Any]],
                                                       Tuple[Dict[str, Any], avro.schema.RecordSchema,
                                                             Dict[str, Any], avro.schema.RecordSchema]],
-                 extra_kafka_consumer_config: List[str],
-                 extra_kafka_producer_config: List[str]):
+                 extra_kafka_consumer_config: str,
+                 extra_kafka_producer_config: str):
 
         if KafkaClient.__instance is not None:
             raise Exception('KafkaClient class should be used as a singleton.')
@@ -39,25 +39,25 @@ class KafkaClient(object):
         consumer_config = {
             'bootstrap.servers': bootstrap_servers,
             'group.id': f'cdc_to_kafka_progress_check_{socket.getfqdn()}',
-            'schema.registry.url': schema_registry_url,
             'enable.partition.eof': True
         }
         producer_config = {
             'bootstrap.servers': bootstrap_servers,
             'linger.ms': '100',
-            'schema.registry.url': schema_registry_url
         }
         admin_config = {
             'bootstrap.servers': bootstrap_servers
         }
 
-        for extra in extra_kafka_consumer_config or []:
-            k, v = extra.split(':')
-            consumer_config[k] = v
+        if extra_kafka_consumer_config:
+            for extra in extra_kafka_consumer_config.split(';'):
+                k, v = extra.split(':')
+                consumer_config[k] = v
 
-        for extra in extra_kafka_producer_config or []:
-            k, v = extra.split(':')
-            producer_config[k] = v
+        if extra_kafka_producer_config:
+            for extra in extra_kafka_producer_config.split(';'):
+                k, v = extra.split(':')
+                producer_config[k] = v
 
         logger.debug('Kafka consumer configuration: \n%s', json.dumps(consumer_config, indent=4))
         logger.debug('Kafka producer configuration: \n%s', json.dumps(producer_config, indent=4))
@@ -73,8 +73,9 @@ class KafkaClient(object):
         admin_config['throttle_cb'] = KafkaClient._log_kafka_throttle_event
         admin_config['logger'] = logger
 
-        self._consumer = confluent_kafka.avro.AvroConsumer(consumer_config)
-        self._producer = confluent_kafka.avro.AvroProducer(producer_config)
+        self._schema_registry = confluent_kafka.avro.CachedSchemaRegistryClient(schema_registry_url)
+        self._consumer = confluent_kafka.avro.AvroConsumer(consumer_config, schema_registry=self._schema_registry)
+        self._producer = confluent_kafka.avro.AvroProducer(producer_config, schema_registry=self._schema_registry)
         self._admin = confluent_kafka.admin.AdminClient(admin_config)
 
         self._refresh_cluster_metadata()
@@ -196,6 +197,13 @@ class KafkaClient(object):
                 result[topic_name].append(watermarks)
 
         return result
+
+    def register_schemas(self, topic_name, key_schema, value_schema):
+        key_subject, value_subject = topic_name + '-key', topic_name + '-value'
+        self._schema_registry.register(key_subject, key_schema)
+        self._schema_registry.register(value_subject, value_schema)
+        self._schema_registry.update_compatibility(constants.KEY_SCHEMA_COMPATIBILITY_LEVEL, key_subject)
+        self._schema_registry.update_compatibility(constants.VALUE_SCHEMA_COMPATIBILITY_LEVEL, value_subject)
 
     @staticmethod
     def _raise_kafka_error(err: confluent_kafka.KafkaError) -> None:

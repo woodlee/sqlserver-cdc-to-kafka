@@ -57,15 +57,18 @@ class TrackedField(object):
 
 
 class TrackedTable(object):
-    _registered_tables_by_kafka_topic: Dict[str, 'TrackedTable'] = {}
+    _REGISTERED_TABLES_BY_KAFKA_TOPIC: Dict[str, 'TrackedTable'] = {}
+    _DB_TIME_DELTA: Union[None, datetime.timedelta] = None
+    _DB_TIME_DELTA_LAST_REFRESH: datetime.datetime = datetime.datetime.min
 
     def __init__(self, db_conn: pyodbc.Connection, schema_name: str, table_name: str, capture_instance_name: str,
-                 topic_name: str, snapshot_allowed: bool):
+                 topic_name: str, min_lsn: bytes, snapshot_allowed: bool):
         self.db_conn: pyodbc.Connection = db_conn
         self.schema_name: str = schema_name
         self.table_name: str = table_name
         self.capture_instance_name: str = capture_instance_name
         self.topic_name: str = topic_name
+        self.min_lsn: bytes = min_lsn
         self.snapshot_allowed: bool = snapshot_allowed
 
         self.fq_name: str = f'{self.schema_name}.{self.table_name}'
@@ -105,7 +108,7 @@ class TrackedTable(object):
     def progress_message_extractor(topic_name: str, msg_value: Dict[str, Any]) -> \
             Tuple[Dict[str, Any], avro.schema.RecordSchema, Dict[str, Any], avro.schema.RecordSchema]:
 
-        table = TrackedTable._registered_tables_by_kafka_topic[topic_name]
+        table = TrackedTable._REGISTERED_TABLES_BY_KAFKA_TOPIC[topic_name]
         key = {"topic_name": topic_name, "capture_instance_name": table.capture_instance_name}
 
         if msg_value[constants.OPERATION_NAME] == constants.SNAPSHOT_OPERATION_NAME:
@@ -173,17 +176,12 @@ class TrackedTable(object):
         self._finalized = True
 
         if start_after_change_table_index.lsn > constants.BEGINNING_CHANGE_TABLE_INDEX.lsn:
-            with self.db_conn.cursor() as cursor:
-                cursor.execute(constants.CDC_EARLIEST_LSN_QUERY, self.capture_instance_name)
-                earliest_lsn_available_in_db = cursor.fetchval()
-
-            if earliest_lsn_available_in_db > start_after_change_table_index.lsn:
+            if self.min_lsn > start_after_change_table_index.lsn:
                 # TODO - this should maybe trigger a re-snapshot. For now just bail.
                 raise Exception(
                     f'The earliest change LSN available in the DB for capture instance {self.capture_instance_name} '
-                    f'(0x{earliest_lsn_available_in_db.hex()}) is later than the log position we need to start from '
-                    f'based on the prior progress stored in Kafka ((0x{start_after_change_table_index.lsn.hex()}). '
-                    f'Cannot continue.')
+                    f'(0x{self.min_lsn.hex()}) is later than the log position we need to start from based on the prior '
+                    f'progress stored in Kafka ((0x{start_after_change_table_index.lsn.hex()}). Cannot continue.')
 
         self._last_read_change_table_index = start_after_change_table_index
 
@@ -281,7 +279,7 @@ class TrackedTable(object):
                     f"key (which is required for snapshotting at this time). You can get past this error by adding"
                     f"the table to the snapshot blacklist")
 
-        TrackedTable._registered_tables_by_kafka_topic[self.topic_name] = self
+        TrackedTable._REGISTERED_TABLES_BY_KAFKA_TOPIC[self.topic_name] = self
 
     def _message_kv_from_change_row(self, change_row: Tuple) -> Tuple[Dict[str, object], Dict[str, object]]:
         meta_cols, table_cols = change_row[:constants.CDC_METADATA_COL_COUNT], \
@@ -322,11 +320,19 @@ class TrackedTable(object):
                     yield self._value_field_names[pos]
                 pos += 1
 
+    def _get_db_time(self):
+        if (datetime.datetime.now() - TrackedTable._DB_TIME_DELTA_LAST_REFRESH) > datetime.timedelta(minutes=1):
+            self._cursor.execute('SELECT GETDATE()')
+            TrackedTable._DB_TIME_DELTA = self._cursor.fetchval() - datetime.datetime.now()
+            TrackedTable._DB_TIME_DELTA_LAST_REFRESH = datetime.datetime.now()
+            logger.debug('Current DB time delta: %s', TrackedTable._DB_TIME_DELTA)
+        return datetime.datetime.now() + TrackedTable._DB_TIME_DELTA
+
     # This method's Return value is used to order results in the priority queue used to determine the sequence in
     # which rows are published.
     def _get_queue_priority_tuple(self, row) -> Tuple[datetime.datetime, bytes, bytes, int, str]:
         if row is None:
-            return (self._last_db_poll_time + constants.DB_TABLE_POLL_INTERVAL,  # defer until ready for next poll
+            return (self._get_db_time() + constants.DB_TABLE_POLL_INTERVAL,  # defer until ready for next poll
                     constants.BEGINNING_CHANGE_TABLE_INDEX.lsn,
                     constants.BEGINNING_CHANGE_TABLE_INDEX.seqval,
                     0,
@@ -438,7 +444,8 @@ def get_latest_capture_instance_names(db_conn: pyodbc.Connection, capture_instan
                 'create_date': row[2],
             }
             if capture_instance_version_regex:
-                as_dict['regex_matched_group'] = capture_instance_version_regex.match(row['capture_instance']).group(1)
+                match = capture_instance_version_regex.match(row[1])
+                as_dict['regex_matched_group'] = match and match.group(1) or ''
             table_to_capture_instances[as_dict['source_object_id']].append(as_dict)
 
     for source_id, capture_instances in table_to_capture_instances.items():
@@ -479,10 +486,10 @@ def build_tracked_tables_from_cdc_metadata(
     with db_conn.cursor() as cursor:
         cursor.execute(meta_query, latest_names)
         for row in cursor.fetchall():
-            # 0:3 gets schema name, table name, capture instance name:
-            name_to_meta_fields[tuple(row[0:3])].append(row[3:])
+            # 0:4 gets schema name, table name, capture instance name, min captured LSN:
+            name_to_meta_fields[tuple(row[0:4])].append(row[4:])
 
-    for (schema_name, table_name, capture_instance_name), fields in name_to_meta_fields.items():
+    for (schema_name, table_name, capture_instance_name, min_lsn), fields in name_to_meta_fields.items():
         fq_table_name = f'{schema_name}.{table_name}'
 
         can_snapshot = False
@@ -506,7 +513,8 @@ def build_tracked_tables_from_cdc_metadata(
         topic_name = topic_name_template.format(
             schema_name=schema_name, table_name=table_name, capture_instance_name=capture_instance_name)
 
-        tracked_table = TrackedTable(db_conn, schema_name, table_name, capture_instance_name, topic_name, can_snapshot)
+        tracked_table = TrackedTable(db_conn, schema_name, table_name, capture_instance_name, topic_name,
+                                     min_lsn, can_snapshot)
 
         for (change_table_ordinal, column_name, sql_type_name, primary_key_ordinal, decimal_precision,
              decimal_scale) in fields:

@@ -15,6 +15,8 @@ KAFKA_DELIVERY_SUCCESS_LOG_EVERY_NTH_MSG = 1000
 BEGINNING_CHANGE_TABLE_INDEX = ChangeTableIndex(b'\x00' * 10, b'\x00' * 10, 0)
 BEGINNING_DATETIME = datetime.datetime(2000, 1, 1)
 MESSAGE_KEY_FIELD_NAME_WHEN_PK_ABSENT = 'row_hash'
+KEY_SCHEMA_COMPATIBILITY_LEVEL = 'FULL'
+VALUE_SCHEMA_COMPATIBILITY_LEVEL = 'FORWARD'
 
 # Progress tracking schema
 
@@ -87,6 +89,7 @@ SELECT
     OBJECT_SCHEMA_NAME(ct.source_object_id) AS schema_name
     , OBJECT_NAME(ct.source_object_id) AS table_name
     , ct.capture_instance AS capture_instance_name
+    , ct.start_lsn AS capture_min_lsn
     , cc.column_ordinal AS change_table_ordinal
     , cc.column_name AS column_name
     , cc.column_type AS sql_type_name
@@ -102,7 +105,6 @@ WHERE ct.capture_instance IN (?)
 ORDER BY ct.object_id, cc.column_ordinal
 '''
 
-CDC_EARLIEST_LSN_QUERY = 'SELECT start_lsn FROM cdc.change_tables WHERE capture_instance = ?'
 LAG_QUERY = '''
 SELECT TOP 1 tran_end_time, DATEDIFF(ms, tran_end_time, GETDATE()) 
 FROM cdc.lsn_time_mapping ORDER BY tran_end_time DESC

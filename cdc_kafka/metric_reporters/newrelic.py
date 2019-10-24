@@ -48,6 +48,7 @@ license_key = {self._license_key}
 app_name = {self._nr_app_name}
 monitor_mode = true
 log_level = debug
+log_file = /var/log/newrel.log
 high_security = false
 error_collector.enabled = true
 error_collector.ignore_errors = false
