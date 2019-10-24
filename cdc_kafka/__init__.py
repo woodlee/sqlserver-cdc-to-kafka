@@ -1,10 +1,14 @@
 import logging.config
 
+import sentry_sdk
+
 from .avro_from_sql import *
 from .cli import *
 from .constants import *
 from .kafka import *
 from .tracked_tables import *
+
+sentry_sdk.init()
 
 log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
 

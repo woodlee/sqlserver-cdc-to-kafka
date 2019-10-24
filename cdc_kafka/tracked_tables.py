@@ -169,19 +169,28 @@ class TrackedTable(object):
 
     # 'Finalizing' mostly means doing the things we can't do until we know all of the table's fields have been added
     def finalize_table(self, start_after_change_table_index: ChangeTableIndex,
-                       start_from_key_for_snapshot: Tuple[Any]) -> None:
+                       start_from_key_for_snapshot: Tuple[Any], lsn_gap_handling: str) -> None:
         if self._finalized:
             raise Exception(f"Attempted to finalize table {self.fq_name} more than once")
 
         self._finalized = True
 
-        if start_after_change_table_index.lsn > constants.BEGINNING_CHANGE_TABLE_INDEX.lsn:
-            if self.min_lsn > start_after_change_table_index.lsn:
-                # TODO - this should maybe trigger a re-snapshot. For now just bail.
-                raise Exception(
-                    f'The earliest change LSN available in the DB for capture instance {self.capture_instance_name} '
-                    f'(0x{self.min_lsn.hex()}) is later than the log position we need to start from based on the prior '
-                    f'progress stored in Kafka ((0x{start_after_change_table_index.lsn.hex()}). Cannot continue.')
+        if constants.BEGINNING_CHANGE_TABLE_INDEX.lsn < start_after_change_table_index.lsn < self.min_lsn:
+            msg = (f'The earliest change LSN available in the DB for capture instance {self.capture_instance_name} '
+                   f'(0x{self.min_lsn.hex()}) is later than the log position we need to start from based on the prior '
+                   f'progress LSN stored in Kafka (0x{start_after_change_table_index.lsn.hex()}). ')
+
+            if lsn_gap_handling == 'ignore':
+                logger.warning(msg + 'Proceeding anyway since lsn_gap_handling is set to "ignore"!')
+            elif lsn_gap_handling == 'begin_new_snapshot':
+                if self.snapshot_allowed:
+                    start_from_key_for_snapshot = None
+                    logger.warning(msg + 'Beginning new table snapshot!')
+                else:
+                    raise Exception(msg + f'lsn_gap_handling was set to "begin_new_snapshot", but due to white/black-'
+                                    f'listing, snapshotting of table {self.fq_name} is not allowed!')
+            else:
+                raise Exception(msg + f'Cannot continue! Parameter lsn_gap_handling was set to "{lsn_gap_handling}".')
 
         self._last_read_change_table_index = start_after_change_table_index
 

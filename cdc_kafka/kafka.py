@@ -110,6 +110,9 @@ class KafkaClient(object):
                 break
             except BufferError:
                 time.sleep(1)
+            except Exception:
+                logger.error('The following exception occurred producing to topic %', topic)
+                raise
 
         if topic != self._progress_topic_name and (datetime.datetime.now() - self._last_progress_commit_time) > \
                 constants.PROGRESS_COMMIT_INTERVAL:

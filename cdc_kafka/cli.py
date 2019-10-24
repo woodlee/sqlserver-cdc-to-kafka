@@ -121,15 +121,17 @@ def main() -> None:
                         "tables, in the case of snapshots). This process will create the topic if it does not yet "
                         "exist. It should have only one partition.")
 
+    p.add_argument('--lsn-gap-handling',
+                   choices=('raise_exception', 'begin_new_snapshot', 'ignore'),
+                   default=os.environ.get('LSN_GAP_HANDLING', 'raise_exception'),
+                   help="Controls what happens if the earliest available change LSN in a capture instance is after "
+                        "the LSN of the latest change published to Kafka.")
+
     p.add_argument('--run-validations',
                    type=str2bool, nargs='?', const=True,
                    default=str2bool(os.environ.get('RUN_VALIDATIONS', False)),
                    help="Runs count validations between messages in the Kafka topic and rows in the change and"
                         "source tables, then quits. Respects the table whitelist/blacklist regexes.")
-
-    p.add_argument('--sentry-dsn',
-                   default=os.environ.get('SENTRY_DSN'),
-                   help="Use sentry.io? If so, specify your DSN here and this app will report in to it.")
 
     p.add_argument('--metric-reporters',
                    default=os.environ.get('METRIC_REPORTERS', 'cdc_kafka.metric_reporters.stdout.StdoutReporter'),
@@ -138,14 +140,10 @@ def main() -> None:
 
     p.add_argument('--metric-reporting-interval',
                    type=int,
-                   default=os.environ.get('METRIC_REPORTING_INTERVAL', 10),
+                   default=os.environ.get('METRIC_REPORTING_INTERVAL', 15),
                    help="Interval in seconds between calls to metric reporters.")
 
     opts = p.parse_args()
-
-    if opts.sentry_dsn:
-        import sentry_sdk
-        sentry_sdk.init(opts.sentry_dsn)
 
     reporters = []
     if opts.metric_reporters:
@@ -184,7 +182,7 @@ def main() -> None:
                                                                        opts.capture_instance_version_regex)
 
         determine_start_points_and_finalize_tables(
-            kafka_client, tables, skip_stable_watermark_checks=opts.run_validations)
+            kafka_client, tables, opts.lsn_gap_handling, opts.run_validations)
 
         if opts.run_validations:
             validator = validation.Validator(kafka_client, db_conn, tables)
@@ -239,24 +237,28 @@ def main() -> None:
 
 def determine_start_points_and_finalize_tables(kafka_client: kafka.KafkaClient,
                                                tables: List[tracked_tables.TrackedTable],
-                                               skip_stable_watermark_checks: bool = False) -> None:
+                                               lsn_gap_handling: str, validation_mode: bool = False) -> None:
     topic_names = [t.topic_name for t in tables]
 
-    watermarks_by_topic = {}
-    if not skip_stable_watermark_checks:
-        watermarks_by_topic = kafka_client.get_topic_watermarks(topic_names)
-        first_check_watermarks_json = json.dumps(watermarks_by_topic, indent=4)
+    if validation_mode:
+        for table in tables:
+            table.snapshot_allowed = False
+            table.finalize_table(constants.BEGINNING_CHANGE_TABLE_INDEX, (None,), lsn_gap_handling)
+        return
 
-        logger.info('Pausing briefly to ensure target topics are not receiving new messages from elsewhere...')
-        time.sleep(constants.STABLE_WATERMARK_CHECKS_INTERVAL_SECONDS)
+    watermarks_by_topic = kafka_client.get_topic_watermarks(topic_names)
+    first_check_watermarks_json = json.dumps(watermarks_by_topic, indent=4)
 
-        watermarks_by_topic = kafka_client.get_topic_watermarks(topic_names)
-        second_check_watermarks_json = json.dumps(watermarks_by_topic, indent=4)
+    logger.info('Pausing briefly to ensure target topics are not receiving new messages from elsewhere...')
+    time.sleep(constants.STABLE_WATERMARK_CHECKS_INTERVAL_SECONDS)
 
-        if first_check_watermarks_json != second_check_watermarks_json:
-            raise Exception(f'Watermarks for one or more target topics changed between successive checks. '
-                            f'Another process may be producing to the topic(s). Bailing.\nFirst check: '
-                            f'{first_check_watermarks_json}\nSecond check: {second_check_watermarks_json}')
+    watermarks_by_topic = kafka_client.get_topic_watermarks(topic_names)
+    second_check_watermarks_json = json.dumps(watermarks_by_topic, indent=4)
+
+    if first_check_watermarks_json != second_check_watermarks_json:
+        raise Exception(f'Watermarks for one or more target topics changed between successive checks. '
+                        f'Another process may be producing to the topic(s). Bailing.\nFirst check: '
+                        f'{first_check_watermarks_json}\nSecond check: {second_check_watermarks_json}')
 
     prior_progress = kafka_client.get_prior_progress_or_create_progress_topic()
     prior_progress_log_table_data = []
@@ -283,7 +285,8 @@ def determine_start_points_and_finalize_tables(kafka_client: kafka.KafkaClient,
             tuple(kf['value_as_string']
                   for kf in prior_snapshot_rows_progress['last_published_snapshot_key_field_values'])
 
-        table.finalize_table(start_change_index or constants.BEGINNING_CHANGE_TABLE_INDEX, start_snapshot_value)
+        table.finalize_table(start_change_index or constants.BEGINNING_CHANGE_TABLE_INDEX,
+                             start_snapshot_value, lsn_gap_handling)
 
         if watermarks_by_topic.get(table.topic_name):
             format_table_name = table.topic_name
