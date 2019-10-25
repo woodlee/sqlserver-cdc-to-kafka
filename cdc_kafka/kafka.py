@@ -210,7 +210,11 @@ class KafkaClient(object):
 
     @staticmethod
     def _raise_kafka_error(err: confluent_kafka.KafkaError) -> None:
-        raise confluent_kafka.KafkaException(err)
+        if err.fatal():
+            raise confluent_kafka.KafkaException(err)
+        else:
+            logger.warning("librdkafka raised a non-fatal error: code - %s, name - %s, msg - %s",
+                           err.code(), err.name(), err.str())
 
     @staticmethod
     def _log_kafka_throttle_event(evt: confluent_kafka.ThrottleEvent) -> None:
