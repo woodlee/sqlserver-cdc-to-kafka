@@ -289,12 +289,15 @@ def determine_start_points_and_finalize_tables(kafka_client: kafka.KafkaClient,
         table.finalize_table(start_change_index or constants.BEGINNING_CHANGE_TABLE_INDEX,
                              start_snapshot_value, lsn_gap_handling)
 
-        if watermarks_by_topic.get(table.topic_name):
-            format_table_name = table.topic_name
-        else:
-            # We are creating the topic; register schemas and set their compatibility levels:
+        if table.topic_name not in watermarks_by_topic:
+            logger.info('Registering schemas for to-be-created topic %s with key and value schema compatibility '
+                        'levels %s and %s respectively', table.topic_name, constants.KEY_SCHEMA_COMPATIBILITY_LEVEL,
+                        constants.VALUE_SCHEMA_COMPATIBILITY_LEVEL)
             kafka_client.register_schemas(table.topic_name, table.key_schema, table.value_schema)
-            format_table_name = f'{table.topic_name} (CREATING)'
+            # some older versions of the Confluent schema registry have a bug that leads to duplicate schema IDs in
+            # some circumstances; delay a bit on this one-time operation to give it a chance to become consistent
+            # (see https://github.com/confluentinc/schema-registry/pull/1003 and linked issues for context):
+            time.sleep(3)
 
         if not table.snapshot_allowed:
             snapshot_state = '<not doing>'
@@ -305,7 +308,7 @@ def determine_start_points_and_finalize_tables(kafka_client: kafka.KafkaClient,
         else:
             snapshot_state = f'From {table.last_read_key_for_snapshot_display}'
 
-        prior_progress_log_table_data.append((table.capture_instance_name, table.fq_name, format_table_name,
+        prior_progress_log_table_data.append((table.capture_instance_name, table.fq_name, table.topic_name,
                                               start_change_index or '<from beginning>', snapshot_state))
 
     headers = ('Capture instance name', 'Source table name', 'Topic name', 'From change table index', 'Snapshots')
