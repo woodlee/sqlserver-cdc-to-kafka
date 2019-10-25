@@ -97,7 +97,7 @@ class KafkaClient(object):
     def __exit__(self, exc_type, value, traceback):
         logger.info("Committing progress and cleaning up Kafka resources...")
         self._consumer.close()
-        self._commit_progress()
+        self._commit_progress(True)
         logger.info("Done.")
 
     def produce(self, topic: str, key: Dict[str, Any], key_schema: avro.schema.RecordSchema,
@@ -232,11 +232,15 @@ class KafkaClient(object):
         key, key_schema, value, value_schema = self._progress_message_extractor(msg.topic(), orig_message_value)
         self._progress_messages_awaiting_commit[(tuple(key.items()), key_schema)] = (value, value_schema)
 
-    def _commit_progress(self):
-        self._producer.flush(self._kafka_timeout_seconds)  # triggers the _delivery_callback
+    def _commit_progress(self, final=False):
+        start_time = time.perf_counter()
+        self._producer.flush(30 if final else 0.1)  # triggers the _delivery_callback
 
         for (key_kvs, key_schema), (value, value_schema) in self._progress_messages_awaiting_commit.items():
             self.produce(self._progress_topic_name, dict(key_kvs), key_schema, value, value_schema)
 
-        self._producer.flush(self._kafka_timeout_seconds)
+        if final:
+            self._producer.flush(30)
+
         self._progress_messages_awaiting_commit = {}
+        logger.debug('_commit_progress took %s ms', (time.perf_counter() - start_time) * 1000)

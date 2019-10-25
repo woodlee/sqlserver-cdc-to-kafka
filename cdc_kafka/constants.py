@@ -10,7 +10,7 @@ from .tracked_tables import ChangeTableIndex
 DB_ROW_BATCH_SIZE = 1000
 DB_TABLE_POLL_INTERVAL = datetime.timedelta(seconds=3)
 STABLE_WATERMARK_CHECKS_INTERVAL_SECONDS = 5
-PROGRESS_COMMIT_INTERVAL = datetime.timedelta(seconds=3)
+PROGRESS_COMMIT_INTERVAL = datetime.timedelta(seconds=5)
 KAFKA_DELIVERY_SUCCESS_LOG_EVERY_NTH_MSG = 1000
 BEGINNING_CHANGE_TABLE_INDEX = ChangeTableIndex(b'\x00' * 10, b'\x00' * 10, 0)
 BEGINNING_DATETIME = datetime.datetime(2000, 1, 1)

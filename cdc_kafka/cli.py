@@ -204,8 +204,11 @@ def main() -> None:
         last_metrics_emission_time = datetime.datetime.now()
         last_published_msg_db_time = None
         metrics_accum = metric_reporters.MetricsAccumulator(db_conn)
+        loop_entry_time = time.perf_counter()
+        pop_time_total, produce_time_total, publish_count = 0.0, 0.0, 0
 
         try:
+
             while True:
                 if (datetime.datetime.now() - last_metrics_emission_time) > metrics_interval:
                     lagging = any([t.lagging for t in tables])
@@ -214,22 +217,34 @@ def main() -> None:
                         reporter.emit(metrics_accum)
                     last_metrics_emission_time = datetime.datetime.now()
                     metrics_accum = metric_reporters.MetricsAccumulator(db_conn)
+                    total_time = time.perf_counter() - loop_entry_time
+                    logger.debug('Timings per msg: overall - %s ms, DB (pop) - %s ms, Kafka (produce/commit) - %s ms',
+                                 total_time / publish_count * 1000, pop_time_total / publish_count * 1000,
+                                 produce_time_total / publish_count * 1000)
 
                 priority_tuple, msg_key, msg_value, table = pq.get()
 
                 if msg_key is not None:
+                    start_time = time.perf_counter()
                     kafka_client.produce(table.topic_name, msg_key, table.key_schema, msg_value, table.value_schema)
+                    produce_time_total += (time.perf_counter() - start_time)
+                    publish_count += 1
                     metrics_accum.record_publish += 1
 
                     if msg_value[constants.OPERATION_NAME] == 'Delete' and not opts.disable_deletion_tombstones:
+                        start_time = time.perf_counter()
                         kafka_client.produce(table.topic_name, msg_key, table.key_schema, None, table.value_schema)
+                        produce_time_total += (time.perf_counter() - start_time)
+                        publish_count += 1
                         metrics_accum.tombstone_publish += 1
 
                     if msg_value[constants.OPERATION_NAME] != 'Snapshot':
                         last_published_msg_db_time = priority_tuple[0]
 
                 # Put the next entry for the table just handled back on the priority queue:
+                start_time = time.perf_counter()
                 priority_tuple, msg_key, msg_value = table.pop_next()
+                pop_time_total += (time.perf_counter() - start_time)
                 pq.put((priority_tuple, msg_key, msg_value, table))
         except KeyboardInterrupt:
             logger.info('Exiting due to external interrupt.')
