@@ -221,22 +221,20 @@ def main() -> None:
         last_metrics_emission_time = datetime.datetime.now()
         last_published_msg_db_time = None
         metrics_accum = metric_reporters.MetricsAccumulator(db_conn)
-        loop_entry_time = time.perf_counter()
         pop_time_total, produce_time_total, publish_count = 0.0, 0.0, 0
 
         try:
 
             while True:
                 if (datetime.datetime.now() - last_metrics_emission_time) > metrics_interval:
-                    metrics_accum.determine_lags(last_published_msg_db_time)
+                    metrics_accum.determine_lags(last_published_msg_db_time, any([t.lagging for t in tables]))
                     for reporter in reporters:
                         reporter.emit(metrics_accum)
                     last_metrics_emission_time = datetime.datetime.now()
                     metrics_accum = metric_reporters.MetricsAccumulator(db_conn)
-                    total_time = time.perf_counter() - loop_entry_time
                     logger.debug('Timings per msg: overall - %s us, DB (pop) - %s us, Kafka (produce/commit) - %s us',
-                                 total_time / publish_count * 1000000, pop_time_total / publish_count * 1000000,
-                                 produce_time_total / publish_count * 1000000)
+                                 int(pop_time_total / publish_count * 1000000),
+                                 int(produce_time_total / publish_count * 1000000))
 
                 priority_tuple, msg_key, msg_value, table = pq.get()
 
