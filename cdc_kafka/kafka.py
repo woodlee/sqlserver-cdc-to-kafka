@@ -232,14 +232,14 @@ class KafkaClient(object):
         registered = False
 
         key_schema_id, current_key_schema, _ = self._schema_registry.get_latest_schema(key_subject)
-        if current_key_schema != key_schema:
+        if current_key_schema is None or current_key_schema != key_schema:
             logger.info('Key schema for subject %s does not exist or is outdated; registering now.', key_subject)
             key_schema_id = self._schema_registry.register(key_subject, key_schema)
             self._schema_registry.update_compatibility(constants.KEY_SCHEMA_COMPATIBILITY_LEVEL, key_subject)
             registered = True
 
         value_schema_id, current_value_schema, _ = self._schema_registry.get_latest_schema(value_subject)
-        if current_value_schema != value_schema:
+        if current_value_schema is None or current_value_schema != value_schema:
             logger.info('Value schema for subject %s does not exist or is outdated; registering now.', value_subject)
             value_schema_id = self._schema_registry.register(key_subject, value_schema)
             self._schema_registry.update_compatibility(constants.VALUE_SCHEMA_COMPATIBILITY_LEVEL, value_subject)
