@@ -3,7 +3,6 @@ import logging
 
 from . import accumulator, base
 
-
 logger = logging.getLogger(__name__)
 
 

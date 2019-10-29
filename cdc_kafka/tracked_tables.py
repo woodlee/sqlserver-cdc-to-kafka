@@ -193,7 +193,7 @@ class TrackedTable(object):
                     logger.warning(msg + 'Beginning new table snapshot!')
                 else:
                     raise Exception(msg + f'lsn_gap_handling was set to "begin_new_snapshot", but due to white/black-'
-                                    f'listing, snapshotting of table {self.fq_name} is not allowed!')
+                                          f'listing, snapshotting of table {self.fq_name} is not allowed!')
             else:
                 raise Exception(msg + f'Cannot continue! Parameter lsn_gap_handling was set to "{lsn_gap_handling}".')
 

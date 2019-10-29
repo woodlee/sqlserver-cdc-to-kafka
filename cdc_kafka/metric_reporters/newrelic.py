@@ -6,7 +6,6 @@ import newrelic.agent
 
 from . import accumulator, base
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -58,4 +57,3 @@ distributed_tracing.enabled = false
         import newrelic.agent
         newrelic.agent.initialize('newrelic.ini')
         self._nr_app = newrelic.agent.register_application(name=self._nr_app_name)
-

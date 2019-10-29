@@ -276,19 +276,19 @@ def determine_start_points_and_finalize_tables(
             table.finalize_table(constants.BEGINNING_CHANGE_TABLE_INDEX, (None,), lsn_gap_handling, None)
         return
 
-    # watermarks_by_topic = kafka_client.get_topic_watermarks(topic_names)
-    # first_check_watermarks_json = json.dumps(watermarks_by_topic, indent=4)
-    #
-    # logger.info('Pausing briefly to ensure target topics are not receiving new messages from elsewhere...')
-    # time.sleep(constants.STABLE_WATERMARK_CHECKS_INTERVAL_SECONDS)
-    #
-    # watermarks_by_topic = kafka_client.get_topic_watermarks(topic_names)
-    # second_check_watermarks_json = json.dumps(watermarks_by_topic, indent=4)
-    #
-    # if first_check_watermarks_json != second_check_watermarks_json:
-    #     raise Exception(f'Watermarks for one or more target topics changed between successive checks. '
-    #                     f'Another process may be producing to the topic(s). Bailing.\nFirst check: '
-    #                     f'{first_check_watermarks_json}\nSecond check: {second_check_watermarks_json}')
+    watermarks_by_topic = kafka_client.get_topic_watermarks(topic_names)
+    first_check_watermarks_json = json.dumps(watermarks_by_topic, indent=4)
+
+    logger.info('Pausing briefly to ensure target topics are not receiving new messages from elsewhere...')
+    time.sleep(constants.STABLE_WATERMARK_CHECKS_INTERVAL_SECONDS)
+
+    watermarks_by_topic = kafka_client.get_topic_watermarks(topic_names)
+    second_check_watermarks_json = json.dumps(watermarks_by_topic, indent=4)
+
+    if first_check_watermarks_json != second_check_watermarks_json:
+        raise Exception(f'Watermarks for one or more target topics changed between successive checks. '
+                        f'Another process may be producing to the topic(s). Bailing.\nFirst check: '
+                        f'{first_check_watermarks_json}\nSecond check: {second_check_watermarks_json}')
 
     prior_progress = kafka_client.get_prior_progress_or_create_progress_topic()
     prior_progress_log_table_data = []
@@ -318,9 +318,9 @@ def determine_start_points_and_finalize_tables(
         table.finalize_table(start_change_index or constants.BEGINNING_CHANGE_TABLE_INDEX,
                              start_snapshot_value, lsn_gap_handling, kafka_client.register_schemas)
 
-        # if table.topic_name not in watermarks_by_topic:
-        #     logger.info('Creating topic %s', table.topic_name)
-        #     kafka_client.create_topic(table.topic_name, partition_count, replication_factor, extra_topic_config)
+        if table.topic_name not in watermarks_by_topic:
+            logger.info('Creating topic %s', table.topic_name)
+            kafka_client.create_topic(table.topic_name, partition_count, replication_factor, extra_topic_config)
 
         if not table.snapshot_allowed:
             snapshot_state = '<not doing>'
