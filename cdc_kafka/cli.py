@@ -232,7 +232,7 @@ def main() -> None:
                         reporter.emit(metrics_accum)
                     last_metrics_emission_time = datetime.datetime.now()
                     metrics_accum = metric_reporters.MetricsAccumulator(db_conn)
-                    logger.debug('Timings per msg: overall - %s us, DB (pop) - %s us, Kafka (produce/commit) - %s us',
+                    logger.debug('Timings per msg: DB (pop) - %s us, Kafka (produce/commit) - %s us',
                                  int(pop_time_total / publish_count * 1000000),
                                  int(produce_time_total / publish_count * 1000000))
 
