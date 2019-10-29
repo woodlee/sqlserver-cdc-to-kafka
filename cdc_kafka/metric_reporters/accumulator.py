@@ -16,10 +16,7 @@ class MetricsAccumulator(object):
 
     def determine_lags(self, last_published_msg_db_time: datetime.datetime):
         self._cursor.execute(constants.LAG_QUERY)
-        latest_cdc, db_lag = self._cursor.fetchone()
-        self.cdc_lag_behind_now_ms = db_lag
-        if not last_published_msg_db_time:
-            self.app_lag_behind_cdc_ms = None
-        else:
-            app_lag = (latest_cdc - last_published_msg_db_time).total_seconds() * 1000
-            self.app_lag_behind_cdc_ms = max(app_lag, 0.0)
+        latest_cdc_tran_end_time, db_lag_ms = self._cursor.fetchone()
+        self.cdc_lag_behind_now_ms = db_lag_ms
+        app_lag_ms = (latest_cdc_tran_end_time - last_published_msg_db_time).total_seconds() * 1000
+        self.app_lag_behind_cdc_ms = max(app_lag_ms, 0.0)

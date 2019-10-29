@@ -77,6 +77,8 @@ class TrackedTable(object):
         self.snapshot_complete: bool = False
         self.key_schema: Union[None, avro.schema.RecordSchema] = None
         self.value_schema: Union[None, avro.schema.RecordSchema] = None
+        self.key_schema_id: Union[None, int] = None
+        self.value_schema_id: Union[None, int] = None
         self.lagging: bool = False
 
         self._key_fields: Union[None, List[TrackedField]] = None
@@ -168,8 +170,11 @@ class TrackedTable(object):
             return delete, insert, update
 
     # 'Finalizing' mostly means doing the things we can't do until we know all of the table's fields have been added
-    def finalize_table(self, start_after_change_table_index: ChangeTableIndex,
-                       start_from_key_for_snapshot: Tuple[Any], lsn_gap_handling: str) -> None:
+    def finalize_table(
+            self, start_after_change_table_index: ChangeTableIndex, start_from_key_for_snapshot: Tuple[Any],
+            lsn_gap_handling: str, schema_id_getter: Callable[[str, avro.schema.RecordSchema, avro.schema.RecordSchema],
+                                                              Tuple[int, int]] = None) -> None:
+
         if self._finalized:
             raise Exception(f"Attempted to finalize table {self.fq_name} more than once")
 
@@ -228,6 +233,10 @@ class TrackedTable(object):
             "type": "record",
             "fields": value_fields_plus_metadata_fields
         }))
+
+        if schema_id_getter:
+            self.key_schema_id, self.value_schema_id = schema_id_getter(
+                self.topic_name, self.key_schema, self.value_schema)
 
         select_column_specs = ', '.join([f'ct.[{f}]' for f in self._value_field_names])
 
@@ -347,13 +356,6 @@ class TrackedTable(object):
                     0,
                     self.fq_name)
 
-        if row[constants.OPERATION_POS] == constants.SNAPSHOT_OPERATION_ID:
-            return (row[constants.TRAN_END_TIME_POS],  # for snapshot rows this is just GETDATE() from that query
-                    constants.BEGINNING_CHANGE_TABLE_INDEX.lsn,
-                    constants.BEGINNING_CHANGE_TABLE_INDEX.seqval,
-                    constants.SNAPSHOT_OPERATION_ID,
-                    self.fq_name)
-
         return (row[constants.TRAN_END_TIME_POS],
                 row[constants.LSN_POS],
                 row[constants.SEQVAL_POS],
@@ -389,7 +391,9 @@ class TrackedTable(object):
             self._last_read_change_table_index = ChangeTableIndex(
                 change_row[constants.LSN_POS], change_row[constants.SEQVAL_POS], change_row[constants.OPERATION_POS])
 
-        if self.snapshot_allowed and not self.snapshot_complete:
+        self.lagging = change_rows_read_ctr == constants.DB_ROW_BATCH_SIZE
+
+        if self.snapshot_allowed and not self.snapshot_complete and not self.lagging:
             snapshot_query_params = [constants.DB_ROW_BATCH_SIZE]
             logger.debug('Polling DB for snapshot rows from %s', self.fq_name)
 
@@ -414,8 +418,6 @@ class TrackedTable(object):
                     [f'{k}: {v}' for k, v in zip(self._key_field_names, self._last_read_key_for_snapshot)]))
                 self._last_read_key_for_snapshot = None
                 self.snapshot_complete = True
-
-        self.lagging = (change_rows_read_ctr == constants.DB_ROW_BATCH_SIZE) or snapshot_rows_read_ctr
 
     def _get_max_key_value(self):
         order_by_spec = ", ".join([f'{fn} DESC' for fn in self._quoted_key_field_names])

@@ -43,7 +43,10 @@ class KafkaClient(object):
         }
         producer_config = {
             'bootstrap.servers': bootstrap_servers,
-            'linger.ms': '100',
+            'linger.ms': '50',
+            'enable.idempotence': True,
+            'enable.gapless.guarantee': True,
+            'compression.codec': 'snappy'
         }
         admin_config = {
             'bootstrap.servers': bootstrap_servers
@@ -74,8 +77,9 @@ class KafkaClient(object):
         admin_config['logger'] = logger
 
         self._schema_registry = confluent_kafka.avro.CachedSchemaRegistryClient(schema_registry_url)
+        self._serializer = confluent_kafka.avro.MessageSerializer(self._schema_registry)
         self._consumer = confluent_kafka.avro.AvroConsumer(consumer_config, schema_registry=self._schema_registry)
-        self._producer = confluent_kafka.avro.AvroProducer(producer_config, schema_registry=self._schema_registry)
+        self._producer = confluent_kafka.Producer(producer_config)
         self._admin = confluent_kafka.admin.AdminClient(admin_config)
 
         self._refresh_cluster_metadata()
@@ -83,6 +87,12 @@ class KafkaClient(object):
         self._last_progress_commit_time: datetime.datetime = datetime.datetime.now()
         self._successfully_delivered_messages_counter: int = 0
         self._progress_messages_awaiting_commit: Dict[Tuple, Tuple] = {}
+
+        k_id, v_id = self.register_schemas(
+            self._progress_topic_name, constants.PROGRESS_MESSAGE_AVRO_KEY_SCHEMA,
+            constants.PROGRESS_MESSAGE_AVRO_VALUE_SCHEMA)
+        self._progress_key_schema_id: int = k_id
+        self._progress_value_schema_id: int = v_id
 
         KafkaClient.__instance = self
 
@@ -100,16 +110,18 @@ class KafkaClient(object):
         self._commit_progress(True)
         logger.info("Done.")
 
-    def produce(self, topic: str, key: Dict[str, Any], key_schema: avro.schema.RecordSchema,
-                value: Union[None, Dict[str, Any]], value_schema: avro.schema.RecordSchema) -> None:
+    def produce(self, topic: str, key: Dict[str, Any], key_schema_id: int, value: Union[None, Dict[str, Any]],
+                value_schema_id: int) -> None:
         while True:
             try:
-                self._producer.produce(topic=topic, key=key, key_schema=key_schema, value=value,
-                                       value_schema=value_schema,
+                key_ser = self._serializer.encode_record_with_schema_id(key_schema_id, key, True)
+                value_ser = self._serializer.encode_record_with_schema_id(value_schema_id, value, False)
+                self._producer.produce(topic=topic, value=value_ser, key=key_ser,
                                        callback=lambda err, msg: self._delivery_callback(err, msg, value))
                 break
             except BufferError:
                 time.sleep(1)
+                logger.debug('Sleeping due to Kafka producer buffer being full...')
             except Exception:
                 logger.error('The following exception occurred producing to topic %', topic)
                 raise
@@ -152,17 +164,30 @@ class KafkaClient(object):
 
             yield msg
 
+    def create_topic(self, topic_name: str, partition_count: int, replication_factor: int = None,
+                     extra_config: str = None):
+        if not replication_factor:
+            replication_factor = min(len(self._cluster_metadata.brokers), 3)
+
+        topic_config = {'cleanup.policy': 'compact'}
+
+        if extra_config:
+            for extra in extra_config.split(';'):
+                k, v = extra.split(':')
+                topic_config[k] = v
+
+        logger.debug('Kafka topic configuration for %s: \n%s', topic_name, json.dumps(topic_config, indent=4))
+        topic = confluent_kafka.admin.NewTopic(topic_name, partition_count, replication_factor, config=topic_config)
+        self._admin.create_topics([topic])[topic_name].result()
+        self._refresh_cluster_metadata()
+
     def get_prior_progress_or_create_progress_topic(self) -> Dict[Tuple, Dict[str, Any]]:
         result = {}
 
         if self._progress_topic_name not in self._cluster_metadata.topics:
             logger.warning('No existing snapshot progress storage topic found; creating topic %s',
                            self._progress_topic_name)
-            replication_factor = min(len(self._cluster_metadata.brokers), 3)
-            progress_topic = confluent_kafka.admin.NewTopic(self._progress_topic_name, 1, replication_factor,
-                                                            config={'cleanup.policy': 'compact'})
-            self._admin.create_topics([progress_topic])[self._progress_topic_name].result()
-            self._refresh_cluster_metadata()
+            self.create_topic(self._progress_topic_name, 1)
             return {}
 
         progress_msg_ctr = 0
@@ -195,18 +220,39 @@ class KafkaClient(object):
                 watermarks = self._consumer.get_watermark_offsets(
                     confluent_kafka.TopicPartition(topic_name, partition_ix), timeout=self._kafka_timeout_seconds)
                 if watermarks is None:
-                    raise Exception(f'Timeout request watermark offsets from Kafka for topic {topic_name}, '
+                    raise Exception(f'Timeout requesting watermark offsets from Kafka for topic {topic_name}, '
                                     f'partition {partition_ix}')
                 result[topic_name].append(watermarks)
 
         return result
 
-    def register_schemas(self, topic_name, key_schema, value_schema):
+    def register_schemas(self, topic_name: str, key_schema: avro.schema.RecordSchema,
+                         value_schema: avro.schema.RecordSchema) -> Tuple[int, int]:
         key_subject, value_subject = topic_name + '-key', topic_name + '-value'
-        self._schema_registry.register(key_subject, key_schema)
-        self._schema_registry.register(value_subject, value_schema)
-        self._schema_registry.update_compatibility(constants.KEY_SCHEMA_COMPATIBILITY_LEVEL, key_subject)
-        self._schema_registry.update_compatibility(constants.VALUE_SCHEMA_COMPATIBILITY_LEVEL, value_subject)
+        registered = False
+
+        key_schema_id, current_key_schema, _ = self._schema_registry.get_latest_schema(key_subject)
+        if current_key_schema != key_schema:
+            logger.info('Key schema for subject %s does not exist or is outdated; registering now.', key_subject)
+            key_schema_id = self._schema_registry.register(key_subject, key_schema)
+            self._schema_registry.update_compatibility(constants.KEY_SCHEMA_COMPATIBILITY_LEVEL, key_subject)
+            registered = True
+
+        value_schema_id, current_value_schema, _ = self._schema_registry.get_latest_schema(value_subject)
+        if current_value_schema != value_schema:
+            logger.info('Value schema for subject %s does not exist or is outdated; registering now.', value_subject)
+            value_schema_id = self._schema_registry.register(key_subject, value_schema)
+            self._schema_registry.update_compatibility(constants.VALUE_SCHEMA_COMPATIBILITY_LEVEL, value_subject)
+            registered = True
+
+        if registered:
+            # some older versions of the Confluent schema registry have a bug that leads to duplicate schema IDs in
+            # some circumstances; delay a bit if we actually registered a new schema, to give the registry  a chance
+            # to become consistent (see https://github.com/confluentinc/schema-registry/pull/1003 and linked issues
+            # for context):
+            time.sleep(3)
+
+        return key_schema_id, value_schema_id
 
     @staticmethod
     def _raise_kafka_error(err: confluent_kafka.KafkaError) -> None:
@@ -241,7 +287,8 @@ class KafkaClient(object):
         self._producer.flush(30 if final else 0.1)  # triggers the _delivery_callback
 
         for (key_kvs, key_schema), (value, value_schema) in self._progress_messages_awaiting_commit.items():
-            self.produce(self._progress_topic_name, dict(key_kvs), key_schema, value, value_schema)
+            self.produce(self._progress_topic_name, dict(key_kvs), self._progress_key_schema_id, value,
+                         self._progress_value_schema_id)
 
         if final:
             self._producer.flush(30)

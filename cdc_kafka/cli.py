@@ -135,13 +135,29 @@ def main() -> None:
 
     p.add_argument('--metric-reporters',
                    default=os.environ.get('METRIC_REPORTERS', 'cdc_kafka.metric_reporters.stdout.StdoutReporter'),
-                   help="Comma-separated list of <modulename>.<classname>s of metric reporters you want this app to "
-                        "emit to.")
+                   help="Comma-separated list of <module_name>.<class_name>s of metric reporters you want this app "
+                        "to emit to.")
 
     p.add_argument('--metric-reporting-interval',
                    type=int,
                    default=os.environ.get('METRIC_REPORTING_INTERVAL', 15),
                    help="Interval in seconds between calls to metric reporters.")
+
+    p.add_argument('--partition-count',
+                   type=int,
+                   default=os.environ.get('PARTITION_COUNT', 12),
+                   help="Number of partitions to specify when creating new topics")
+
+    p.add_argument('--replication-factor',
+                   type=int,
+                   default=os.environ.get('REPLICATION_FACTOR'),
+                   help="Replication factor to specify when creating new topics")
+
+    p.add_argument('--extra-topic-config',
+                   default=os.environ.get('EXTRA_TOPIC_CONFIG'),
+                   help="Additional config parameters to be used when creating new topics. Should be a "
+                        "semicolon-separated list of colon-delimited librdkafka config key:value pairs, e.g. "
+                        "'min.insync.replicas:2'")
 
     opts = p.parse_args()
 
@@ -182,7 +198,8 @@ def main() -> None:
                                                                        opts.capture_instance_version_regex)
 
         determine_start_points_and_finalize_tables(
-            kafka_client, tables, opts.lsn_gap_handling, opts.run_validations)
+            kafka_client, tables, opts.lsn_gap_handling, opts.partition_count, opts.replication_factor,
+            opts.extra_topic_config, opts.run_validations)
 
         if opts.run_validations:
             validator = validation.Validator(kafka_client, db_conn, tables)
@@ -211,35 +228,34 @@ def main() -> None:
 
             while True:
                 if (datetime.datetime.now() - last_metrics_emission_time) > metrics_interval:
-                    lagging = any([t.lagging for t in tables])
-                    metrics_accum.determine_lags((lagging and last_published_msg_db_time) or datetime.datetime.now())
+                    metrics_accum.determine_lags(last_published_msg_db_time)
                     for reporter in reporters:
                         reporter.emit(metrics_accum)
                     last_metrics_emission_time = datetime.datetime.now()
                     metrics_accum = metric_reporters.MetricsAccumulator(db_conn)
                     total_time = time.perf_counter() - loop_entry_time
-                    logger.debug('Timings per msg: overall - %s ms, DB (pop) - %s ms, Kafka (produce/commit) - %s ms',
-                                 total_time / publish_count * 1000, pop_time_total / publish_count * 1000,
-                                 produce_time_total / publish_count * 1000)
+                    logger.debug('Timings per msg: overall - %s us, DB (pop) - %s us, Kafka (produce/commit) - %s us',
+                                 total_time / publish_count * 1000000, pop_time_total / publish_count * 1000000,
+                                 produce_time_total / publish_count * 1000000)
 
                 priority_tuple, msg_key, msg_value, table = pq.get()
 
                 if msg_key is not None:
                     start_time = time.perf_counter()
-                    kafka_client.produce(table.topic_name, msg_key, table.key_schema, msg_value, table.value_schema)
+                    kafka_client.produce(
+                        table.topic_name, msg_key, table.key_schema_id, msg_value, table.value_schema_id)
                     produce_time_total += (time.perf_counter() - start_time)
                     publish_count += 1
                     metrics_accum.record_publish += 1
+                    last_published_msg_db_time = priority_tuple[0]
 
                     if msg_value[constants.OPERATION_NAME] == 'Delete' and not opts.disable_deletion_tombstones:
                         start_time = time.perf_counter()
-                        kafka_client.produce(table.topic_name, msg_key, table.key_schema, None, table.value_schema)
+                        kafka_client.produce(
+                            table.topic_name, msg_key, table.key_schema_id, None, table.value_schema_id)
                         produce_time_total += (time.perf_counter() - start_time)
                         publish_count += 1
                         metrics_accum.tombstone_publish += 1
-
-                    if msg_value[constants.OPERATION_NAME] != 'Snapshot':
-                        last_published_msg_db_time = priority_tuple[0]
 
                 # Put the next entry for the table just handled back on the priority queue:
                 start_time = time.perf_counter()
@@ -251,30 +267,30 @@ def main() -> None:
             exit(0)
 
 
-def determine_start_points_and_finalize_tables(kafka_client: kafka.KafkaClient,
-                                               tables: List[tracked_tables.TrackedTable],
-                                               lsn_gap_handling: str, validation_mode: bool = False) -> None:
+def determine_start_points_and_finalize_tables(
+        kafka_client: kafka.KafkaClient, tables: List[tracked_tables.TrackedTable], lsn_gap_handling: str,
+        partition_count: int, replication_factor: int, extra_topic_config: str, validation_mode: bool = False) -> None:
     topic_names = [t.topic_name for t in tables]
 
     if validation_mode:
         for table in tables:
             table.snapshot_allowed = False
-            table.finalize_table(constants.BEGINNING_CHANGE_TABLE_INDEX, (None,), lsn_gap_handling)
+            table.finalize_table(constants.BEGINNING_CHANGE_TABLE_INDEX, (None,), lsn_gap_handling, None)
         return
 
-    watermarks_by_topic = kafka_client.get_topic_watermarks(topic_names)
-    first_check_watermarks_json = json.dumps(watermarks_by_topic, indent=4)
-
-    logger.info('Pausing briefly to ensure target topics are not receiving new messages from elsewhere...')
-    time.sleep(constants.STABLE_WATERMARK_CHECKS_INTERVAL_SECONDS)
-
-    watermarks_by_topic = kafka_client.get_topic_watermarks(topic_names)
-    second_check_watermarks_json = json.dumps(watermarks_by_topic, indent=4)
-
-    if first_check_watermarks_json != second_check_watermarks_json:
-        raise Exception(f'Watermarks for one or more target topics changed between successive checks. '
-                        f'Another process may be producing to the topic(s). Bailing.\nFirst check: '
-                        f'{first_check_watermarks_json}\nSecond check: {second_check_watermarks_json}')
+    # watermarks_by_topic = kafka_client.get_topic_watermarks(topic_names)
+    # first_check_watermarks_json = json.dumps(watermarks_by_topic, indent=4)
+    #
+    # logger.info('Pausing briefly to ensure target topics are not receiving new messages from elsewhere...')
+    # time.sleep(constants.STABLE_WATERMARK_CHECKS_INTERVAL_SECONDS)
+    #
+    # watermarks_by_topic = kafka_client.get_topic_watermarks(topic_names)
+    # second_check_watermarks_json = json.dumps(watermarks_by_topic, indent=4)
+    #
+    # if first_check_watermarks_json != second_check_watermarks_json:
+    #     raise Exception(f'Watermarks for one or more target topics changed between successive checks. '
+    #                     f'Another process may be producing to the topic(s). Bailing.\nFirst check: '
+    #                     f'{first_check_watermarks_json}\nSecond check: {second_check_watermarks_json}')
 
     prior_progress = kafka_client.get_prior_progress_or_create_progress_topic()
     prior_progress_log_table_data = []
@@ -302,17 +318,11 @@ def determine_start_points_and_finalize_tables(kafka_client: kafka.KafkaClient,
                   for kf in prior_snapshot_rows_progress['last_published_snapshot_key_field_values'])
 
         table.finalize_table(start_change_index or constants.BEGINNING_CHANGE_TABLE_INDEX,
-                             start_snapshot_value, lsn_gap_handling)
+                             start_snapshot_value, lsn_gap_handling, kafka_client.register_schemas)
 
-        if table.topic_name not in watermarks_by_topic:
-            logger.info('Registering schemas for to-be-created topic %s with key and value schema compatibility '
-                        'levels %s and %s respectively', table.topic_name, constants.KEY_SCHEMA_COMPATIBILITY_LEVEL,
-                        constants.VALUE_SCHEMA_COMPATIBILITY_LEVEL)
-            kafka_client.register_schemas(table.topic_name, table.key_schema, table.value_schema)
-            # some older versions of the Confluent schema registry have a bug that leads to duplicate schema IDs in
-            # some circumstances; delay a bit on this one-time operation to give it a chance to become consistent
-            # (see https://github.com/confluentinc/schema-registry/pull/1003 and linked issues for context):
-            time.sleep(3)
+        # if table.topic_name not in watermarks_by_topic:
+        #     logger.info('Creating topic %s', table.topic_name)
+        #     kafka_client.create_topic(table.topic_name, partition_count, replication_factor, extra_topic_config)
 
         if not table.snapshot_allowed:
             snapshot_state = '<not doing>'
