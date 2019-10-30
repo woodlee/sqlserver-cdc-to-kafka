@@ -45,16 +45,8 @@ PROGRESS_MESSAGE_AVRO_VALUE_SCHEMA = confluent_kafka.avro.loads(json.dumps({
         {"name": "last_ack_change_table_seqval", "type": ["null", "bytes"]},
         {"name": "last_ack_change_table_operation", "type": ["null", "int"]},
         {"name": "last_ack_snapshot_key_field_values", "type": ["null", {
-            "type": "array",
-            "items": {
-                "name": "key_field_value",
-                "type": "record",
-                "fields": [
-                    {"name": "field_name", "type": "string"},
-                    {"name": "sql_type", "type": "string"},
-                    {"name": "value_as_string", "type": "string"}
-                ]
-            }
+            "type": "map",
+            "values": ["string", "int"]
         }]},
         {"name": "last_ack_partition", "type": "int"},
         {"name": "last_ack_offset", "type": "int"},

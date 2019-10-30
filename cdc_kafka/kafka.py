@@ -23,8 +23,7 @@ class KafkaClient(object):
                  schema_registry_url: str,
                  kafka_timeout_seconds: int,
                  progress_topic_name: str,
-                 progress_message_extractor: Callable[[confluent_kafka.Message],
-                                                      Tuple[Dict[str, Any], Dict[str, Any]]],
+                 capture_instance_name_resolver: Callable[[str], str],
                  extra_kafka_consumer_config: str,
                  extra_kafka_producer_config: str):
 
@@ -33,7 +32,7 @@ class KafkaClient(object):
 
         self._kafka_timeout_seconds: int = kafka_timeout_seconds
         self._progress_topic_name: str = progress_topic_name
-        self._progress_message_extractor: Callable = progress_message_extractor
+        self._capture_instance_name_resolver: Callable[[str], str] = capture_instance_name_resolver
 
         consumer_config = {
             'bootstrap.servers': bootstrap_servers,
@@ -86,7 +85,8 @@ class KafkaClient(object):
 
         self._last_progress_commit_time: datetime.datetime = datetime.datetime.now()
         self._successfully_delivered_messages_counter: int = 0
-        self._progress_messages_awaiting_commit: Dict[Tuple, Dict] = {}
+        self._produce_sequence: int = 0
+        self._progress_messages_awaiting_commit: Dict[Tuple, Dict[int, Tuple]] = collections.defaultdict(dict)
 
         k_id, v_id = self.register_schemas(
             self._progress_topic_name, constants.PROGRESS_MESSAGE_AVRO_KEY_SCHEMA,
@@ -119,9 +119,11 @@ class KafkaClient(object):
                 # the callback function receives the binary-serialized payload, so instead of specifying it
                 # directly as the delivery callback we wrap it in a lambda that also passes the original not-yet-
                 # serialized key and value so that we don't have to re-deserialize it later:
+                self._produce_sequence += 1
+                seq = self._produce_sequence
                 self._producer.produce(
                     topic=topic, value=value_ser, key=key_ser,
-                    callback=lambda err, msg: self._delivery_callback(err, msg, key, value))
+                    callback=lambda err, msg: self._delivery_callback(err, msg, key, value, seq))
                 break
             except BufferError:
                 time.sleep(1)
@@ -136,22 +138,42 @@ class KafkaClient(object):
             return
 
         start_time = time.perf_counter()
-        self._producer.flush(30 if final else 0.1)  # triggers the _delivery_callback
+        still_in_queue_count = self._producer.flush(30 if final else 0.1)  # triggers the _delivery_callback
+        commit_all = still_in_queue_count == 0
 
-        if not self._progress_messages_awaiting_commit:
-            return
+        for (kind, topic), progress_by_partition in self._progress_messages_awaiting_commit.items():
+            commit_sequence, commit_partition = None, None
+            for partition, (produce_sequence, progress_msg) in progress_by_partition.items():
+                if commit_all:
+                    if commit_sequence is None or produce_sequence > commit_sequence:
+                        commit_sequence = produce_sequence
+                        commit_partition = partition
+                else:
+                    if commit_sequence is None or produce_sequence < commit_sequence:
+                        commit_sequence = produce_sequence
+                        commit_partition = partition
 
-        for key_kvs, value in self._progress_messages_awaiting_commit.items():
-            self.produce(self._progress_topic_name, dict(key_kvs), self._progress_key_schema_id, value,
-                         self._progress_value_schema_id)
+            if commit_partition is not None:
+                progress_msg = progress_by_partition.pop(commit_partition)[1]
+                key = {
+                    'progress_kind': kind,
+                    'topic_name': topic,
+                    'capture_instance_name': self._capture_instance_name_resolver(topic)
+                }
+                self.produce(self._progress_topic_name, key, self._progress_key_schema_id, progress_msg,
+                             self._progress_value_schema_id)
 
-        if final:
-            self._producer.flush(30)
+            if final:
+                if self._producer.flush(30) > 0:
+                    logger.error('Unable to complete final flush of Kafka producer queue.')
 
-        self._progress_messages_awaiting_commit = {}
+        if commit_all:
+            self._progress_messages_awaiting_commit = collections.defaultdict(dict)
+
         self._last_progress_commit_time = datetime.datetime.now()
 
-        logger.debug('_commit_progress took %s ms (final=%s)', (time.perf_counter() - start_time) * 1000, final)
+        logger.debug('_commit_progress took %s ms (final=%s, all=%s)',
+                     (time.perf_counter() - start_time) * 1000, final, commit_all)
 
     def consume_all(self, topic_name: str) -> Generator[confluent_kafka.Message, None, None]:
         topic_metadata = self._cluster_metadata.topics.get(topic_name)
@@ -301,7 +323,7 @@ class KafkaClient(object):
         logger.warning('Kafka throttle event: %s', evt)
 
     def _delivery_callback(self, err: confluent_kafka.KafkaError, msg: confluent_kafka.Message,
-                           orig_key: Dict[str, Any], orig_value: Dict[str, Any]) -> None:
+                           orig_key: Dict[str, Any], orig_value: Dict[str, Any], produce_sequence: int) -> None:
         if err is not None:
             raise confluent_kafka.KafkaException(f'Delivery error on topic {msg.topic()}: {err}')
 
@@ -313,9 +335,18 @@ class KafkaClient(object):
         if msg.topic() == self._progress_topic_name or msg.value() is None:
             return
 
-        msg.set_key(orig_key)
-        msg.set_value(orig_value)
+        progress_msg = {'last_ack_partition': msg.partition(), 'last_ack_offset': msg.offset()}
 
-        key, value = self._progress_message_extractor(msg)
-        self._progress_messages_awaiting_commit[tuple(key.items())] = value
+        if orig_value[constants.OPERATION_NAME] == constants.SNAPSHOT_OPERATION_NAME:
+            kind = constants.SNAPSHOT_ROWS_PROGRESS_KIND
+            progress_msg['last_ack_snapshot_key_field_values'] = orig_key
+        else:
+            kind = constants.CHANGE_ROWS_PROGRESS_KIND
+            progress_msg['last_ack_change_table_lsn'] = orig_value[constants.LSN_NAME]
+            progress_msg['last_ack_change_table_seqval'] = orig_value[constants.SEQVAL_NAME]
+            progress_msg['last_ack_change_table_operation'] = \
+                constants.CDC_OPERATION_NAME_TO_ID[orig_value[constants.OPERATION_NAME]]
+
+        key = (kind, msg.topic())
+        self._progress_messages_awaiting_commit[key][msg.partition()] = (produce_sequence, progress_msg)
 

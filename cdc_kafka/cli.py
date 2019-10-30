@@ -183,7 +183,7 @@ def main() -> None:
                            opts.schema_registry_url,
                            opts.kafka_timeout_seconds,
                            opts.progress_topic_name,
-                           tracked_tables.TrackedTable.progress_message_extractor,
+                           tracked_tables.TrackedTable.capture_instance_name_resolver,
                            opts.extra_kafka_consumer_config,
                            opts.extra_kafka_producer_config) as kafka_client, \
             pyodbc.connect(opts.db_conn_string) as db_conn:
@@ -231,9 +231,10 @@ def main() -> None:
                         reporter.emit(metrics_accum)
                     last_metrics_emission_time = datetime.datetime.now()
                     metrics_accum = metric_reporters.MetricsAccumulator(db_conn)
-                    logger.debug('Timings per msg: DB (pop) - %s us, Kafka (produce/commit) - %s us',
-                                 int(pop_time_total / publish_count * 1000000),
-                                 int(produce_time_total / publish_count * 1000000))
+                    if publish_count:
+                        logger.debug('Timings per msg: DB (pop) - %s us, Kafka (produce/commit) - %s us',
+                                     int(pop_time_total / publish_count * 1000000),
+                                     int(produce_time_total / publish_count * 1000000))
 
                 priority_tuple, msg_key, msg_value, table = pq.get()
 
@@ -254,13 +255,13 @@ def main() -> None:
                         publish_count += 1
                         metrics_accum.tombstone_publish += 1
 
+                kafka_client.commit_progress()
+
                 # Put the next entry for the table just handled back on the priority queue:
                 start_time = time.perf_counter()
                 priority_tuple, msg_key, msg_value = table.pop_next()
                 pop_time_total += (time.perf_counter() - start_time)
                 pq.put((priority_tuple, msg_key, msg_value, table))
-
-                kafka_client.commit_progress()
         except KeyboardInterrupt:
             logger.info('Exiting due to external interrupt.')
             exit(0)
@@ -274,7 +275,7 @@ def determine_start_points_and_finalize_tables(
     if validation_mode:
         for table in tables:
             table.snapshot_allowed = False
-            table.finalize_table(constants.BEGINNING_CHANGE_TABLE_INDEX, (None,), lsn_gap_handling,
+            table.finalize_table(constants.BEGINNING_CHANGE_TABLE_INDEX, {}, lsn_gap_handling,
                                  kafka_client.register_schemas)
         return
 
@@ -317,10 +318,8 @@ def determine_start_points_and_finalize_tables(
                 prior_change_rows_progress['last_ack_change_table_seqval'],
                 prior_change_rows_progress['last_ack_change_table_operation']
             )
-            start_snapshot_value = \
-                prior_snapshot_rows_progress and \
-                tuple(kf['value_as_string']
-                      for kf in prior_snapshot_rows_progress['last_ack_snapshot_key_field_values'])
+            start_snapshot_value = prior_snapshot_rows_progress and \
+                prior_snapshot_rows_progress['last_ack_snapshot_key_field_values']
 
         table.finalize_table(start_change_index or constants.BEGINNING_CHANGE_TABLE_INDEX,
                              start_snapshot_value, lsn_gap_handling, kafka_client.register_schemas)

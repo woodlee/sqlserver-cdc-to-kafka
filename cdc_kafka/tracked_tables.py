@@ -106,29 +106,9 @@ class TrackedTable(object):
             return None
         return ', '.join([f'{k}: {v}' for k, v in zip(self._key_field_names, self._last_read_key_for_snapshot)])
 
-    @staticmethod  # Needs to be static to be called by the Kafka event produce callback
-    def progress_message_extractor(msg: confluent_kafka.Message) -> \
-            Tuple[Dict[str, Any], Dict[str, Any]]:
-
-        table = TrackedTable._REGISTERED_TABLES_BY_KAFKA_TOPIC[msg.topic()]
-        key = {"topic_name": msg.topic(), "capture_instance_name": table.capture_instance_name}
-        value = {'last_ack_partition': msg.partition(), 'last_ack_offset': msg.offset()}
-
-        if msg.value()[constants.OPERATION_NAME] == constants.SNAPSHOT_OPERATION_NAME:
-            key['progress_kind'] = constants.SNAPSHOT_ROWS_PROGRESS_KIND
-            value['last_ack_snapshot_key_field_values'] = [{
-                'field_name': f.name,
-                'sql_type': f.sql_type_name,
-                'value_as_string': str(msg.value()[f.name])
-            } for f in table._key_fields]
-        else:
-            key['progress_kind'] = constants.CHANGE_ROWS_PROGRESS_KIND
-            value['last_ack_change_table_lsn'] = msg.value()[constants.LSN_NAME]
-            value['last_ack_change_table_seqval'] = msg.value()[constants.SEQVAL_NAME]
-            value['last_ack_change_table_operation'] = \
-                constants.CDC_OPERATION_NAME_TO_ID[msg.value()[constants.OPERATION_NAME]]
-
-        return key, value
+    @staticmethod
+    def capture_instance_name_resolver(topic_name: str) -> str:
+        return TrackedTable._REGISTERED_TABLES_BY_KAFKA_TOPIC[topic_name].capture_instance_name
 
     def pop_next(self) -> Tuple[Tuple, Union[Dict, None], Union[Dict, None]]:
         self._maybe_refresh_buffer()
@@ -168,7 +148,7 @@ class TrackedTable(object):
 
     # 'Finalizing' mostly means doing the things we can't do until we know all of the table's fields have been added
     def finalize_table(
-            self, start_after_change_table_index: ChangeTableIndex, start_from_key_for_snapshot: Tuple[Any],
+            self, start_after_change_table_index: ChangeTableIndex, start_from_key_for_snapshot: Dict[str, Any],
             lsn_gap_handling: str, schema_id_getter: Callable[[str, avro.schema.RecordSchema, avro.schema.RecordSchema],
                                                               Tuple[int, int]] = None) -> None:
 
@@ -262,15 +242,13 @@ class TrackedTable(object):
                 )
 
                 if start_from_key_for_snapshot:
-                    key_min = self._get_min_key_value()
+                    key_min_tuple = tuple(self._get_min_key_value() or [])
+                    start_key_tuple = tuple([start_from_key_for_snapshot[kfn] for kfn in self._key_field_names])
 
-                    if key_min:
-                        if tuple(str(x) for x in key_min) == tuple(str(x) for x in start_from_key_for_snapshot):
-                            self.snapshot_complete = True
-                        else:
-                            self._last_read_key_for_snapshot = start_from_key_for_snapshot
+                    if key_min_tuple and key_min_tuple == start_key_tuple:
+                        self.snapshot_complete = True
                     else:
-                        self._last_read_key_for_snapshot = start_from_key_for_snapshot
+                        self._last_read_key_for_snapshot = start_key_tuple
                 else:
                     key_max = self._get_max_key_value()
                     if key_max:
