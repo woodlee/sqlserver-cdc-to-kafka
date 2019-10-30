@@ -224,7 +224,6 @@ def main() -> None:
         pop_time_total, produce_time_total, publish_count = 0.0, 0.0, 0
 
         try:
-
             while True:
                 if (datetime.datetime.now() - last_metrics_emission_time) > metrics_interval:
                     metrics_accum.determine_lags(last_published_msg_db_time, any([t.lagging for t in tables]))
@@ -260,6 +259,8 @@ def main() -> None:
                 priority_tuple, msg_key, msg_value = table.pop_next()
                 pop_time_total += (time.perf_counter() - start_time)
                 pq.put((priority_tuple, msg_key, msg_value, table))
+
+                kafka_client.commit_progress()
         except KeyboardInterrupt:
             logger.info('Exiting due to external interrupt.')
             exit(0)
@@ -273,7 +274,8 @@ def determine_start_points_and_finalize_tables(
     if validation_mode:
         for table in tables:
             table.snapshot_allowed = False
-            table.finalize_table(constants.BEGINNING_CHANGE_TABLE_INDEX, (None,), lsn_gap_handling, None)
+            table.finalize_table(constants.BEGINNING_CHANGE_TABLE_INDEX, (None,), lsn_gap_handling,
+                                 kafka_client.register_schemas)
         return
 
     watermarks_by_topic = kafka_client.get_topic_watermarks(topic_names)
@@ -294,33 +296,34 @@ def determine_start_points_and_finalize_tables(
     prior_progress_log_table_data = []
 
     for table in tables:
-        prior_change_rows_progress = prior_progress.get((
-            ('capture_instance_name', table.capture_instance_name),
-            ('progress_kind', constants.CHANGE_ROWS_PROGRESS_KIND),
-            ('topic_name', table.topic_name)
-        ))
-        prior_snapshot_rows_progress = prior_progress.get((
-            ('capture_instance_name', table.capture_instance_name),
-            ('progress_kind', constants.SNAPSHOT_ROWS_PROGRESS_KIND),
-            ('topic_name', table.topic_name)
-        ))
-
-        start_change_index = prior_change_rows_progress and tracked_tables.ChangeTableIndex(
-            prior_change_rows_progress['last_published_change_table_lsn'],
-            prior_change_rows_progress['last_published_change_table_seqval'],
-            prior_change_rows_progress['last_published_change_table_operation']
-        )
-        start_snapshot_value = \
-            prior_snapshot_rows_progress and \
-            tuple(kf['value_as_string']
-                  for kf in prior_snapshot_rows_progress['last_published_snapshot_key_field_values'])
-
-        table.finalize_table(start_change_index or constants.BEGINNING_CHANGE_TABLE_INDEX,
-                             start_snapshot_value, lsn_gap_handling, kafka_client.register_schemas)
-
         if table.topic_name not in watermarks_by_topic:
             logger.info('Creating topic %s', table.topic_name)
             kafka_client.create_topic(table.topic_name, partition_count, replication_factor, extra_topic_config)
+            start_change_index, start_snapshot_value = None, None
+        else:
+            prior_change_rows_progress = prior_progress.get((
+                ('capture_instance_name', table.capture_instance_name),
+                ('progress_kind', constants.CHANGE_ROWS_PROGRESS_KIND),
+                ('topic_name', table.topic_name)
+            ))
+            prior_snapshot_rows_progress = prior_progress.get((
+                ('capture_instance_name', table.capture_instance_name),
+                ('progress_kind', constants.SNAPSHOT_ROWS_PROGRESS_KIND),
+                ('topic_name', table.topic_name)
+            ))
+
+            start_change_index = prior_change_rows_progress and tracked_tables.ChangeTableIndex(
+                prior_change_rows_progress['last_ack_change_table_lsn'],
+                prior_change_rows_progress['last_ack_change_table_seqval'],
+                prior_change_rows_progress['last_ack_change_table_operation']
+            )
+            start_snapshot_value = \
+                prior_snapshot_rows_progress and \
+                tuple(kf['value_as_string']
+                      for kf in prior_snapshot_rows_progress['last_ack_snapshot_key_field_values'])
+
+        table.finalize_table(start_change_index or constants.BEGINNING_CHANGE_TABLE_INDEX,
+                             start_snapshot_value, lsn_gap_handling, kafka_client.register_schemas)
 
         if not table.snapshot_allowed:
             snapshot_state = '<not doing>'

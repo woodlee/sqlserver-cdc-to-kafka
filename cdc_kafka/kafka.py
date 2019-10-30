@@ -4,7 +4,7 @@ import json
 import logging
 import socket
 import time
-from typing import List, Dict, Tuple, Any, Callable, Union
+from typing import List, Dict, Tuple, Any, Callable, Union, Generator
 
 import avro
 import confluent_kafka.admin
@@ -23,9 +23,8 @@ class KafkaClient(object):
                  schema_registry_url: str,
                  kafka_timeout_seconds: int,
                  progress_topic_name: str,
-                 progress_message_extractor: Callable[[str, Dict[str, Any]],
-                                                      Tuple[Dict[str, Any], avro.schema.RecordSchema,
-                                                            Dict[str, Any], avro.schema.RecordSchema]],
+                 progress_message_extractor: Callable[[confluent_kafka.Message],
+                                                      Tuple[Dict[str, Any], Dict[str, Any]]],
                  extra_kafka_consumer_config: str,
                  extra_kafka_producer_config: str):
 
@@ -77,16 +76,17 @@ class KafkaClient(object):
         admin_config['logger'] = logger
 
         self._schema_registry = confluent_kafka.avro.CachedSchemaRegistryClient(schema_registry_url)
-        self._serializer = confluent_kafka.avro.MessageSerializer(self._schema_registry)
-        self._consumer = confluent_kafka.avro.AvroConsumer(consumer_config, schema_registry=self._schema_registry)
+        self._avro_serializer = confluent_kafka.avro.MessageSerializer(self._schema_registry)
+        self._consumer = confluent_kafka.Consumer(consumer_config)
         self._producer = confluent_kafka.Producer(producer_config)
         self._admin = confluent_kafka.admin.AdminClient(admin_config)
+        self._avro_deserializers = {}
 
         self._refresh_cluster_metadata()
 
         self._last_progress_commit_time: datetime.datetime = datetime.datetime.now()
         self._successfully_delivered_messages_counter: int = 0
-        self._progress_messages_awaiting_commit: Dict[Tuple, Tuple] = {}
+        self._progress_messages_awaiting_commit: Dict[Tuple, Dict] = {}
 
         k_id, v_id = self.register_schemas(
             self._progress_topic_name, constants.PROGRESS_MESSAGE_AVRO_KEY_SCHEMA,
@@ -107,31 +107,53 @@ class KafkaClient(object):
     def __exit__(self, exc_type, value, traceback):
         logger.info("Committing progress and cleaning up Kafka resources...")
         self._consumer.close()
-        self._commit_progress(True)
+        self.commit_progress(True)
         logger.info("Done.")
 
     def produce(self, topic: str, key: Dict[str, Any], key_schema_id: int, value: Union[None, Dict[str, Any]],
                 value_schema_id: int) -> None:
         while True:
             try:
-                key_ser = self._serializer.encode_record_with_schema_id(key_schema_id, key, True)
-                value_ser = self._serializer.encode_record_with_schema_id(value_schema_id, value, False)
-                self._producer.produce(topic=topic, value=value_ser, key=key_ser,
-                                       callback=lambda err, msg: self._delivery_callback(err, msg, value))
+                key_ser = self._avro_serializer.encode_record_with_schema_id(key_schema_id, key, True)
+                value_ser = self._avro_serializer.encode_record_with_schema_id(value_schema_id, value, False)
+                # the callback function receives the binary-serialized payload, so instead of specifying it
+                # directly as the delivery callback we wrap it in a lambda that also passes the original not-yet-
+                # serialized key and value so that we don't have to re-deserialize it later:
+                self._producer.produce(
+                    topic=topic, value=value_ser, key=key_ser,
+                    callback=lambda err, msg: self._delivery_callback(err, msg, key, value))
                 break
             except BufferError:
                 time.sleep(1)
                 logger.debug('Sleeping due to Kafka producer buffer being full...')
             except Exception:
-                logger.error('The following exception occurred producing to topic %', topic)
+                logger.error('The following exception occurred producing to topic %s', topic)
                 raise
 
-        if topic != self._progress_topic_name and (datetime.datetime.now() - self._last_progress_commit_time) > \
-                constants.PROGRESS_COMMIT_INTERVAL:
-            self._commit_progress()
-            self._last_progress_commit_time = datetime.datetime.now()
+    def commit_progress(self, final: bool = False):
+        if (datetime.datetime.now() - self._last_progress_commit_time) < constants.PROGRESS_COMMIT_INTERVAL \
+                and not final:
+            return
 
-    def consume_all(self, topic_name: str):
+        start_time = time.perf_counter()
+        self._producer.flush(30 if final else 0.1)  # triggers the _delivery_callback
+
+        if not self._progress_messages_awaiting_commit:
+            return
+
+        for key_kvs, value in self._progress_messages_awaiting_commit.items():
+            self.produce(self._progress_topic_name, dict(key_kvs), self._progress_key_schema_id, value,
+                         self._progress_value_schema_id)
+
+        if final:
+            self._producer.flush(30)
+
+        self._progress_messages_awaiting_commit = {}
+        self._last_progress_commit_time = datetime.datetime.now()
+
+        logger.debug('_commit_progress took %s ms (final=%s)', (time.perf_counter() - start_time) * 1000, final)
+
+    def consume_all(self, topic_name: str) -> Generator[confluent_kafka.Message, None, None]:
         topic_metadata = self._cluster_metadata.topics.get(topic_name)
 
         if not topic_metadata:
@@ -151,16 +173,25 @@ class KafkaClient(object):
             if msg is None:
                 time.sleep(1)
                 continue
-            if msg.error() and msg.error().code() == confluent_kafka.KafkaError._PARTITION_EOF:
-                finished_parts[msg.partition()] = True
-                if all(finished_parts):
-                    break
             if msg.error():
-                raise confluent_kafka.KafkaException(msg.error())
+                if msg.error().code() == confluent_kafka.KafkaError._PARTITION_EOF:
+                    finished_parts[msg.partition()] = True
+                    if all(finished_parts):
+                        break
+                    continue
+                else:
+                    raise confluent_kafka.KafkaException(msg.error())
 
             ctr += 1
             if ctr % 100000 == 0:
                 logger.debug('consume_all has yielded %s messages so far from topic %s', ctr, topic_name)
+
+            deserializer = self._avro_deserializers[msg.topic()]
+
+            if msg.value() is not None:
+                msg.set_value(deserializer.decode_message(msg.value(), is_key=False))
+            if msg.key() is not None:
+                msg.set_key(deserializer.decode_message(msg.key(), is_key=True))
 
             yield msg
 
@@ -195,7 +226,7 @@ class KafkaClient(object):
             progress_msg_ctr += 1
             # Need to reform the key into a stably-sorted tuple of kv pairs so it can be used as a dictionary key:
             key = tuple(sorted(progress_msg.key().items(), key=lambda kv: kv[0]))
-            result[key] = progress_msg.value()  # last read for a given key will win
+            result[key] = dict(progress_msg.value())  # last read for a given key will win
 
         logger.debug('Read %s prior progress messages from Kafka topic %s', progress_msg_ctr,
                      self._progress_topic_name)
@@ -252,6 +283,9 @@ class KafkaClient(object):
             # for context):
             time.sleep(3)
 
+        self._avro_deserializers[topic_name] = confluent_kafka.avro.MessageSerializer(
+                self._schema_registry, key_schema, value_schema)
+
         return key_schema_id, value_schema_id
 
     @staticmethod
@@ -267,7 +301,7 @@ class KafkaClient(object):
         logger.warning('Kafka throttle event: %s', evt)
 
     def _delivery_callback(self, err: confluent_kafka.KafkaError, msg: confluent_kafka.Message,
-                           orig_message_value: Dict[str, Any]) -> None:
+                           orig_key: Dict[str, Any], orig_value: Dict[str, Any]) -> None:
         if err is not None:
             raise confluent_kafka.KafkaException(f'Delivery error on topic {msg.topic()}: {err}')
 
@@ -279,19 +313,9 @@ class KafkaClient(object):
         if msg.topic() == self._progress_topic_name or msg.value() is None:
             return
 
-        key, key_schema, value, value_schema = self._progress_message_extractor(msg.topic(), orig_message_value)
-        self._progress_messages_awaiting_commit[(tuple(key.items()), key_schema)] = (value, value_schema)
+        msg.set_key(orig_key)
+        msg.set_value(orig_value)
 
-    def _commit_progress(self, final=False):
-        start_time = time.perf_counter()
-        self._producer.flush(30 if final else 0.1)  # triggers the _delivery_callback
+        key, value = self._progress_message_extractor(msg)
+        self._progress_messages_awaiting_commit[tuple(key.items())] = value
 
-        for (key_kvs, key_schema), (value, value_schema) in self._progress_messages_awaiting_commit.items():
-            self.produce(self._progress_topic_name, dict(key_kvs), self._progress_key_schema_id, value,
-                         self._progress_value_schema_id)
-
-        if final:
-            self._producer.flush(30)
-
-        self._progress_messages_awaiting_commit = {}
-        logger.debug('_commit_progress took %s ms', (time.perf_counter() - start_time) * 1000)

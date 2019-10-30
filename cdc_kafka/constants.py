@@ -41,10 +41,10 @@ PROGRESS_MESSAGE_AVRO_VALUE_SCHEMA = confluent_kafka.avro.loads(json.dumps({
     "namespace": AVRO_SCHEMA_NAMESPACE,
     "type": "record",
     "fields": [
-        {"name": "last_published_change_table_lsn", "type": ["null", "bytes"]},
-        {"name": "last_published_change_table_seqval", "type": ["null", "bytes"]},
-        {"name": "last_published_change_table_operation", "type": ["null", "int"]},
-        {"name": "last_published_snapshot_key_field_values", "type": ["null", {
+        {"name": "last_ack_change_table_lsn", "type": ["null", "bytes"]},
+        {"name": "last_ack_change_table_seqval", "type": ["null", "bytes"]},
+        {"name": "last_ack_change_table_operation", "type": ["null", "int"]},
+        {"name": "last_ack_snapshot_key_field_values", "type": ["null", {
             "type": "array",
             "items": {
                 "name": "key_field_value",
@@ -55,7 +55,9 @@ PROGRESS_MESSAGE_AVRO_VALUE_SCHEMA = confluent_kafka.avro.loads(json.dumps({
                     {"name": "value_as_string", "type": "string"}
                 ]
             }
-        }]}
+        }]},
+        {"name": "last_ack_partition", "type": "int"},
+        {"name": "last_ack_offset", "type": "int"},
     ]
 }))
 

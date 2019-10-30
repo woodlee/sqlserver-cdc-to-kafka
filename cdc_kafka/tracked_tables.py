@@ -107,31 +107,28 @@ class TrackedTable(object):
         return ', '.join([f'{k}: {v}' for k, v in zip(self._key_field_names, self._last_read_key_for_snapshot)])
 
     @staticmethod  # Needs to be static to be called by the Kafka event produce callback
-    def progress_message_extractor(topic_name: str, msg_value: Dict[str, Any]) -> \
-            Tuple[Dict[str, Any], avro.schema.RecordSchema, Dict[str, Any], avro.schema.RecordSchema]:
+    def progress_message_extractor(msg: confluent_kafka.Message) -> \
+            Tuple[Dict[str, Any], Dict[str, Any]]:
 
-        table = TrackedTable._REGISTERED_TABLES_BY_KAFKA_TOPIC[topic_name]
-        key = {"topic_name": topic_name, "capture_instance_name": table.capture_instance_name}
+        table = TrackedTable._REGISTERED_TABLES_BY_KAFKA_TOPIC[msg.topic()]
+        key = {"topic_name": msg.topic(), "capture_instance_name": table.capture_instance_name}
+        value = {'last_ack_partition': msg.partition(), 'last_ack_offset': msg.offset()}
 
-        if msg_value[constants.OPERATION_NAME] == constants.SNAPSHOT_OPERATION_NAME:
+        if msg.value()[constants.OPERATION_NAME] == constants.SNAPSHOT_OPERATION_NAME:
             key['progress_kind'] = constants.SNAPSHOT_ROWS_PROGRESS_KIND
-            value = {
-                'last_published_snapshot_key_field_values': [{
-                    'field_name': f.name,
-                    'sql_type': f.sql_type_name,
-                    'value_as_string': str(msg_value[f.name])
-                } for f in table._key_fields]
-            }
+            value['last_ack_snapshot_key_field_values'] = [{
+                'field_name': f.name,
+                'sql_type': f.sql_type_name,
+                'value_as_string': str(msg.value()[f.name])
+            } for f in table._key_fields]
         else:
             key['progress_kind'] = constants.CHANGE_ROWS_PROGRESS_KIND
-            value = {
-                'last_published_change_table_lsn': msg_value[constants.LSN_NAME],
-                'last_published_change_table_seqval': msg_value[constants.SEQVAL_NAME],
-                'last_published_change_table_operation':
-                    constants.CDC_OPERATION_NAME_TO_ID[msg_value[constants.OPERATION_NAME]]
-            }
+            value['last_ack_change_table_lsn'] = msg.value()[constants.LSN_NAME]
+            value['last_ack_change_table_seqval'] = msg.value()[constants.SEQVAL_NAME]
+            value['last_ack_change_table_operation'] = \
+                constants.CDC_OPERATION_NAME_TO_ID[msg.value()[constants.OPERATION_NAME]]
 
-        return key, constants.PROGRESS_MESSAGE_AVRO_KEY_SCHEMA, value, constants.PROGRESS_MESSAGE_AVRO_VALUE_SCHEMA
+        return key, value
 
     def pop_next(self) -> Tuple[Tuple, Union[Dict, None], Union[Dict, None]]:
         self._maybe_refresh_buffer()
