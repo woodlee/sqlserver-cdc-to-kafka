@@ -92,6 +92,8 @@ class TrackedTable(object):
         self._snapshot_rows_query: Union[None, str] = None
         self._initial_snapshot_rows_query: Union[None, str] = None
         self._last_read_change_table_index: Union[None, ChangeTableIndex] = None
+        self._last_popped_snapshot_row: Union[Tuple, None] = None
+        self._last_popped_change_row: Union[Tuple, None] = None
 
         self._fields_added_pending_finalization: List[TrackedField] = []
         self._row_buffer: collections.deque = collections.deque()
@@ -117,7 +119,35 @@ class TrackedTable(object):
             return self._get_queue_priority_tuple(None), None, None
 
         next_row = self._row_buffer.popleft()
+        is_snapshot_row = next_row[constants.OPERATION_POS] == constants.SNAPSHOT_OPERATION_ID
+
+        # Sometimes the LEFT JOIN to lsn_time_mapping comes up empty. Not 100% sure why, may have something to do
+        # with change table rows corresponding to transactions still in progress? In any case if we encounter this
+        # we'll bail and set the progress horizon to the last row we read that has a tran_end_time:
+        if (not is_snapshot_row) and next_row[constants.TRAN_END_TIME_POS] is None:
+            if self._last_popped_change_row:
+                self._last_read_change_table_index = ChangeTableIndex(
+                    self._last_popped_change_row[constants.LSN_POS],
+                    self._last_popped_change_row[constants.SEQVAL_POS],
+                    self._last_popped_change_row[constants.OPERATION_POS]
+                )
+            if self._last_read_key_for_snapshot is not None and self._last_read_key_for_snapshot != NEW_SNAPSHOT \
+                    and self._last_popped_snapshot_row:
+                self._last_read_key_for_snapshot = tuple(
+                    self._last_popped_snapshot_row[n - 1 + constants.CDC_METADATA_COL_COUNT]
+                    for n in self._key_field_positions
+                )
+            self._row_buffer.clear()
+            logger.debug('Encountered change row missing a corresponding tran_end_time on %s. Flushing row buffer and '
+                         'will retry from last "good" change and snapshot indices.', self.fq_name)
+            return self._get_queue_priority_tuple(None), None, None
+
         msg_key, msg_value = self._message_kv_from_change_row(next_row)
+
+        if is_snapshot_row:
+            self._last_popped_snapshot_row = next_row
+        else:
+            self._last_popped_change_row = next_row
 
         return self._get_queue_priority_tuple(next_row), msg_key, msg_value
 
