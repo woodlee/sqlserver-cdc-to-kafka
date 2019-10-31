@@ -1,7 +1,9 @@
 import collections
+import csv
 import datetime
 import json
 import logging
+import os
 import socket
 import time
 from typing import List, Dict, Tuple, Any, Callable, Union, Generator
@@ -234,7 +236,7 @@ class KafkaClient(object):
         self._admin.create_topics([topic])[topic_name].result()
         self._refresh_cluster_metadata()
 
-    def get_prior_progress_or_create_progress_topic(self) -> Dict[Tuple, Dict[str, Any]]:
+    def get_prior_progress_or_create_progress_topic(self, log_to_file_path: str = None) -> Dict[Tuple, Dict[str, Any]]:
         result = {}
 
         if self._progress_topic_name not in self._cluster_metadata.topics:
@@ -243,12 +245,37 @@ class KafkaClient(object):
             self.create_topic(self._progress_topic_name, 1)
             return {}
 
+        header = None
+        if log_to_file_path is not None:
+            all_file = open(os.path.join(log_to_file_path, 'all_progress_entries.csv'), 'w')
+            all_csv_writer = csv.writer(all_file, quoting=csv.QUOTE_ALL)
+
         progress_msg_ctr = 0
         for progress_msg in self.consume_all(self._progress_topic_name):
             progress_msg_ctr += 1
             # Need to reform the key into a stably-sorted tuple of kv pairs so it can be used as a dictionary key:
             key = tuple(sorted(progress_msg.key().items(), key=lambda kv: kv[0]))
             result[key] = dict(progress_msg.value())  # last read for a given key will win
+
+            if log_to_file_path is not None:
+                sorted_vals = tuple(sorted(progress_msg.value().items(), key=lambda kv: kv[0]))
+                if not header:
+                    header = ['progress_offset'] + [key_k for key_k, _ in key] + [val_k for val_k, _ in sorted_vals]
+                    all_csv_writer.writerow(header)
+                row = [progress_msg.offset()] + [key_v for _, key_v in key] + \
+                      [f'0x{val_v.hex()}' if isinstance(val_v, bytes) else val_v for _, val_v in sorted_vals]
+                all_csv_writer.writerow(row)
+
+        if log_to_file_path is not None:
+            all_file.close()
+            with open(os.path.join(log_to_file_path, 'latest_progress_entries.csv'), 'w') as latest_file:
+                latest_csv_writer = csv.writer(latest_file, quoting=csv.QUOTE_ALL)
+                latest_csv_writer.writerow(header[1:])
+                for k, v in result.items():
+                    sorted_vals = tuple(sorted(v.items(), key=lambda kv: kv[0]))
+                    row = [key_v for _, key_v in k] + \
+                          [f'0x{val_v.hex()}' if isinstance(val_v, bytes) else val_v for _, val_v in sorted_vals]
+                    latest_csv_writer.writerow(row)
 
         logger.debug('Read %s prior progress messages from Kafka topic %s', progress_msg_ctr,
                      self._progress_topic_name)

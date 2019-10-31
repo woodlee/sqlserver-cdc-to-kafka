@@ -130,7 +130,7 @@ def main() -> None:
     p.add_argument('--run-validations',
                    type=str2bool, nargs='?', const=True,
                    default=str2bool(os.environ.get('RUN_VALIDATIONS', False)),
-                   help="Runs count validations between messages in the Kafka topic and rows in the change and"
+                   help="Runs count validations between messages in the Kafka topic and rows in the change and "
                         "source tables, then quits. Respects the table whitelist/blacklist regexes.")
 
     p.add_argument('--metric-reporters',
@@ -158,6 +158,11 @@ def main() -> None:
                    help="Additional config parameters to be used when creating new topics. Should be a "
                         "semicolon-separated list of colon-delimited librdkafka config key:value pairs, e.g. "
                         "'min.insync.replicas:2'")
+
+    p.add_argument('--progress-csv-path',
+                   default=os.environ.get('PROGRESS_CSV_PATH'),
+                   help="File path to which CSV files will be written with data read from the existing progress "
+                        "topic at startup time.")
 
     opts = p.parse_args()
 
@@ -199,7 +204,7 @@ def main() -> None:
 
         determine_start_points_and_finalize_tables(
             kafka_client, tables, opts.lsn_gap_handling, opts.partition_count, opts.replication_factor,
-            opts.extra_topic_config, opts.run_validations)
+            opts.extra_topic_config, opts.progress_csv_path, opts.run_validations)
 
         if opts.run_validations:
             validator = validation.Validator(kafka_client, db_conn, tables)
@@ -269,7 +274,8 @@ def main() -> None:
 
 def determine_start_points_and_finalize_tables(
         kafka_client: kafka.KafkaClient, tables: List[tracked_tables.TrackedTable], lsn_gap_handling: str,
-        partition_count: int, replication_factor: int, extra_topic_config: str, validation_mode: bool = False) -> None:
+        partition_count: int, replication_factor: int, extra_topic_config: str, progress_csv_path: str = None,
+        validation_mode: bool = False) -> None:
     topic_names = [t.topic_name for t in tables]
 
     if validation_mode:
@@ -293,7 +299,7 @@ def determine_start_points_and_finalize_tables(
                         f'Another process may be producing to the topic(s). Bailing.\nFirst check: '
                         f'{first_check_watermarks_json}\nSecond check: {second_check_watermarks_json}')
 
-    prior_progress = kafka_client.get_prior_progress_or_create_progress_topic()
+    prior_progress = kafka_client.get_prior_progress_or_create_progress_topic(progress_csv_path)
     prior_progress_log_table_data = []
 
     for table in tables:
