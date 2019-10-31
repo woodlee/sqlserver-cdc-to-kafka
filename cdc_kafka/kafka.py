@@ -82,10 +82,12 @@ class KafkaClient(object):
         self._producer = confluent_kafka.Producer(producer_config)
         self._admin = confluent_kafka.admin.AdminClient(admin_config)
         self._avro_deserializers = {}
+        self._commit_order_enforcer: Dict[Tuple, int] = {}
 
         self._refresh_cluster_metadata()
 
         self._last_progress_commit_time: datetime.datetime = datetime.datetime.now()
+        self._last_full_flush_time: datetime.datetime = datetime.datetime.now()
         self._successfully_delivered_messages_counter: int = 0
         self._produce_sequence: int = 0
         self._progress_messages_awaiting_commit: Dict[Tuple, Dict[int, Tuple]] = collections.defaultdict(dict)
@@ -140,13 +142,21 @@ class KafkaClient(object):
             return
 
         start_time = time.perf_counter()
-        still_in_queue_count = self._producer.flush(30 if final else 0.1)  # triggers the _delivery_callback
-        commit_all = still_in_queue_count == 0
+        full_flush_due = (datetime.datetime.now() - self._last_full_flush_time) > constants.FULL_FLUSH_MAX_INTERVAL
+        flush_timeout = 30 if (final or full_flush_due) else 0.1
+        still_in_queue_count = self._producer.flush(flush_timeout)  # triggers the _delivery_callback
+        flushed_all = still_in_queue_count == 0
+        if flushed_all:
+            self._last_full_flush_time = datetime.datetime.now()
 
         for (kind, topic), progress_by_partition in self._progress_messages_awaiting_commit.items():
             commit_sequence, commit_partition = None, None
+            if (not flushed_all) and len(progress_by_partition) < len(self._cluster_metadata.topics[topic].partitions):
+                # not safe to commit anything if not all partitions have acked since there may still be some
+                # less-progressed messages in flight for the non-acked partition:
+                continue
             for partition, (produce_sequence, progress_msg) in progress_by_partition.items():
-                if commit_all:
+                if flushed_all:
                     if commit_sequence is None or produce_sequence > commit_sequence:
                         commit_sequence = produce_sequence
                         commit_partition = partition
@@ -156,7 +166,11 @@ class KafkaClient(object):
                         commit_partition = partition
 
             if commit_partition is not None:
-                progress_msg = progress_by_partition.pop(commit_partition)[1]
+                produce_sequence, progress_msg = progress_by_partition.pop(commit_partition)
+                prior_sequence = self._commit_order_enforcer.get((kind, topic))
+                if prior_sequence is not None and produce_sequence < prior_sequence:
+                    raise Exception('Committing progress out of order. There is a bug. Fix it.')
+                self._commit_order_enforcer[(kind, topic)] = produce_sequence
                 key = {
                     'progress_kind': kind,
                     'topic_name': topic,
@@ -169,13 +183,13 @@ class KafkaClient(object):
                 if self._producer.flush(30) > 0:
                     logger.error('Unable to complete final flush of Kafka producer queue.')
 
-        if commit_all:
+        if flushed_all:
             self._progress_messages_awaiting_commit = collections.defaultdict(dict)
 
         self._last_progress_commit_time = datetime.datetime.now()
 
-        logger.debug('_commit_progress took %s ms (final=%s, all=%s)',
-                     (time.perf_counter() - start_time) * 1000, final, commit_all)
+        logger.debug('_commit_progress took %s ms (final=%s, flushed_all=%s)',
+                     (time.perf_counter() - start_time) * 1000, final, flushed_all)
 
     def consume_all(self, topic_name: str) -> Generator[confluent_kafka.Message, None, None]:
         topic_metadata = self._cluster_metadata.topics.get(topic_name)
