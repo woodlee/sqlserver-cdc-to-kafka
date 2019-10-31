@@ -116,19 +116,19 @@ class KafkaClient(object):
 
     def produce(self, topic: str, key: Dict[str, Any], key_schema_id: int, value: Union[None, Dict[str, Any]],
                 value_schema_id: int) -> None:
+        key_ser = self._avro_serializer.encode_record_with_schema_id(key_schema_id, key, True)
+        if value is None:
+            # deletion tombstone
+            value_ser = None
+        else:
+            value_ser = self._avro_serializer.encode_record_with_schema_id(value_schema_id, value, False)
+        # the callback function receives the binary-serialized payload, so instead of specifying it
+        # directly as the delivery callback we wrap it in a lambda that also passes the original not-yet-
+        # serialized key and value so that we don't have to re-deserialize it later:
+        self._produce_sequence += 1
+        seq = self._produce_sequence
         while True:
             try:
-                key_ser = self._avro_serializer.encode_record_with_schema_id(key_schema_id, key, True)
-                if value is None:
-                    # deletion tombstone
-                    value_ser = None
-                else:
-                    value_ser = self._avro_serializer.encode_record_with_schema_id(value_schema_id, value, False)
-                # the callback function receives the binary-serialized payload, so instead of specifying it
-                # directly as the delivery callback we wrap it in a lambda that also passes the original not-yet-
-                # serialized key and value so that we don't have to re-deserialize it later:
-                self._produce_sequence += 1
-                seq = self._produce_sequence
                 self._producer.produce(
                     topic=topic, value=value_ser, key=key_ser,
                     callback=lambda err, msg: self._delivery_callback(err, msg, key, value, seq))
@@ -136,6 +136,7 @@ class KafkaClient(object):
             except BufferError:
                 time.sleep(1)
                 logger.debug('Sleeping due to Kafka producer buffer being full...')
+                self.commit_progress()  # clear some space before retrying
             except Exception:
                 logger.error('The following exception occurred producing to topic %s', topic)
                 raise
