@@ -242,7 +242,9 @@ class KafkaClient(object):
         if self._progress_topic_name not in self._cluster_metadata.topics:
             logger.warning('No existing snapshot progress storage topic found; creating topic %s',
                            self._progress_topic_name)
-            self.create_topic(self._progress_topic_name, 1)
+            # log.segment.bytes set to 16 MB. Compaction will not run until the next log segment rolls so we set this
+            # a bit low (the default is 1 GB) to prevent having to read too much from the topic on process start:
+            self.create_topic(self._progress_topic_name, 1, extra_config='log.segment.bytes:16777216')
             return {}
 
         header = None
@@ -260,9 +262,11 @@ class KafkaClient(object):
             if log_to_file_path is not None:
                 sorted_vals = tuple(sorted(progress_msg.value().items(), key=lambda kv: kv[0]))
                 if not header:
-                    header = ['progress_offset'] + [key_k for key_k, _ in key] + [val_k for val_k, _ in sorted_vals]
+                    header = ['timestamp', 'progress_offset'] + [key_k for key_k, _ in key] + \
+                             [val_k for val_k, _ in sorted_vals]
                     all_csv_writer.writerow(header)
-                row = [progress_msg.offset()] + [key_v for _, key_v in key] + \
+                timestamp = datetime.datetime.utcfromtimestamp(progress_msg.timestamp()[1] / 1000.0).isoformat()
+                row = [timestamp, progress_msg.offset()] + [key_v for _, key_v in key] + \
                       [f'0x{val_v.hex()}' if isinstance(val_v, bytes) else val_v for _, val_v in sorted_vals]
                 all_csv_writer.writerow(row)
 
@@ -270,7 +274,7 @@ class KafkaClient(object):
             all_file.close()
             with open(os.path.join(log_to_file_path, 'latest_progress_entries.csv'), 'w') as latest_file:
                 latest_csv_writer = csv.writer(latest_file, quoting=csv.QUOTE_ALL)
-                latest_csv_writer.writerow(header[1:])
+                latest_csv_writer.writerow(header[2:])
                 for k, v in result.items():
                     sorted_vals = tuple(sorted(v.items(), key=lambda kv: kv[0]))
                     row = [key_v for _, key_v in k] + \
