@@ -119,7 +119,11 @@ class KafkaClient(object):
         while True:
             try:
                 key_ser = self._avro_serializer.encode_record_with_schema_id(key_schema_id, key, True)
-                value_ser = self._avro_serializer.encode_record_with_schema_id(value_schema_id, value, False)
+                if value is None:
+                    # deletion tombstone
+                    value_ser = None
+                else:
+                    value_ser = self._avro_serializer.encode_record_with_schema_id(value_schema_id, value, False)
                 # the callback function receives the binary-serialized payload, so instead of specifying it
                 # directly as the delivery callback we wrap it in a lambda that also passes the original not-yet-
                 # serialized key and value so that we don't have to re-deserialize it later:
