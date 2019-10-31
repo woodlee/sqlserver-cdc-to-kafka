@@ -4,6 +4,7 @@ import importlib
 import json
 import logging
 import os
+import re
 import queue
 import time
 from typing import List
@@ -184,14 +185,30 @@ def main() -> None:
     if not (opts.schema_registry_url and opts.kafka_bootstrap_servers and opts.db_conn_string):
         raise Exception('Arguments schema_registry_url, kafka_bootstrap_servers, and db_conn_string are all required.')
 
+    # The Linux ODBC driver doesn't do failover, so we're hacking it in here. This will only work for initial
+    # connections. If a failover happens while this process is running, the app will crash. Have a process supervisor
+    # that can restart it if that happens, and it'll connect to the failover on restart:
+    # THIS ASSUMES that you are using the exact keywords 'SERVER' and 'Failover_Partner' in your connection string!
+    try:
+        db_conn = pyodbc.connect(opts.db_conn_string)
+    except pyodbc.ProgrammingError as e:
+        if e.args[0] != '42000':
+            raise
+        server = re.match(r".*SERVER=(.*?);", opts.db_conn_string)
+        failover_partner = re.match(r".*Failover_Partner=(.*?);", opts.db_conn_string)
+        if failover_partner is not None and server is not None:
+            failover_partner = failover_partner.groups(1)[0]
+            server = server.groups(1)[0]
+            opts.db_conn_string = opts.db_conn_string.replace(server, failover_partner)
+            db_conn = pyodbc.connect(opts.db_conn_string)
+
     with kafka.KafkaClient(opts.kafka_bootstrap_servers,
                            opts.schema_registry_url,
                            opts.kafka_timeout_seconds,
                            opts.progress_topic_name,
                            tracked_tables.TrackedTable.capture_instance_name_resolver,
                            opts.extra_kafka_consumer_config,
-                           opts.extra_kafka_producer_config) as kafka_client, \
-            pyodbc.connect(opts.db_conn_string) as db_conn:
+                           opts.extra_kafka_producer_config) as kafka_client, db_conn:
 
         tables = tracked_tables.build_tracked_tables_from_cdc_metadata(db_conn,
                                                                        opts.topic_name_template,
