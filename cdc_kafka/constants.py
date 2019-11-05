@@ -118,25 +118,44 @@ UPDATE_MASK_NAME = '_cdc_update_mask'
 TRAN_END_TIME_POS = 4
 TRAN_END_TIME_NAME = '_cdc_tran_end_time'
 
+# You may feel tempted to change or simplify this query. TREAD CAREFULLY. There was a lot of iterating here to
+# craft something that would not induce SQL Server to resort to a full index scan. If you change it, run some
+# EXPLAINs and ensure that the steps are still only index SEEKs, not scans.
 CHANGE_ROWS_QUERY_TEMPLATE = f'''
-SELECT TOP (?)
-    ct.__$start_lsn AS {LSN_NAME}
-    , ct.__$seqval AS {SEQVAL_NAME}
-    , ct.__$operation AS {OPERATION_NAME}
-    , ct.__$update_mask AS {UPDATE_MASK_NAME}
-    , ltm.tran_end_time AS {TRAN_END_TIME_NAME}
-    , {{fields}}
-FROM
-    cdc.[{{capture_instance_name}}_CT] AS ct WITH (NOLOCK)
-    LEFT JOIN cdc.lsn_time_mapping AS ltm WITH (NOLOCK) ON (ct.__$start_lsn = ltm.start_lsn)
-WHERE
-    __$operation != 3 AND
-    (
-        __$start_lsn > ?
-        OR (__$start_lsn = ? AND __$seqval > ?)
-        OR (__$start_lsn = ? AND __$seqval = ? AND __$operation > ?)
-    )
-ORDER BY __$start_lsn, __$seqval, __$operation
+WITH all_rows AS (
+    SELECT TOP {DB_ROW_BATCH_SIZE}
+        ct.__$start_lsn AS {LSN_NAME}
+        , ct.__$seqval AS {SEQVAL_NAME}
+        , ct.__$operation AS {OPERATION_NAME}
+        , ct.__$update_mask AS {UPDATE_MASK_NAME}
+        , ltm.tran_end_time AS {TRAN_END_TIME_NAME}
+        , {{fields}}
+    FROM
+        cdc.[{{capture_instance_name}}_CT] AS ct WITH (NOLOCK)
+        LEFT JOIN cdc.lsn_time_mapping AS ltm WITH (NOLOCK) ON (ct.__$start_lsn = ltm.start_lsn)
+    WHERE
+        ct.__$start_lsn > ?
+        AND (ct.__$operation = 1 OR ct.__$operation = 2 OR ct.__$operation = 4)
+
+    UNION
+
+    SELECT TOP {DB_ROW_BATCH_SIZE}
+        ct.__$start_lsn AS {LSN_NAME}
+        , ct.__$seqval AS {SEQVAL_NAME}
+        , ct.__$operation AS {OPERATION_NAME}
+        , ct.__$update_mask AS {UPDATE_MASK_NAME}
+        , ltm.tran_end_time AS {TRAN_END_TIME_NAME}
+        , {{fields}}
+    FROM
+        cdc.[{{capture_instance_name}}_CT] AS ct WITH (NOLOCK)
+        LEFT JOIN cdc.lsn_time_mapping AS ltm WITH (NOLOCK) ON (ct.__$start_lsn = ltm.start_lsn)
+    WHERE
+        ct.__$start_lsn = ? AND ct.__$seqval > ?
+        AND (ct.__$operation = 1 OR ct.__$operation = 2 OR ct.__$operation = 4)
+)
+SELECT TOP ({DB_ROW_BATCH_SIZE * 2}) *
+FROM all_rows 
+ORDER BY _cdc_start_lsn, _cdc_seqval, _cdc_operation
 '''
 
 SNAPSHOT_ROWS_QUERY_TEMPLATE = f'''
