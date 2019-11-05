@@ -378,7 +378,7 @@ class TrackedTable(object):
         logger.debug('Polling DB for capture instance %s', self.capture_instance_name)
 
         self._cursor.execute(self._change_rows_query, (self._last_read_change_table_index.lsn,
-                             self._last_read_change_table_index.lsn, self._last_read_change_table_index.seqval))
+                             self._last_read_change_table_index.seqval, self._last_read_change_table_index.lsn))
         change_row = None
         for change_row in self._cursor.fetchall():
             change_rows_read_ctr += 1
