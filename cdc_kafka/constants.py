@@ -127,7 +127,7 @@ WITH ct AS (
     FROM cdc.[{{capture_instance_name}}_CT] AS ct WITH (NOLOCK)
     WHERE ct.__$start_lsn = ? AND ct.__$seqval > ?
 
-    UNION
+    UNION ALL
 
     SELECT *
     FROM cdc.[{{capture_instance_name}}_CT] AS ct WITH (NOLOCK)
