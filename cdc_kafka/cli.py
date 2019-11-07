@@ -190,7 +190,7 @@ def main() -> None:
     # that can restart it if that happens, and it'll connect to the failover on restart:
     # THIS ASSUMES that you are using the exact keywords 'SERVER' and 'Failover_Partner' in your connection string!
     try:
-        db_conn = pyodbc.connect(opts.db_conn_string)
+        db_conn = pyodbc.connect(opts.db_conn_string, autocommit=True)
     except pyodbc.ProgrammingError as e:
         if e.args[0] != '42000':
             raise
@@ -200,7 +200,7 @@ def main() -> None:
             failover_partner = failover_partner.groups(1)[0]
             server = server.groups(1)[0]
             opts.db_conn_string = opts.db_conn_string.replace(server, failover_partner)
-            db_conn = pyodbc.connect(opts.db_conn_string)
+            db_conn = pyodbc.connect(opts.db_conn_string, autocommit=True)
 
     with kafka.KafkaClient(opts.kafka_bootstrap_servers,
                            opts.schema_registry_url,

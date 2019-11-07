@@ -63,7 +63,6 @@ class TrackedTable(object):
 
     def __init__(self, db_conn: pyodbc.Connection, schema_name: str, table_name: str, capture_instance_name: str,
                  topic_name: str, min_lsn: bytes, snapshot_allowed: bool):
-        self.db_conn: pyodbc.Connection = db_conn
         self.schema_name: str = schema_name
         self.table_name: str = table_name
         self.capture_instance_name: str = capture_instance_name
@@ -97,7 +96,7 @@ class TrackedTable(object):
 
         self._fields_added_pending_finalization: List[TrackedField] = []
         self._row_buffer: collections.deque = collections.deque()
-        self._cursor: pyodbc.Cursor = self.db_conn.cursor()
+        self._db_conn: pyodbc.Connection = db_conn
         self._last_db_poll_time: datetime.datetime = constants.BEGINNING_DATETIME
         self._finalized: bool = False
         self._has_pk: bool = False
@@ -155,12 +154,12 @@ class TrackedTable(object):
         self._fields_added_pending_finalization.append(field)
 
     def get_source_table_count(self):
-        with self.db_conn.cursor() as cursor:
+        with self._db_conn.cursor() as cursor:
             cursor.execute(f'SELECT COUNT(*) FROM [{self.schema_name}].[{self.table_name}]')
             return cursor.fetchval()
 
     def get_change_table_counts(self):
-        with self.db_conn.cursor() as cursor:
+        with self._db_conn.cursor() as cursor:
             delete, insert, update = 0, 0, 0
             cursor.execute(f'SELECT COUNT(*), __$operation AS op FROM cdc.[{self.capture_instance_name}_CT] '
                            f'WHERE __$operation != 3 GROUP BY __$operation')
@@ -345,8 +344,9 @@ class TrackedTable(object):
 
     def _get_db_time(self):
         if (datetime.datetime.now() - TrackedTable._DB_TIME_DELTA_LAST_REFRESH) > datetime.timedelta(minutes=1):
-            self._cursor.execute('SELECT GETDATE()')
-            TrackedTable._DB_TIME_DELTA = self._cursor.fetchval() - datetime.datetime.now()
+            with self._db_conn.cursor() as cursor:
+                cursor.execute('SELECT GETDATE()')
+                TrackedTable._DB_TIME_DELTA = cursor.fetchval() - datetime.datetime.now()
             TrackedTable._DB_TIME_DELTA_LAST_REFRESH = datetime.datetime.now()
             logger.debug('Current DB time delta: %s', TrackedTable._DB_TIME_DELTA)
         return datetime.datetime.now() + TrackedTable._DB_TIME_DELTA
@@ -377,12 +377,13 @@ class TrackedTable(object):
         change_rows_read_ctr, snapshot_rows_read_ctr = 0, 0
         logger.debug('Polling DB for capture instance %s', self.capture_instance_name)
 
-        self._cursor.execute(self._change_rows_query, (self._last_read_change_table_index.lsn,
-                             self._last_read_change_table_index.seqval, self._last_read_change_table_index.lsn))
-        change_row = None
-        for change_row in self._cursor.fetchall():
-            change_rows_read_ctr += 1
-            self._row_buffer.append(change_row)
+        with self._db_conn.cursor() as cursor:
+            cursor.execute(self._change_rows_query, (self._last_read_change_table_index.lsn,
+                           self._last_read_change_table_index.seqval, self._last_read_change_table_index.lsn))
+            change_row = None
+            for change_row in cursor.fetchall():
+                change_rows_read_ctr += 1
+                self._row_buffer.append(change_row)
 
         self._last_db_poll_time = datetime.datetime.now()
 
@@ -397,17 +398,18 @@ class TrackedTable(object):
             snapshot_query_params = [constants.DB_ROW_BATCH_SIZE]
             logger.debug('Polling DB for snapshot rows from %s', self.fq_name)
 
-            if self._last_read_key_for_snapshot == NEW_SNAPSHOT:
-                self._cursor.execute(self._initial_snapshot_rows_query, snapshot_query_params)
-            else:
-                for key_field_pos in range(len(self._last_read_key_for_snapshot)):
-                    snapshot_query_params.extend(self._last_read_key_for_snapshot[:key_field_pos + 1])
-                self._cursor.execute(self._snapshot_rows_query, snapshot_query_params)
+            with self._db_conn.cursor() as cursor:
+                if self._last_read_key_for_snapshot == NEW_SNAPSHOT:
+                    cursor.execute(self._initial_snapshot_rows_query, snapshot_query_params)
+                else:
+                    for key_field_pos in range(len(self._last_read_key_for_snapshot)):
+                        snapshot_query_params.extend(self._last_read_key_for_snapshot[:key_field_pos + 1])
+                    cursor.execute(self._snapshot_rows_query, snapshot_query_params)
 
-            snapshot_row = None
-            for snapshot_row in self._cursor.fetchall():
-                snapshot_rows_read_ctr += 1
-                self._row_buffer.append(snapshot_row)
+                snapshot_row = None
+                for snapshot_row in cursor.fetchall():
+                    snapshot_rows_read_ctr += 1
+                    self._row_buffer.append(snapshot_row)
 
             if snapshot_row:
                 self._last_read_key_for_snapshot = tuple(snapshot_row[n - 1 + constants.CDC_METADATA_COL_COUNT]
@@ -422,7 +424,7 @@ class TrackedTable(object):
     def _get_max_key_value(self):
         order_by_spec = ", ".join([f'{fn} DESC' for fn in self._quoted_key_field_names])
 
-        with self.db_conn.cursor() as cursor:
+        with self._db_conn.cursor() as cursor:
             cursor.execute(f'SELECT TOP 1 {", ".join(self._quoted_key_field_names)} '
                            f'FROM [{self.schema_name}].[{self.table_name}] ORDER BY {order_by_spec}')
             return cursor.fetchone()
@@ -430,7 +432,7 @@ class TrackedTable(object):
     def _get_min_key_value(self):
         order_by_spec = ", ".join([f'{fn} ASC' for fn in self._quoted_key_field_names])
 
-        with self.db_conn.cursor() as cursor:
+        with self._db_conn.cursor() as cursor:
             cursor.execute(f'SELECT TOP 1 {", ".join(self._quoted_key_field_names)} '
                            f'FROM [{self.schema_name}].[{self.table_name}] ORDER BY {order_by_spec}')
             return cursor.fetchone()
