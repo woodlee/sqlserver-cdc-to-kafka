@@ -84,7 +84,7 @@ class KafkaClient(object):
         self._avro_deserializers = {}
         self._commit_order_enforcer: Dict[Tuple, int] = {}
 
-        self._refresh_cluster_metadata()
+        self.refresh_cluster_metadata()
 
         self._last_progress_commit_time: datetime.datetime = datetime.datetime.now()
         self._last_full_flush_time: datetime.datetime = datetime.datetime.now()
@@ -100,7 +100,7 @@ class KafkaClient(object):
 
         KafkaClient.__instance = self
 
-    def _refresh_cluster_metadata(self):
+    def refresh_cluster_metadata(self):
         self._cluster_metadata = self._admin.list_topics(timeout=self._kafka_timeout_seconds)
         if self._cluster_metadata is None:
             raise Exception(f'Cluster metadata request to Kafka timed out')
@@ -253,7 +253,6 @@ class KafkaClient(object):
         logger.debug('Kafka topic configuration for %s: \n%s', topic_name, json.dumps(topic_config, indent=4))
         topic = confluent_kafka.admin.NewTopic(topic_name, partition_count, replication_factor, config=topic_config)
         self._admin.create_topics([topic])[topic_name].result()
-        self._refresh_cluster_metadata()
 
     def get_prior_progress_or_create_progress_topic(self, log_to_file_path: str = None) -> Dict[Tuple, Dict[str, Any]]:
         result = {}
@@ -264,6 +263,8 @@ class KafkaClient(object):
             # log.segment.bytes set to 16 MB. Compaction will not run until the next log segment rolls so we set this
             # a bit low (the default is 1 GB) to prevent having to read too much from the topic on process start:
             self.create_topic(self._progress_topic_name, 1, extra_config='segment.bytes:16777216')
+            time.sleep(5)
+            self.refresh_cluster_metadata()
             return {}
 
         header = None

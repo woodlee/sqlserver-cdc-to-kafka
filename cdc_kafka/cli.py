@@ -319,11 +319,13 @@ def determine_start_points_and_finalize_tables(
 
     prior_progress = kafka_client.get_prior_progress_or_create_progress_topic(progress_csv_path)
     prior_progress_log_table_data = []
+    created_topics = False
 
     for table in tables:
         if table.topic_name not in watermarks_by_topic:
             logger.info('Creating topic %s', table.topic_name)
             kafka_client.create_topic(table.topic_name, partition_count, replication_factor, extra_topic_config)
+            created_topics = True
             start_change_index, start_snapshot_value = None, None
         else:
             prior_change_rows_progress = prior_progress.get((
@@ -360,6 +362,10 @@ def determine_start_points_and_finalize_tables(
         prior_progress_log_table_data.append((table.capture_instance_name, table.fq_name, table.topic_name,
                                               start_change_index or '<from beginning>', snapshot_state))
 
+    if created_topics:
+        time.sleep(5)
+        kafka_client.refresh_cluster_metadata()
+        
     headers = ('Capture instance name', 'Source table name', 'Topic name', 'From change table index', 'Snapshots')
     table = tabulate(prior_progress_log_table_data, headers, tablefmt='fancy_grid')
 
