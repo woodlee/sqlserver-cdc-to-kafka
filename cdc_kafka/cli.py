@@ -146,7 +146,7 @@ def main() -> None:
 
     p.add_argument('--partition-count',
                    type=int,
-                   default=os.environ.get('PARTITION_COUNT', 12),
+                   default=os.environ.get('PARTITION_COUNT', 2),
                    help="Number of partitions to specify when creating new topics")
 
     p.add_argument('--replication-factor',
