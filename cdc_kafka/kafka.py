@@ -263,7 +263,7 @@ class KafkaClient(object):
                            self._progress_topic_name)
             # log.segment.bytes set to 16 MB. Compaction will not run until the next log segment rolls so we set this
             # a bit low (the default is 1 GB) to prevent having to read too much from the topic on process start:
-            self.create_topic(self._progress_topic_name, 1, extra_config='log.segment.bytes:16777216')
+            self.create_topic(self._progress_topic_name, 1, extra_config='segment.bytes:16777216')
             return {}
 
         header = None
