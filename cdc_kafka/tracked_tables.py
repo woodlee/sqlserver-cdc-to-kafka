@@ -437,6 +437,12 @@ class TrackedTable(object):
                            f'FROM [{self.schema_name}].[{self.table_name}] ORDER BY {order_by_spec}')
             return cursor.fetchone()
 
+    def get_change_rows_per_second(self):
+        with self._db_conn.cursor() as cursor:
+            cursor.execute(constants.CHANGE_ROWS_PER_SECOND_QUERY.format(
+                capture_instance_name=self.capture_instance_name))
+            return cursor.fetchval()
+
 
 # This pulls the "greatest" capture instance running for each source table, in the event there is more than one.
 def get_latest_capture_instance_names(db_conn: pyodbc.Connection, capture_instance_version_strategy: str,

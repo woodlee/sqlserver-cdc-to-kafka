@@ -105,6 +105,12 @@ SELECT TOP 1 tran_end_time, DATEDIFF(ms, tran_end_time, GETDATE())
 FROM cdc.lsn_time_mapping ORDER BY tran_end_time DESC
 '''
 
+CHANGE_ROWS_PER_SECOND_QUERY = '''
+SELECT COUNT(*) / DATEDIFF(second, MIN(ltm.tran_end_time), MAX(ltm.tran_end_time))
+FROM cdc.[{capture_instance_name}_CT] AS ct WITH (NOLOCK)
+INNER JOIN cdc.lsn_time_mapping AS ltm WITH (NOLOCK) ON ct.__$start_lsn = ltm.start_lsn
+'''
+
 CDC_METADATA_COL_COUNT = 5
 
 LSN_POS = 0

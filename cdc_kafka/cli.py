@@ -146,13 +146,16 @@ def main() -> None:
 
     p.add_argument('--partition-count',
                    type=int,
-                   default=os.environ.get('PARTITION_COUNT', 2),
-                   help="Number of partitions to specify when creating new topics")
+                   default=os.environ.get('PARTITION_COUNT'),
+                   help="Number of partitions to specify when creating new topics. If left empty, defaults to 2 or "
+                        "the daily average number of rows currently on the change table integer-divided by 500,000, "
+                        "whichever is larger.")
 
     p.add_argument('--replication-factor',
                    type=int,
                    default=os.environ.get('REPLICATION_FACTOR'),
-                   help="Replication factor to specify when creating new topics")
+                   help="Replication factor to specify when creating new topics. If left empty, defaults to 3 or the "
+                        "number of brokers in the cluster, whichever is smaller.")
 
     p.add_argument('--extra-topic-config',
                    default=os.environ.get('EXTRA_TOPIC_CONFIG'),
@@ -323,7 +326,17 @@ def determine_start_points_and_finalize_tables(
 
     for table in tables:
         if table.topic_name not in watermarks_by_topic:
-            logger.info('Creating topic %s', table.topic_name)
+            if partition_count is None:
+                per_second = table.get_change_rows_per_second()
+                # one partition per 500K rows/day on average:
+                partition_count = max(2, int(per_second * 60 * 60 * 24 / 500_000))
+                if partition_count > 100:
+                    raise Exception(
+                        f'Automatic topic creation would create %{partition_count} partitions for topic '
+                        f'{table.topic_name} based on a change table rows per second rate of {per_second}. This '
+                        f'seems excessive, so the program is exiting to prevent overwhelming your Kafka cluster. '
+                        f'Look at setting PARTITION_COUNT to take manual control of this.')
+            logger.info('Creating topic %s with %s partitions', table.topic_name, partition_count)
             kafka_client.create_topic(table.topic_name, partition_count, replication_factor, extra_topic_config)
             created_topics = True
             start_change_index, start_snapshot_value = None, None
@@ -365,7 +378,7 @@ def determine_start_points_and_finalize_tables(
     if created_topics:
         time.sleep(5)
         kafka_client.refresh_cluster_metadata()
-        
+
     headers = ('Capture instance name', 'Source table name', 'Topic name', 'From change table index', 'Snapshots')
     table = tabulate(prior_progress_log_table_data, headers, tablefmt='fancy_grid')
 
