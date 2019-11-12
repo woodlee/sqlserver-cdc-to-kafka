@@ -244,14 +244,14 @@ def main() -> None:
 
         metrics_interval = datetime.timedelta(seconds=opts.metric_reporting_interval)
         last_metrics_emission_time = datetime.datetime.now()
-        last_published_change_msg_db_time = datetime.datetime.now() - datetime.timedelta(days=1)
+        last_published_change_msg_time = datetime.datetime.now() - datetime.timedelta(days=1)
         metrics_accum = metric_reporters.MetricsAccumulator(db_conn)
         pop_time_total, produce_time_total, publish_count = 0.0, 0.0, 0
 
         try:
             while True:
                 if (datetime.datetime.now() - last_metrics_emission_time) > metrics_interval:
-                    metrics_accum.determine_lags(last_published_change_msg_db_time, any([t.lagging for t in tables]))
+                    metrics_accum.determine_lags(last_published_change_msg_time, any([t.lagging for t in tables]))
                     for reporter in reporters:
                         reporter.emit(metrics_accum)
                     last_metrics_emission_time = datetime.datetime.now()
@@ -262,6 +262,9 @@ def main() -> None:
                                      int(produce_time_total / publish_count * 1000000))
 
                 priority_tuple, msg_key, msg_value, table = pq.get()
+                act_time = priority_tuple[0]
+                if act_time > datetime.datetime.utcnow():
+                    time.sleep((act_time - datetime.datetime.utcnow()).seconds)
 
                 if msg_key is not None:
                     start_time = time.perf_counter()
@@ -271,7 +274,7 @@ def main() -> None:
                     publish_count += 1
                     metrics_accum.record_publish += 1
                     if msg_value and msg_value[constants.OPERATION_NAME] != constants.SNAPSHOT_OPERATION_NAME:
-                        last_published_change_msg_db_time = priority_tuple[0]
+                        last_published_change_msg_time = act_time + table.get_db_time_delta()
 
                     if msg_value[constants.OPERATION_NAME] == 'Delete' and not opts.disable_deletion_tombstones:
                         start_time = time.perf_counter()

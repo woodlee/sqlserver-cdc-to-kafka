@@ -342,26 +342,26 @@ class TrackedTable(object):
                     yield self._value_field_names[pos]
                 pos += 1
 
-    def _get_db_time(self):
-        if (datetime.datetime.now() - TrackedTable._DB_TIME_DELTA_LAST_REFRESH) > datetime.timedelta(minutes=1):
+    def get_db_time_delta(self):
+        if (datetime.datetime.utcnow() - TrackedTable._DB_TIME_DELTA_LAST_REFRESH) > datetime.timedelta(minutes=1):
             with self._db_conn.cursor() as cursor:
                 cursor.execute('SELECT GETDATE()')
-                TrackedTable._DB_TIME_DELTA = cursor.fetchval() - datetime.datetime.now()
-            TrackedTable._DB_TIME_DELTA_LAST_REFRESH = datetime.datetime.now()
+                TrackedTable._DB_TIME_DELTA = cursor.fetchval() - datetime.datetime.utcnow()
+            TrackedTable._DB_TIME_DELTA_LAST_REFRESH = datetime.datetime.utcnow()
             logger.debug('Current DB time delta: %s', TrackedTable._DB_TIME_DELTA)
-        return datetime.datetime.now() + TrackedTable._DB_TIME_DELTA
+        return TrackedTable._DB_TIME_DELTA
 
     # This method's Return value is used to order results in the priority queue used to determine the sequence in
     # which rows are published.
     def _get_queue_priority_tuple(self, row) -> Tuple[datetime.datetime, bytes, bytes, int, str]:
         if row is None:
-            return (self._get_db_time() + constants.DB_TABLE_POLL_INTERVAL,  # defer until ready for next poll
+            return (datetime.datetime.utcnow() + constants.DB_TABLE_POLL_INTERVAL,  # defer until ready for next poll
                     constants.BEGINNING_CHANGE_TABLE_INDEX.lsn,
                     constants.BEGINNING_CHANGE_TABLE_INDEX.seqval,
                     0,
                     self.fq_name)
 
-        return (row[constants.TRAN_END_TIME_POS],
+        return (row[constants.TRAN_END_TIME_POS] - self.get_db_time_delta(),
                 row[constants.LSN_POS],
                 row[constants.SEQVAL_POS],
                 row[constants.OPERATION_POS],
@@ -371,7 +371,8 @@ class TrackedTable(object):
         if len(self._row_buffer) > 0:
             return
 
-        if not self.lagging and (datetime.datetime.now() - self._last_db_poll_time) < constants.DB_TABLE_POLL_INTERVAL:
+        if not self.lagging and \
+                (datetime.datetime.utcnow() - self._last_db_poll_time) < constants.DB_TABLE_POLL_INTERVAL:
             return
 
         change_rows_read_ctr, snapshot_rows_read_ctr = 0, 0
@@ -385,7 +386,7 @@ class TrackedTable(object):
                 change_rows_read_ctr += 1
                 self._row_buffer.append(change_row)
 
-        self._last_db_poll_time = datetime.datetime.now()
+        self._last_db_poll_time = datetime.datetime.utcnow()
 
         if change_row:
             logger.debug('Retrieved %s change rows', change_rows_read_ctr)
