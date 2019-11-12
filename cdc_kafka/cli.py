@@ -326,18 +326,21 @@ def determine_start_points_and_finalize_tables(
 
     for table in tables:
         if table.topic_name not in watermarks_by_topic:
-            if partition_count is None:
+            if partition_count:
+                this_topic_partition_count = partition_count
+            else:
                 per_second = table.get_change_rows_per_second()
                 # one partition per 500K rows/day on average:
-                partition_count = max(2, int(per_second * 60 * 60 * 24 / 500_000))
-                if partition_count > 100:
+                this_topic_partition_count = max(2, int(per_second * 60 * 60 * 24 / 500_000))
+                if this_topic_partition_count > 100:
                     raise Exception(
-                        f'Automatic topic creation would create %{partition_count} partitions for topic '
+                        f'Automatic topic creation would create %{this_topic_partition_count} partitions for topic '
                         f'{table.topic_name} based on a change table rows per second rate of {per_second}. This '
                         f'seems excessive, so the program is exiting to prevent overwhelming your Kafka cluster. '
                         f'Look at setting PARTITION_COUNT to take manual control of this.')
-            logger.info('Creating topic %s with %s partitions', table.topic_name, partition_count)
-            kafka_client.create_topic(table.topic_name, partition_count, replication_factor, extra_topic_config)
+            logger.info('Creating topic %s with %s partitions', table.topic_name, this_topic_partition_count)
+            kafka_client.create_topic(table.topic_name, this_topic_partition_count, replication_factor,
+                                      extra_topic_config)
             created_topics = True
             start_change_index, start_snapshot_value = None, None
         else:
