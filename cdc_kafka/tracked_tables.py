@@ -442,7 +442,7 @@ class TrackedTable(object):
         with self._db_conn.cursor() as cursor:
             cursor.execute(constants.CHANGE_ROWS_PER_SECOND_QUERY.format(
                 capture_instance_name=self.capture_instance_name))
-            return cursor.fetchval()
+            return cursor.fetchval() or 0
 
 
 # This pulls the "greatest" capture instance running for each source table, in the event there is more than one.
