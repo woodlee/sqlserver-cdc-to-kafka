@@ -46,6 +46,7 @@ class KafkaClient(object):
             'linger.ms': '50',
             'enable.idempotence': True,
             'enable.gapless.guarantee': True,
+            'retry.backoff.ms': 250,
             'compression.codec': 'snappy'
         }
         admin_config = {
@@ -84,6 +85,7 @@ class KafkaClient(object):
         self._avro_deserializers = {}
         self._commit_order_enforcer: Dict[Tuple, int] = {}
 
+        self._cluster_metadata = None
         self.refresh_cluster_metadata()
 
         self._last_progress_commit_time: datetime.datetime = datetime.datetime.now()
@@ -100,7 +102,7 @@ class KafkaClient(object):
 
         KafkaClient.__instance = self
 
-    def refresh_cluster_metadata(self):
+    def refresh_cluster_metadata(self) -> None:
         self._cluster_metadata = self._admin.list_topics(timeout=self._kafka_timeout_seconds)
         if self._cluster_metadata is None:
             raise Exception(f'Cluster metadata request to Kafka timed out')
@@ -140,6 +142,21 @@ class KafkaClient(object):
             except Exception:
                 logger.error('The following exception occurred producing to topic %s', topic)
                 raise
+
+    def reset_progress(self, topic_name: str, capture_instance_name: str) -> None:
+        key = {
+            'progress_kind': constants.CHANGE_ROWS_PROGRESS_KIND,
+            'topic_name': topic_name,
+            'capture_instance_name': capture_instance_name
+        }
+        self.produce(self._progress_topic_name, key, self._progress_key_schema_id, None, self._progress_value_schema_id)
+        key = {
+            'progress_kind': constants.SNAPSHOT_ROWS_PROGRESS_KIND,
+            'topic_name': topic_name,
+            'capture_instance_name': capture_instance_name
+        }
+        self.produce(self._progress_topic_name, key, self._progress_key_schema_id, None, self._progress_value_schema_id)
+        logger.info('Deleted existing progress records for topic %s.', topic_name)
 
     def commit_progress(self, final: bool = False):
         if (datetime.datetime.now() - self._last_progress_commit_time) < constants.PROGRESS_COMMIT_INTERVAL \
@@ -277,6 +294,12 @@ class KafkaClient(object):
             progress_msg_ctr += 1
             # Need to reform the key into a stably-sorted tuple of kv pairs so it can be used as a dictionary key:
             key = tuple(sorted(progress_msg.key().items(), key=lambda kv: kv[0]))
+
+            if progress_msg.value() is None:
+                if key in result:
+                    del result[key]
+                continue
+
             result[key] = dict(progress_msg.value())  # last read for a given key will win
 
             if log_to_file_path is not None:

@@ -177,9 +177,13 @@ class TrackedTable(object):
 
     # 'Finalizing' mostly means doing the things we can't do until we know all of the table's fields have been added
     def finalize_table(
-            self, start_after_change_table_index: ChangeTableIndex, start_from_key_for_snapshot: Dict[str, Any],
-            lsn_gap_handling: str, schema_id_getter: Callable[[str, avro.schema.RecordSchema, avro.schema.RecordSchema],
-                                                              Tuple[int, int]] = None) -> None:
+        self,
+        start_after_change_table_index: ChangeTableIndex,
+        start_from_key_for_snapshot: Dict[str, Any],
+        lsn_gap_handling: str,
+        schema_id_getter: Callable[[str, avro.schema.RecordSchema, avro.schema.RecordSchema], Tuple[int, int]] = None,
+        progress_reset_fn: Callable[[str, str], None] = None
+    ) -> None:
 
         if self._finalized:
             raise Exception(f"Attempted to finalize table {self.fq_name} more than once")
@@ -197,6 +201,7 @@ class TrackedTable(object):
                 if self.snapshot_allowed:
                     start_from_key_for_snapshot = None
                     logger.warning(msg + 'Beginning new table snapshot!')
+                    progress_reset_fn(self.topic_name, self.capture_instance_name)
                 else:
                     raise Exception(msg + f'lsn_gap_handling was set to "begin_new_snapshot", but due to white/black-'
                                           f'listing, snapshotting of table {self.fq_name} is not allowed!')
@@ -342,7 +347,7 @@ class TrackedTable(object):
                     yield self._value_field_names[pos]
                 pos += 1
 
-    def get_db_time_delta(self):
+    def get_db_time_delta(self) -> datetime.timedelta:
         if (datetime.datetime.utcnow() - TrackedTable._DB_TIME_DELTA_LAST_REFRESH) > datetime.timedelta(minutes=1):
             with self._db_conn.cursor() as cursor:
                 cursor.execute('SELECT GETDATE()')
@@ -438,7 +443,7 @@ class TrackedTable(object):
                            f'FROM [{self.schema_name}].[{self.table_name}] ORDER BY {order_by_spec}')
             return cursor.fetchone()
 
-    def get_change_rows_per_second(self):
+    def get_change_rows_per_second(self) -> int:
         with self._db_conn.cursor() as cursor:
             cursor.execute(constants.CHANGE_ROWS_PER_SECOND_QUERY.format(
                 capture_instance_name=self.capture_instance_name))

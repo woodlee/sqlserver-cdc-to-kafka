@@ -366,8 +366,8 @@ def determine_start_points_and_finalize_tables(
             start_snapshot_value = prior_snapshot_rows_progress and \
                 prior_snapshot_rows_progress['last_ack_snapshot_key_field_values']
 
-        table.finalize_table(start_change_index or constants.BEGINNING_CHANGE_TABLE_INDEX,
-                             start_snapshot_value, lsn_gap_handling, kafka_client.register_schemas)
+        table.finalize_table(start_change_index or constants.BEGINNING_CHANGE_TABLE_INDEX, start_snapshot_value,
+                             lsn_gap_handling, kafka_client.register_schemas, kafka_client.reset_progress)
 
         if not table.snapshot_allowed:
             snapshot_state = '<not doing>'
