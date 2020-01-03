@@ -4,42 +4,24 @@ import hashlib
 import json
 import logging
 import re
+import time
 import uuid
-from functools import total_ordering
 from typing import Tuple, Dict, List, Union, Any, Callable
 
 import avro
 import confluent_kafka
 import pyodbc
 
-from . import avro_from_sql, constants
+from . import avro_from_sql, constants, change_index
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from . import clock_sync
+    from .metric_reporting import accumulator
 
 logger = logging.getLogger(__name__)
 
 NEW_SNAPSHOT = object()
-
-
-@total_ordering
-class ChangeTableIndex(object):
-    # SQL Server CDC capture tables have a single compound index on (lsn, seqval, operation)
-    def __init__(self, lsn: bytes, seqval: bytes, operation: int):
-        self.lsn: bytes = lsn
-        self.seqval: bytes = seqval
-        if isinstance(operation, int):
-            self.operation: int = operation
-        else:
-            self.operation: int = constants.CDC_OPERATION_NAME_TO_ID[operation]
-
-    def __eq__(self, other) -> bool:
-        return self.lsn + self.seqval + bytes([self.operation]) == \
-               other.lsn + other.seqval + bytes([other.operation])
-
-    def __lt__(self, other) -> bool:
-        return self.lsn + self.seqval + bytes([self.operation]) < \
-               other.lsn + other.seqval + bytes([other.operation])
-
-    def __repr__(self) -> str:
-        return f'0x{self.lsn.hex()}:0x{self.seqval.hex()}:{self.operation}'
 
 
 class TrackedField(object):
@@ -61,8 +43,14 @@ class TrackedTable(object):
     _DB_TIME_DELTA: Union[None, datetime.timedelta] = None
     _DB_TIME_DELTA_LAST_REFRESH: datetime.datetime = datetime.datetime.min
 
-    def __init__(self, db_conn: pyodbc.Connection, schema_name: str, table_name: str, capture_instance_name: str,
+    def __init__(self, db_conn: pyodbc.Connection, clock_syncer: 'clock_sync.ClockSync',
+                 metrics_accumulator: 'accumulator.Accumulator',
+                 schema_name: str, table_name: str, capture_instance_name: str,
                  topic_name: str, min_lsn: bytes, snapshot_allowed: bool):
+
+        if topic_name in TrackedTable._REGISTERED_TABLES_BY_KAFKA_TOPIC:
+            raise Exception('TrackedTable __init__ being called multiple times for Kafka topic %s', topic_name)
+
         self.schema_name: str = schema_name
         self.table_name: str = table_name
         self.capture_instance_name: str = capture_instance_name
@@ -90,19 +78,21 @@ class TrackedTable(object):
         self._change_rows_query: Union[None, str] = None
         self._snapshot_rows_query: Union[None, str] = None
         self._initial_snapshot_rows_query: Union[None, str] = None
-        self._last_read_change_table_index: Union[None, ChangeTableIndex] = None
+        self._last_read_change_table_index: Union[None, change_index.ChangeIndex] = None
         self._last_popped_snapshot_row: Union[Tuple, None] = None
         self._last_popped_change_row: Union[Tuple, None] = None
 
         self._fields_added_pending_finalization: List[TrackedField] = []
         self._row_buffer: collections.deque = collections.deque()
         self._db_conn: pyodbc.Connection = db_conn
+        self._clock_syncer: clock_sync.ClockSync = clock_syncer
+        self._metrics_accumulator = metrics_accumulator
         self._last_db_poll_time: datetime.datetime = constants.BEGINNING_DATETIME
         self._finalized: bool = False
         self._has_pk: bool = False
 
     @property
-    def last_read_key_for_snapshot_display(self):
+    def last_read_key_for_snapshot_display(self) -> Union[None, str]:
         if not self._last_read_key_for_snapshot or self._last_read_key_for_snapshot == NEW_SNAPSHOT:
             return None
         return ', '.join([f'{k}: {v}' for k, v in zip(self._key_field_names, self._last_read_key_for_snapshot)])
@@ -125,7 +115,7 @@ class TrackedTable(object):
         # we'll bail and set the progress horizon to the last row we read that has a tran_end_time:
         if (not is_snapshot_row) and next_row[constants.TRAN_END_TIME_POS] is None:
             if self._last_popped_change_row:
-                self._last_read_change_table_index = ChangeTableIndex(
+                self._last_read_change_table_index = change_index.ChangeIndex(
                     self._last_popped_change_row[constants.LSN_POS],
                     self._last_popped_change_row[constants.SEQVAL_POS],
                     self._last_popped_change_row[constants.OPERATION_POS]
@@ -153,12 +143,12 @@ class TrackedTable(object):
     def add_field(self, field: TrackedField) -> None:
         self._fields_added_pending_finalization.append(field)
 
-    def get_source_table_count(self):
+    def get_source_table_count(self) -> int:
         with self._db_conn.cursor() as cursor:
             cursor.execute(f'SELECT COUNT(*) FROM [{self.schema_name}].[{self.table_name}]')
             return cursor.fetchval()
 
-    def get_change_table_counts(self):
+    def get_change_table_counts(self) -> Tuple[int, int, int]:
         with self._db_conn.cursor() as cursor:
             delete, insert, update = 0, 0, 0
             cursor.execute(f'SELECT COUNT(*), __$operation AS op FROM cdc.[{self.capture_instance_name}_CT] '
@@ -178,7 +168,7 @@ class TrackedTable(object):
     # 'Finalizing' mostly means doing the things we can't do until we know all of the table's fields have been added
     def finalize_table(
         self,
-        start_after_change_table_index: ChangeTableIndex,
+        start_after_change_table_index: change_index.ChangeIndex,
         start_from_key_for_snapshot: Dict[str, Any],
         lsn_gap_handling: str,
         schema_id_getter: Callable[[str, avro.schema.RecordSchema, avro.schema.RecordSchema], Tuple[int, int]] = None,
@@ -190,7 +180,7 @@ class TrackedTable(object):
 
         self._finalized = True
 
-        if constants.BEGINNING_CHANGE_TABLE_INDEX.lsn < start_after_change_table_index.lsn < self.min_lsn:
+        if change_index.BEGINNING_CHANGE_INDEX.lsn < start_after_change_table_index.lsn < self.min_lsn:
             msg = (f'The earliest change LSN available in the DB for capture instance {self.capture_instance_name} '
                    f'(0x{self.min_lsn.hex()}) is later than the log position we need to start from based on the prior '
                    f'progress LSN stored in Kafka (0x{start_after_change_table_index.lsn.hex()}). ')
@@ -347,26 +337,18 @@ class TrackedTable(object):
                     yield self._value_field_names[pos]
                 pos += 1
 
-    def get_db_time_delta(self) -> datetime.timedelta:
-        if (datetime.datetime.utcnow() - TrackedTable._DB_TIME_DELTA_LAST_REFRESH) > datetime.timedelta(minutes=1):
-            with self._db_conn.cursor() as cursor:
-                cursor.execute('SELECT GETDATE()')
-                TrackedTable._DB_TIME_DELTA = cursor.fetchval() - datetime.datetime.utcnow()
-            TrackedTable._DB_TIME_DELTA_LAST_REFRESH = datetime.datetime.utcnow()
-            logger.debug('Current DB time delta: %s', TrackedTable._DB_TIME_DELTA)
-        return TrackedTable._DB_TIME_DELTA
-
     # This method's Return value is used to order results in the priority queue used to determine the sequence in
     # which rows are published.
-    def _get_queue_priority_tuple(self, row) -> Tuple[datetime.datetime, bytes, bytes, int, str]:
+    def _get_queue_priority_tuple(
+            self, row: Union[None, Tuple[Any]]) -> Tuple[datetime.datetime, bytes, bytes, int, str]:
         if row is None:
             return (datetime.datetime.utcnow() + constants.DB_TABLE_POLL_INTERVAL,  # defer until ready for next poll
-                    constants.BEGINNING_CHANGE_TABLE_INDEX.lsn,
-                    constants.BEGINNING_CHANGE_TABLE_INDEX.seqval,
+                    change_index.BEGINNING_CHANGE_INDEX.lsn,
+                    change_index.BEGINNING_CHANGE_INDEX.seqval,
                     0,
                     self.fq_name)
 
-        return (row[constants.TRAN_END_TIME_POS] - self.get_db_time_delta(),
+        return (self._clock_syncer.db_time_to_utc(row[constants.TRAN_END_TIME_POS]),
                 row[constants.LSN_POS],
                 row[constants.SEQVAL_POS],
                 row[constants.OPERATION_POS],
@@ -376,26 +358,29 @@ class TrackedTable(object):
         if len(self._row_buffer) > 0:
             return
 
-        if not self.lagging and \
-                (datetime.datetime.utcnow() - self._last_db_poll_time) < constants.DB_TABLE_POLL_INTERVAL:
+        if not self.lagging and (datetime.datetime.utcnow() - self._last_db_poll_time) < \
+                constants.DB_TABLE_POLL_INTERVAL:
             return
 
         change_rows_read_ctr, snapshot_rows_read_ctr = 0, 0
         logger.debug('Polling DB for capture instance %s', self.capture_instance_name)
 
         with self._db_conn.cursor() as cursor:
+            start_time = time.perf_counter()
             cursor.execute(self._change_rows_query, (self._last_read_change_table_index.lsn,
                            self._last_read_change_table_index.seqval, self._last_read_change_table_index.lsn))
             change_row = None
             for change_row in cursor.fetchall():
                 change_rows_read_ctr += 1
                 self._row_buffer.append(change_row)
+            elapsed = (time.perf_counter() - start_time)
+            self._metrics_accumulator.register_db_query(elapsed, False, change_rows_read_ctr)
 
         self._last_db_poll_time = datetime.datetime.utcnow()
 
         if change_row:
             logger.debug('Retrieved %s change rows', change_rows_read_ctr)
-            self._last_read_change_table_index = ChangeTableIndex(
+            self._last_read_change_table_index = change_index.ChangeIndex(
                 change_row[constants.LSN_POS], change_row[constants.SEQVAL_POS], change_row[constants.OPERATION_POS])
 
         self.lagging = change_rows_read_ctr == constants.DB_ROW_BATCH_SIZE
@@ -405,6 +390,7 @@ class TrackedTable(object):
             logger.debug('Polling DB for snapshot rows from %s', self.fq_name)
 
             with self._db_conn.cursor() as cursor:
+                start_time = time.perf_counter()
                 if self._last_read_key_for_snapshot == NEW_SNAPSHOT:
                     cursor.execute(self._initial_snapshot_rows_query, snapshot_query_params)
                 else:
@@ -416,6 +402,8 @@ class TrackedTable(object):
                 for snapshot_row in cursor.fetchall():
                     snapshot_rows_read_ctr += 1
                     self._row_buffer.append(snapshot_row)
+                elapsed = (time.perf_counter() - start_time)
+                self._metrics_accumulator.register_db_query(elapsed, True, snapshot_rows_read_ctr)
 
             if snapshot_row:
                 self._last_read_key_for_snapshot = tuple(snapshot_row[n - 1 + constants.CDC_METADATA_COL_COUNT]
@@ -427,7 +415,7 @@ class TrackedTable(object):
                 self._last_read_key_for_snapshot = None
                 self.snapshot_complete = True
 
-    def _get_max_key_value(self):
+    def _get_max_key_value(self) -> Union[None, Tuple[Any]]:
         order_by_spec = ", ".join([f'{fn} DESC' for fn in self._quoted_key_field_names])
 
         with self._db_conn.cursor() as cursor:
@@ -435,7 +423,7 @@ class TrackedTable(object):
                            f'FROM [{self.schema_name}].[{self.table_name}] ORDER BY {order_by_spec}')
             return cursor.fetchone()
 
-    def _get_min_key_value(self):
+    def _get_min_key_value(self) -> Union[None, Tuple[Any]]:
         order_by_spec = ", ".join([f'{fn} ASC' for fn in self._quoted_key_field_names])
 
         with self._db_conn.cursor() as cursor:
@@ -486,9 +474,11 @@ def get_latest_capture_instance_names(db_conn: pyodbc.Connection, capture_instan
 
 
 def build_tracked_tables_from_cdc_metadata(
-        db_conn: pyodbc.Connection, topic_name_template: str, table_whitelist_regex: str,
-        table_blacklist_regex: str, snapshot_table_whitelist_regex: str, snapshot_table_blacklist_regex: str,
-        capture_instance_version_strategy: str, capture_instance_version_regex: str) -> List[TrackedTable]:
+    db_conn: pyodbc.Connection, clock_syncer: 'clock_sync.ClockSync', metrics_accumulator: 'accumulator.Accumulator',
+    topic_name_template: str, table_whitelist_regex: str, table_blacklist_regex: str,
+    snapshot_table_whitelist_regex: str, snapshot_table_blacklist_regex: str, capture_instance_version_strategy: str,
+    capture_instance_version_regex: str
+) -> List[TrackedTable]:
     result = []
 
     latest_names = get_latest_capture_instance_names(
@@ -538,8 +528,8 @@ def build_tracked_tables_from_cdc_metadata(
         topic_name = topic_name_template.format(
             schema_name=schema_name, table_name=table_name, capture_instance_name=capture_instance_name)
 
-        tracked_table = TrackedTable(db_conn, schema_name, table_name, capture_instance_name, topic_name,
-                                     min_lsn, can_snapshot)
+        tracked_table = TrackedTable(db_conn, clock_syncer, metrics_accumulator, schema_name, table_name,
+                                     capture_instance_name, topic_name, min_lsn, can_snapshot)
 
         for (change_table_ordinal, column_name, sql_type_name, primary_key_ordinal, decimal_precision,
              decimal_scale) in fields:

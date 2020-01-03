@@ -2,7 +2,7 @@ import logging
 
 from tabulate import tabulate
 
-from cdc_kafka import constants
+from . import constants
 
 logger = logging.getLogger(__name__)
 
@@ -36,16 +36,16 @@ class Validator(object):
                     op = msg.value()[constants.OPERATION_NAME]
                     key = tuple(msg.key().items())
 
-                    if op == 'Delete':
+                    if op == constants.DELETE_OPERATION_NAME:
                         kafka_change_msg_keys.discard(key)
                         kafka_total_deletes += 1
-                    elif op == 'Snapshot':
+                    elif op == constants.SNAPSHOT_OPERATION_NAME:
                         kafka_snapshot_msg_keys.add(key)
                         kafka_total_snapshots += 1
-                    elif op == 'PostUpdate':
+                    elif op == constants.POST_UPDATE_OPERATION_NAME:
                         kafka_change_msg_keys.add(key)
                         kafka_total_updates += 1
-                    elif op == 'Insert':
+                    elif op == constants.INSERT_OPERATION_NAME:
                         kafka_change_msg_keys.add(key)
                         kafka_total_inserts += 1
                     else:

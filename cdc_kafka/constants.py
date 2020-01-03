@@ -3,17 +3,14 @@ import json
 
 import confluent_kafka.avro
 
-from .tracked_tables import ChangeTableIndex
-
 # General; some of these things could be made configurable later if needed:
 
 DB_ROW_BATCH_SIZE = 1000
 DB_TABLE_POLL_INTERVAL = datetime.timedelta(seconds=3)
-STABLE_WATERMARK_CHECKS_INTERVAL_SECONDS = 5
+STABLE_WATERMARK_CHECKS_DELAY_SECONDS = 5
 PROGRESS_COMMIT_INTERVAL = datetime.timedelta(seconds=5)
 FULL_FLUSH_MAX_INTERVAL = datetime.timedelta(seconds=60)
 KAFKA_DELIVERY_SUCCESS_LOG_EVERY_NTH_MSG = 1000
-BEGINNING_CHANGE_TABLE_INDEX = ChangeTableIndex(b'\x00' * 10, b'\x00' * 10, 0)
 BEGINNING_DATETIME = datetime.datetime(2000, 1, 1)
 MESSAGE_KEY_FIELD_NAME_WHEN_PK_ABSENT = 'row_hash'
 KEY_SCHEMA_COMPATIBILITY_LEVEL = 'FULL'
@@ -54,19 +51,34 @@ PROGRESS_MESSAGE_AVRO_VALUE_SCHEMA = confluent_kafka.avro.loads(json.dumps({
     ]
 }))
 
-# CDC operation types
+# CDC operation types; IDs 1-4 here match what SQL Server provides; ID 0 is of our own creation:
 
 SNAPSHOT_OPERATION_ID = 0
 SNAPSHOT_OPERATION_NAME = 'Snapshot'
+DELETE_OPERATION_ID = 1
+DELETE_OPERATION_NAME = 'Delete'
+INSERT_OPERATION_ID = 2
+INSERT_OPERATION_NAME = 'Insert'
+PRE_UPDATE_OPERATION_ID = 3
+PRE_UPDATE_OPERATION_NAME = 'PreUpdate'
+POST_UPDATE_OPERATION_ID = 4
+POST_UPDATE_OPERATION_NAME = 'PostUpdate'
 
 CDC_OPERATION_ID_TO_NAME = {
     SNAPSHOT_OPERATION_ID: SNAPSHOT_OPERATION_NAME,
-    1: "Delete",
-    2: "Insert",
-    3: "PreUpdate",
-    4: "PostUpdate"
+    DELETE_OPERATION_ID: DELETE_OPERATION_NAME,
+    INSERT_OPERATION_ID: INSERT_OPERATION_NAME,
+    PRE_UPDATE_OPERATION_ID: PRE_UPDATE_OPERATION_NAME,
+    POST_UPDATE_OPERATION_ID: POST_UPDATE_OPERATION_NAME,
 }
-CDC_OPERATION_NAME_TO_ID = {v: k for k, v in CDC_OPERATION_ID_TO_NAME.items()}
+
+CDC_OPERATION_NAME_TO_ID = {
+    SNAPSHOT_OPERATION_NAME: SNAPSHOT_OPERATION_ID,
+    DELETE_OPERATION_NAME: DELETE_OPERATION_ID,
+    INSERT_OPERATION_NAME: INSERT_OPERATION_ID,
+    PRE_UPDATE_OPERATION_NAME: PRE_UPDATE_OPERATION_ID,
+    POST_UPDATE_OPERATION_NAME: POST_UPDATE_OPERATION_ID,
+}
 
 # SQL queries
 
@@ -100,9 +112,8 @@ WHERE ct.capture_instance IN (?)
 ORDER BY ct.object_id, cc.column_ordinal
 '''
 
-LAG_QUERY = '''
-SELECT TOP 1 tran_end_time, DATEDIFF(ms, tran_end_time, GETDATE()) 
-FROM cdc.lsn_time_mapping ORDER BY tran_end_time DESC
+LATEST_CDC_ENTRY_TIME_QUERY = '''
+SELECT TOP 1 tran_end_time FROM cdc.lsn_time_mapping ORDER BY tran_end_time DESC
 '''
 
 CHANGE_ROWS_PER_SECOND_QUERY = '''
