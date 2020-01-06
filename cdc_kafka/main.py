@@ -67,6 +67,7 @@ def run() -> None:
 
             try:
                 while True:
+
                     if (datetime.datetime.utcnow() - last_metrics_emission_time) > metrics_interval:
                         start_time = time.perf_counter()
                         metrics = metrics_accumulator.end_and_get_values()
@@ -82,8 +83,9 @@ def run() -> None:
 
                     priority_tuple, msg_key, msg_value, table = pq.get()
                     act_time = priority_tuple[0]
-                    if act_time > datetime.datetime.utcnow():
-                        sleep_time = (act_time - datetime.datetime.utcnow()).total_seconds()
+                    now = datetime.datetime.utcnow()
+                    if act_time > now:
+                        sleep_time = (act_time - now).total_seconds()
                         time.sleep(sleep_time)
                         metrics_accumulator.register_sleep(sleep_time)
 

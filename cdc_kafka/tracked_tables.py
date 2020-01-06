@@ -40,8 +40,6 @@ class TrackedField(object):
 
 class TrackedTable(object):
     _REGISTERED_TABLES_BY_KAFKA_TOPIC: Dict[str, 'TrackedTable'] = {}
-    _DB_TIME_DELTA: Union[None, datetime.timedelta] = None
-    _DB_TIME_DELTA_LAST_REFRESH: datetime.datetime = datetime.datetime.min
 
     def __init__(self, db_conn: pyodbc.Connection, clock_syncer: 'clock_sync.ClockSync',
                  metrics_accumulator: 'accumulator.Accumulator',
