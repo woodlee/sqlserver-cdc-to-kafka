@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 class KafkaClient(object):
     _instance = None
+    WARNED_TIMESTAMPS = False
 
     def __init__(self,
                  metrics_accumulator: 'accumulator.Accumulator',
@@ -437,4 +438,15 @@ class KafkaClient(object):
 
         key = (kind, msg.topic())
         self._progress_messages_awaiting_commit[key][msg.partition()] = (produce_sequence, progress_msg)
-        self._metrics_accumulator.register_kafka_delivery_callback(orig_value)
+
+        timestamp_type, timestamp = msg.timestamp()
+        if timestamp_type != confluent_kafka.TIMESTAMP_CREATE_TIME:
+            if not KafkaClient.WARNED_TIMESTAMPS:
+                logger.warning('Kafka message producer timestamps not available; falling back to delivery '
+                               'callback times for measuring E2E latencies.')
+                KafkaClient.WARNED_TIMESTAMPS = True
+            produce_time = datetime.datetime.utcnow()
+        else:
+            produce_time = datetime.datetime.utcfromtimestamp(timestamp / 1000.0)
+
+        self._metrics_accumulator.register_kafka_delivery_callback(orig_value, produce_time)

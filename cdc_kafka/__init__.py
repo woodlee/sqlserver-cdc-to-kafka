@@ -26,8 +26,7 @@ logging.config.dictConfig({
     },
     'formatters': {
         'simple': {
-            'datefmt': '%Y-%m-%d %H:%M:%S',
-            'format': '(%(threadName)s) %(asctime)s %(levelname)-8s [%(name)s:%(lineno)s] %(message)s',
+            'format': '%(asctime)s %(levelname)-8s [%(name)s:%(lineno)s] %(message)s',
         },
     },
 })

@@ -21,10 +21,12 @@ class ClockSync(object):
         ClockSync._instance = self
 
     def db_time_to_utc(self, db_time: datetime.datetime) -> datetime.datetime:
-        if (datetime.datetime.utcnow() - self._last_sync_time) > ClockSync.SYNC_INTERVAL:
+        local_now = datetime.datetime.utcnow()
+        if (local_now - self._last_sync_time) > ClockSync.SYNC_INTERVAL:
             with self._db_conn.cursor() as cursor:
                 cursor.execute('SELECT GETDATE()')
-                self._clock_skew = datetime.datetime.utcnow() - cursor.fetchval()
-            self._last_sync_time = datetime.datetime.utcnow()
-            logger.debug('Current DB time delta: %s', self._clock_skew)
+                db_now = cursor.fetchval()
+                self._clock_skew = local_now - db_now
+            self._last_sync_time = local_now
+            logger.debug('Current DB time: %s; local process UTC: %s; delta: %s', db_now, local_now, self._clock_skew)
         return db_time + self._clock_skew

@@ -15,8 +15,6 @@ if TYPE_CHECKING:
 class Accumulator(object):
     _instance = None
 
-    # In this class, all variables ending with _time represent cumulative totals in seconds
-
     def __init__(self, db_conn: pyodbc.Connection, clock_syncer: 'clock_sync.ClockSync',
                  metrics_namespace: str, process_hostname: str):
         if Accumulator._instance is not None:
@@ -95,7 +93,6 @@ class Accumulator(object):
         m.e2e_latency_max_sec = (self._e2e_latencies_sec and max(self._e2e_latencies_sec)) or None
         m.e2e_latency_min_sec = (self._e2e_latencies_sec and min(self._e2e_latencies_sec)) or None
 
-        m.cdc_to_kafka_process_lag_sec = (self._e2e_latencies_sec and self._e2e_latencies_sec[-1] - cdc_lag) or None
         m.sql_server_cdc_process_lag_sec = cdc_lag
 
         m.db_all_data_queries_avg_time_per_query_ms = \
@@ -193,10 +190,10 @@ class Accumulator(object):
         self._kafka_progress_commit_and_flush_count += 1
         self._kafka_progress_commit_and_flush_total_time_sec += seconds_elapsed
 
-    def register_kafka_delivery_callback(self, message_value: Dict[str, Any]) -> None:
+    def register_kafka_delivery_callback(self, message_value: Dict[str, Any],  produce_time: datetime.datetime) -> None:
         self._kafka_delivery_acks_count += 1
         if message_value[constants.OPERATION_NAME] != constants.SNAPSHOT_OPERATION_NAME:
-            end_time = self._clock_syncer.db_time_to_utc(datetime.datetime.fromisoformat(
+            db_commit_time = self._clock_syncer.db_time_to_utc(datetime.datetime.fromisoformat(
                 message_value[constants.TRAN_END_TIME_NAME]))
-            e2e_latency = (datetime.datetime.utcnow() - end_time).total_seconds()
+            e2e_latency = (produce_time - db_commit_time).total_seconds()
             self._e2e_latencies_sec.append(e2e_latency)

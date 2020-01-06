@@ -24,7 +24,6 @@ class Metrics(object):
         ("e2e_latency_max_sec", ["null", "float"]),
         ("e2e_latency_min_sec", ["null", "float"]),
 
-        ("cdc_to_kafka_process_lag_sec", ["null", "float"]),
         ("sql_server_cdc_process_lag_sec", ["null", "float"]),
 
         ("db_all_data_queries_avg_time_per_query_ms", ["null", "float"]),
