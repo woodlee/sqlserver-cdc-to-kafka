@@ -122,6 +122,14 @@ FROM cdc.[{capture_instance_name}_CT] AS ct WITH (NOLOCK)
 INNER JOIN cdc.lsn_time_mapping AS ltm WITH (NOLOCK) ON ct.__$start_lsn = ltm.start_lsn
 '''
 
+CHANGE_TABLE_INDEX_COLS_QUERY = '''
+SELECT COL_NAME(ic.object_id, ic.column_id)
+FROM sys.indexes AS i
+INNER JOIN sys.index_columns AS ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+WHERE i.object_id = OBJECT_ID(?) AND type_desc = 'CLUSTERED'
+ORDER BY key_ordinal
+'''
+
 CDC_METADATA_COL_COUNT = 5
 
 LSN_POS = 0
@@ -160,7 +168,7 @@ SELECT TOP ({DB_ROW_BATCH_SIZE})
 FROM ct 
 LEFT JOIN cdc.lsn_time_mapping AS ltm WITH (NOLOCK) ON (ct.__$start_lsn = ltm.start_lsn)
 WHERE ct.__$operation = 1 OR ct.__$operation = 2 OR ct.__$operation = 4
-ORDER BY __$start_lsn, __$command_id, __$seqval, __$operation
+ORDER BY {{order_spec}}
 '''
 
 SNAPSHOT_ROWS_QUERY_TEMPLATE = f'''

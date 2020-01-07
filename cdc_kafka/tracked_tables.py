@@ -239,8 +239,22 @@ class TrackedTable(object):
 
         select_column_specs = ', '.join([f'ct.[{f}]' for f in self._value_field_names])
 
+        with self._db_conn.cursor() as cursor:
+            cursor.execute(constants.CHANGE_TABLE_INDEX_COLS_QUERY, (f'cdc.{self.capture_instance_name}_CT', ))
+            change_table_clustered_idx_cols = [r[0] for r in cursor.fetchall()]
+
+        required_metadata_cols_ordered = ['__$start_lsn', '__$seqval', '__$operation']
+        found_metadata_cols = [c for c in change_table_clustered_idx_cols if c in required_metadata_cols_ordered]
+
+        if found_metadata_cols != required_metadata_cols_ordered:
+            raise Exception(f'The index for change table {self.capture_instance_name}_CT did not contain the expected '
+                            f'CDC metadata columns, or contained them in the wrong order. Index columns found '
+                            f'were: {change_table_clustered_idx_cols}')
+
+        order_spec = ', '.join(change_table_clustered_idx_cols)
+
         self._change_rows_query = constants.CHANGE_ROWS_QUERY_TEMPLATE.format(
-            fields=select_column_specs, capture_instance_name=self.capture_instance_name)
+            fields=select_column_specs, capture_instance_name=self.capture_instance_name, order_spec=order_spec)
 
         if self.snapshot_allowed:
             if self._has_pk:
