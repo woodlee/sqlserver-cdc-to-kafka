@@ -19,7 +19,7 @@ class HttpPostReporter(reporter_base.ReporterBase):
     def __init__(self):
         self._url = None
         self._template = None
-        self._headers = None
+        self._headers = {}
 
     def emit(self, metrics: 'Metrics') -> None:
         if self._template:
@@ -35,13 +35,13 @@ class HttpPostReporter(reporter_base.ReporterBase):
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument('--http-metrics-url', default=os.environ.get('HTTP_METRICS_URL'),
                             help='URL to target when publishing process metrics metadata via the HttpPostReporter.')
-        parser.add_argument('--http-metrics-headers', default=os.environ.get('HTTP_METRICS_HEADERS'),
-                            help='Optional HTTP headers to send along with the POST when publishing process metrics '
-                                 'metadata via the HttpPostReporter. Pass as a JSON object string.')
+        parser.add_argument('--http-metrics-headers', default=os.environ.get('HTTP_METRICS_HEADERS'), type=json.loads,
+                            help='Optional JSON object of HTTP headers to send along with the POST when publishing '
+                                 'process metrics via the HttpPostReporter.')
         parser.add_argument('--http-metrics-template', default=os.environ.get('HTTP_METRICS_TEMPLATE'),
                             help='An optional Jinja2 template used to create the HTTP POST body when publishing '
-                                 'process metrics metadata via the HttpPostReporter. It has access to the fields '
-                                 'defined in the metric_reporting.metrics.Metrics class.')
+                                 'process metrics via the HttpPostReporter. It may reference the fields defined in '
+                                 'the metric_reporting.metrics.Metrics class.')
 
     def set_options(self, opts) -> None:
         if not opts.http_metrics_url:
@@ -53,6 +53,6 @@ class HttpPostReporter(reporter_base.ReporterBase):
             self._template = Template(opts.http_metrics_template)
 
         if opts.http_metrics_headers:
-            self._headers = json.loads(opts.http_metrics_headers)
+            self._headers = opts.http_metrics_headers
 
 

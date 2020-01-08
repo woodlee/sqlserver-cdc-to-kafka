@@ -32,8 +32,8 @@ class KafkaClient(object):
                  kafka_timeout_seconds: int,
                  progress_topic_name: str,
                  capture_instance_name_resolver: Callable[[str], str],
-                 extra_kafka_consumer_config: str,
-                 extra_kafka_producer_config: str):
+                 extra_kafka_consumer_config: Dict[str, Union[str, int]],
+                 extra_kafka_producer_config: Dict[str, Union[str, int]]):
 
         if KafkaClient._instance is not None:
             raise Exception('KafkaClient class should be used as a singleton.')
@@ -43,32 +43,22 @@ class KafkaClient(object):
         self._progress_topic_name: str = progress_topic_name
         self._capture_instance_name_resolver: Callable[[str], str] = capture_instance_name_resolver
 
-        consumer_config = {
+        consumer_config = {**{
             'bootstrap.servers': bootstrap_servers,
             'group.id': f'cdc_to_kafka_progress_check_{socket.getfqdn()}',
             'enable.partition.eof': True
-        }
-        producer_config = {
+        }, **extra_kafka_consumer_config}
+        producer_config = {**{
             'bootstrap.servers': bootstrap_servers,
             'linger.ms': '50',
             'enable.idempotence': True,
             'enable.gapless.guarantee': True,
             'retry.backoff.ms': 250,
             'compression.codec': 'snappy'
-        }
+        }, **extra_kafka_producer_config}
         admin_config = {
             'bootstrap.servers': bootstrap_servers
         }
-
-        if extra_kafka_consumer_config:
-            for extra in extra_kafka_consumer_config.split(';'):
-                k, v = extra.split(':')
-                consumer_config[k] = v
-
-        if extra_kafka_producer_config:
-            for extra in extra_kafka_producer_config.split(';'):
-                k, v = extra.split(':')
-                producer_config[k] = v
 
         logger.debug('Kafka consumer configuration: %s', json.dumps(consumer_config))
         logger.debug('Kafka producer configuration: %s', json.dumps(producer_config))
@@ -270,16 +260,12 @@ class KafkaClient(object):
             yield msg
 
     def create_topic(self, topic_name: str, partition_count: int, replication_factor: int = None,
-                     extra_config: str = None) -> None:
+                     extra_config: Dict[str, Union[str, int]] = None) -> None:
         if not replication_factor:
             replication_factor = min(len(self._cluster_metadata.brokers), 3)
 
-        topic_config = {'cleanup.policy': 'compact'}
-
-        if extra_config:
-            for extra in extra_config.split(';'):
-                k, v = extra.split(':')
-                topic_config[k] = v
+        extra_config = extra_config or {}
+        topic_config = {**{'cleanup.policy': 'compact'}, **extra_config}
 
         logger.debug('Kafka topic configuration for %s: %s', topic_name, json.dumps(topic_config))
         topic = confluent_kafka.admin.NewTopic(topic_name, partition_count, replication_factor, config=topic_config)
@@ -293,7 +279,7 @@ class KafkaClient(object):
                            self._progress_topic_name)
             # log.segment.bytes set to 16 MB. Compaction will not run until the next log segment rolls so we set this
             # a bit low (the default is 1 GB) to prevent having to read too much from the topic on process start:
-            self.create_topic(self._progress_topic_name, 1, extra_config='segment.bytes:16777216')
+            self.create_topic(self._progress_topic_name, 1, extra_config={"segment.bytes": 16777216})
             time.sleep(5)
             self.refresh_cluster_metadata()
             return {}
