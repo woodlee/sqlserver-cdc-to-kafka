@@ -4,7 +4,7 @@ import logging
 import queue
 import re
 import time
-from typing import List
+from typing import List, Dict, Union
 
 import pyodbc
 from tabulate import tabulate
@@ -39,7 +39,7 @@ def run() -> None:
             tables = tracked_tables.build_tracked_tables_from_cdc_metadata(
                 db_conn, clock_syncer, metrics_accumulator, opts.topic_name_template, opts.table_whitelist_regex,
                 opts.table_blacklist_regex, opts.snapshot_table_whitelist_regex, opts.snapshot_table_blacklist_regex,
-                opts.capture_instance_version_strategy, opts.capture_instance_version_regex)
+                opts.capture_instance_version_strategy, opts.capture_instance_version_regex, opts.truncate_fields)
 
             determine_start_points_and_finalize_tables(
                 kafka_client, tables, opts.lsn_gap_handling, opts.partition_count, opts.replication_factor,
@@ -110,8 +110,8 @@ def run() -> None:
 
 def determine_start_points_and_finalize_tables(
         kafka_client: kafka.KafkaClient, tables: List[tracked_tables.TrackedTable], lsn_gap_handling: str,
-        partition_count: int, replication_factor: int, extra_topic_config: str, progress_csv_path: str = None,
-        validation_mode: bool = False) -> None:
+        partition_count: int, replication_factor: int, extra_topic_config: Dict[str, Union[str, int]],
+        progress_csv_path: str = None, validation_mode: bool = False) -> None:
     topic_names = [t.topic_name for t in tables]
 
     if validation_mode:
@@ -210,8 +210,9 @@ def get_db_conn(odbc_conn_string: str) -> pyodbc.Connection:
     # connections. If a failover happens while this process is running, the app will crash. Have a process supervisor
     # that can restart it if that happens, and it'll connect to the failover on restart:
     # THIS ASSUMES that you are using the exact keywords 'SERVER' and 'Failover_Partner' in your connection string!
+    conn = None
     try:
-        return pyodbc.connect(odbc_conn_string)
+        conn = pyodbc.connect(odbc_conn_string)
     except pyodbc.ProgrammingError as e:
         if e.args[0] != '42000':
             raise
@@ -221,4 +222,19 @@ def get_db_conn(odbc_conn_string: str) -> pyodbc.Connection:
             failover_partner = failover_partner.groups('hostname')[0]
             server = server.groups('hostname')[0]
             odbc_conn_string = odbc_conn_string.replace(server, failover_partner)
-            return pyodbc.connect(odbc_conn_string)
+            conn = pyodbc.connect(odbc_conn_string)
+
+    def decode_truncated_utf16(raw_bytes):
+        # SQL Server generally uses UTF-16-LE encoding for text. The length of NCHAR and NVARCHAR columns is the number
+        # of byte pairs that can be stored in the column. But some higher UTF-16 codepoints are 4 bytes long. So it's
+        # possible for a 4-byte character to get truncated halfway through, causing decode errors. This is to work
+        # around that.
+        try:
+            return raw_bytes.decode("utf-16le")
+        except UnicodeDecodeError:
+            return raw_bytes[:-2].decode("utf-16le")
+
+    conn.add_output_converter(pyodbc.SQL_WVARCHAR, decode_truncated_utf16)
+    conn.add_output_converter(pyodbc.SQL_WCHAR, decode_truncated_utf16)
+
+    return conn

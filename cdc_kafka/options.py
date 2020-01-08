@@ -1,5 +1,6 @@
 import argparse
 import importlib
+import json
 import os
 import socket
 
@@ -39,17 +40,21 @@ def get_options_and_reporters():
                         "pulling messages to check existing progress.")
 
     p.add_argument('--extra-kafka-consumer-config',
-                   default=os.environ.get('EXTRA_KAFKA_CONSUMER_CONFIG'),
-                   help="Additional config parameters to be used when instantiating the Kafka consumer (used only for "
-                        "checking saved progress upon startup, and when in validation mode). Should be a "
-                        "semicolon-separated list of colon-delimited librdkafka config key:value pairs, e.g. "
-                        "'queued.max.messages.kbytes:500000;fetch.wait.max.ms:250'")
+                   default=os.environ.get('EXTRA_KAFKA_CONSUMER_CONFIG', {}), type=json.loads,
+                   help='Optional JSON object of additional librdkafka config parameters to be used when instantiating '
+                        'the Kafka consumer (used only for checking saved progress upon startup, and when in '
+                        'validation mode). For example: '
+                        '`{"queued.max.messages.kbytes": "500000", "fetch.wait.max.ms": "250"}`')
 
     p.add_argument('--extra-kafka-producer-config',
-                   default=os.environ.get('EXTRA_KAFKA_PRODUCER_CONFIG'),
-                   help="Additional config parameters to be used when instantiating the Kafka producer. Should be a "
-                        "semicolon-separated list of colon-delimited librdkafka config key:value pairs, e.g. "
-                        "'linger.ms:200;retry.backoff.ms:250'")
+                   default=os.environ.get('EXTRA_KAFKA_PRODUCER_CONFIG', {}), type=json.loads,
+                   help='Optional JSON object of additional librdkafka config parameters to be used when instantiating '
+                        'the Kafka producer. For example: `{"linger.ms": "200", "retry.backoff.ms": "250"}`')
+
+    p.add_argument('--extra-topic-config',
+                   default=os.environ.get('EXTRA_TOPIC_CONFIG', {}), type=json.loads,
+                   help='Optional JSON object of additional librdkafka config parameters to be used when creating new '
+                        'topics. For example: `{"min.insync.replicas": "2"}`.')
 
     p.add_argument('--table-blacklist-regex',
                    default=os.environ.get('TABLE_BLACKLIST_REGEX'),
@@ -150,22 +155,23 @@ def get_options_and_reporters():
                         "the daily average number of rows currently on the change table integer-divided by 500,000, "
                         "whichever is larger.")
 
+    p.add_argument('--progress-csv-path',
+                   default=os.environ.get('PROGRESS_CSV_PATH'),
+                   help="File path to which CSV files will be written with data read from the existing progress "
+                        "topic at startup time.")
+
     p.add_argument('--replication-factor',
                    type=int,
                    default=os.environ.get('REPLICATION_FACTOR'),
                    help="Replication factor to specify when creating new topics. If left empty, defaults to 3 or the "
                         "number of brokers in the cluster, whichever is smaller.")
 
-    p.add_argument('--extra-topic-config',
-                   default=os.environ.get('EXTRA_TOPIC_CONFIG'),
-                   help="Additional config parameters to be used when creating new topics. Should be a "
-                        "semicolon-separated list of colon-delimited librdkafka config key:value pairs, e.g. "
-                        "'min.insync.replicas:2'")
-
-    p.add_argument('--progress-csv-path',
-                   default=os.environ.get('PROGRESS_CSV_PATH'),
-                   help="File path to which CSV files will be written with data read from the existing progress "
-                        "topic at startup time.")
+    p.add_argument('--truncate-fields',
+                   default=os.environ.get('TRUNCATE_FIELDS', {}), type=json.loads,
+                   help='Optional JSON object that maps schema.table.column names to an integer max number of '
+                        'characters that should be copied into the Kafka message for that field\'s values. The schema, '
+                        'table, and column names are case-insensitive. Example: `{"dbo.order.gift_note": 65536}`. '
+                        'Note that this truncates based on _character_ length, not _byte_ length!')
 
     opts = p.parse_args()
 

@@ -26,7 +26,7 @@ NEW_SNAPSHOT = object()
 
 class TrackedField(object):
     def __init__(self, name: str, sql_type_name: str, change_table_ordinal: int, primary_key_ordinal: int,
-                 decimal_precision: int, decimal_scale: int):
+                 decimal_precision: int, decimal_scale: int, truncate_after: Union[int, None] = None):
         self.name: str = name
         self.sql_type_name: str = sql_type_name
         self.change_table_ordinal: int = change_table_ordinal
@@ -36,6 +36,13 @@ class TrackedField(object):
         self.nullable_avro_schema: Dict = avro_from_sql.avro_schema_from_sql_type(
             name, sql_type_name, decimal_precision, decimal_scale, True)
         self.transform_fn: Callable = avro_from_sql.avro_transform_fn_from_sql_type(sql_type_name)
+
+        if truncate_after is not None:
+            if self.sql_type_name not in avro_from_sql.SQL_STRING_TYPES:
+                raise Exception(f'A truncation length was specified for field {name} but it does not appear to be a '
+                                f'string field (SQL type is {sql_type_name}).')
+            orig_transform = self.transform_fn
+            self.transform_fn = lambda x: orig_transform(x)[:int(truncate_after)]
 
 
 class TrackedTable(object):
@@ -489,9 +496,11 @@ def build_tracked_tables_from_cdc_metadata(
     db_conn: pyodbc.Connection, clock_syncer: 'clock_sync.ClockSync', metrics_accumulator: 'accumulator.Accumulator',
     topic_name_template: str, table_whitelist_regex: str, table_blacklist_regex: str,
     snapshot_table_whitelist_regex: str, snapshot_table_blacklist_regex: str, capture_instance_version_strategy: str,
-    capture_instance_version_regex: str
+    capture_instance_version_regex: str, truncate_fields: Dict[str, int]
 ) -> List[TrackedTable]:
     result = []
+
+    truncate_fields = {k.lower(): v for k, v in truncate_fields.items()}
 
     latest_names = get_latest_capture_instance_names(
         db_conn, capture_instance_version_strategy, capture_instance_version_regex)
@@ -545,8 +554,9 @@ def build_tracked_tables_from_cdc_metadata(
 
         for (change_table_ordinal, column_name, sql_type_name, primary_key_ordinal, decimal_precision,
              decimal_scale) in fields:
-            tracked_table.add_field(TrackedField(column_name, sql_type_name, change_table_ordinal,
-                                                 primary_key_ordinal, decimal_precision, decimal_scale))
+            truncate_after = truncate_fields.get(f'{schema_name}.{table_name}.{column_name}'.lower())
+            tracked_table.add_field(TrackedField(column_name, sql_type_name, change_table_ordinal, primary_key_ordinal,
+                                                 decimal_precision, decimal_scale, truncate_after))
 
         result.append(tracked_table)
 

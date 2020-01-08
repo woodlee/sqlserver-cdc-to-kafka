@@ -2,6 +2,8 @@ from typing import List, Dict, Callable, Any
 
 from . import constants
 
+SQL_STRING_TYPES = ('char', 'nchar', 'varchar', 'ntext', 'nvarchar', 'text')
+
 
 # These fields are common to all messages (except progress tracking messages) published to Kafka by this process
 def get_cdc_metadata_fields_avro_schemas(source_field_names: List[str]) -> List[Dict[str, Any]]:
@@ -63,7 +65,7 @@ def avro_schema_from_sql_type(source_field_name: str, sql_type_name: str, decima
         return {"name": source_field_name, "type": maybe_null_union({"type": "int", "logicalType": "date"})}
     elif sql_type_name in ('int', 'smallint', 'tinyint'):
         return {"name": source_field_name, "type": maybe_null_union("int")}
-    elif sql_type_name in ('datetime', 'datetime2', 'char', 'nchar', 'varchar', 'ntext', 'nvarchar', 'text'):
+    elif sql_type_name in ('datetime', 'datetime2') + SQL_STRING_TYPES:
         return {"name": source_field_name, "type": maybe_null_union("string")}
     elif sql_type_name == 'time':
         return {"name": source_field_name, "type": maybe_null_union({"type": "int", "logicalType": "time-millis"})}
