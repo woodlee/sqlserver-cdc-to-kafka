@@ -2,6 +2,7 @@ import datetime
 import json
 
 import confluent_kafka.avro
+import pyodbc
 
 # General; some of these things could be made configurable later if needed:
 
@@ -146,17 +147,26 @@ TRAN_END_TIME_NAME = '_cdc_tran_end_time'
 # You may feel tempted to change or simplify this query. TREAD CAREFULLY. There was a lot of iterating here to
 # craft something that would not induce SQL Server to resort to a full index scan. If you change it, run some
 # EXPLAINs and ensure that the steps are still only index SEEKs, not scans.
+
+# TODO FIX THIS NOW THAT YOU KNOW!
+
+CHANGE_ROWS_QUERY_PARAM_TYPES = [(pyodbc.SQL_BINARY, 10, None), (pyodbc.SQL_BINARY, 10, None)]
 CHANGE_ROWS_QUERY_TEMPLATE = f'''
+DECLARE 
+    @LSN BINARY(10) = ?
+    , @SEQ BINARY(10) = ?
+;
+
 WITH ct AS (
     SELECT *
     FROM cdc.[{{capture_instance_name}}_CT] AS ct WITH (NOLOCK)
-    WHERE ct.__$start_lsn = ? AND ct.__$seqval > ?
+    WHERE ct.__$start_lsn = @LSN AND ct.__$seqval > @SEQ
 
     UNION ALL
 
     SELECT *
     FROM cdc.[{{capture_instance_name}}_CT] AS ct WITH (NOLOCK)
-    WHERE ct.__$start_lsn > ?
+    WHERE ct.__$start_lsn > @LSN
 )
 SELECT TOP ({DB_ROW_BATCH_SIZE})
     ct.__$start_lsn AS {LSN_NAME}
@@ -172,7 +182,11 @@ ORDER BY {{order_spec}}
 '''
 
 SNAPSHOT_ROWS_QUERY_TEMPLATE = f'''
-SELECT TOP (?)
+DECLARE 
+    {{declarations}}
+;
+
+SELECT TOP ({DB_ROW_BATCH_SIZE})
     0x00000000000000000000 AS {LSN_NAME}
     , 0x00000000000000000000 AS {SEQVAL_NAME}
     , {SNAPSHOT_OPERATION_ID} AS {OPERATION_NAME}

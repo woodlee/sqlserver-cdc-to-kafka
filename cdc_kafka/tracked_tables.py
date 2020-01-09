@@ -82,6 +82,7 @@ class TrackedTable(object):
         self._last_read_key_for_snapshot: Union[None, Tuple] = None
         self._change_rows_query: Union[None, str] = None
         self._snapshot_rows_query: Union[None, str] = None
+        self._snapshot_query_param_types: List[Tuple[int, int, int]] = []
         self._initial_snapshot_rows_query: Union[None, str] = None
         self._last_read_change_table_index: Union[None, change_index.ChangeIndex] = None
         self._last_popped_snapshot_row: Union[Tuple, None] = None
@@ -264,23 +265,36 @@ class TrackedTable(object):
             fields=select_column_specs, capture_instance_name=self.capture_instance_name, order_spec=order_spec)
 
         if self.snapshot_allowed:
+            with self._db_conn.cursor() as cursor:
+                cursor.columns(schema=self.schema_name, table=self.table_name)
+                # 3) column_name
+                # 4) data_type
+                # 5) type_name
+                # 6) column_size
+                # 8) decimal_digits
+                odbc_types = {x[3].lower(): (x[4], x[5], x[6], x[8]) for x in cursor.fetchall()}
+
             if self._has_pk:
                 # For multi-column primary keys, this builds a WHERE clause of the following form, assuming
                 # for example a PK on (field_a, field_b, field_c):
-                #   WHERE (field_a < ?)
-                #    OR (field_a = ? AND field_b < ?)
-                #    OR (field_a = ? AND field_b = ? AND field_c < ?)
-                where_clauses = []
-                for ix, field_name in enumerate(self._quoted_key_field_names):
+                #   WHERE (field_a < @P0)
+                #    OR (field_a = @P0 AND field_b < @P1)
+                #    OR (field_a = @P0 AND field_b = @P1 AND field_c < @P2)
+                where_clauses, param_declarations = [], []
+
+                for ix, field in enumerate(self._key_fields):
                     clauses = []
-                    for jx, prior_field_name in enumerate(self._quoted_key_field_names[0:ix]):
-                        clauses.append(f'{prior_field_name} = ?')
-                    clauses.append(f'{field_name} < ?')
+                    for jx, prior_field in enumerate(self._key_fields[0:ix]):
+                        clauses.append(f'[{prior_field.name}] = @P{jx}')
+                    clauses.append(f'[{field.name}] < @P{ix}')
                     where_clauses.append(f"({' AND '.join(clauses)})")
+                    data_type, type_name, column_size, decimal_digits = odbc_types[field.name.lower()]
+                    self._snapshot_query_param_types.append((data_type, column_size, decimal_digits))
+                    param_declarations.append(f'@P{ix} {type_name} = ?')
 
                 self._snapshot_rows_query = constants.SNAPSHOT_ROWS_QUERY_TEMPLATE.format(
-                    fields=select_column_specs, schema_name=self.schema_name,
-                    table_name=self.table_name, where_spec=' OR '.join(where_clauses),
+                    declarations=', '.join(param_declarations), fields=select_column_specs,
+                    schema_name=self.schema_name, table_name=self.table_name, where_spec=' OR '.join(where_clauses),
                     order_spec=', '.join([f'{x} DESC' for x in self._quoted_key_field_names])
                 )
 
@@ -300,8 +314,8 @@ class TrackedTable(object):
                                     ', '.join([f'{k}: {v}' for k, v in zip(self._key_field_names, key_max)]))
 
                         self._initial_snapshot_rows_query = constants.SNAPSHOT_ROWS_QUERY_TEMPLATE.format(
-                            fields=select_column_specs, schema_name=self.schema_name,
-                            table_name=self.table_name, where_spec='1=1',
+                            declarations='@P0 int = 0', fields=select_column_specs,
+                            schema_name=self.schema_name, table_name=self.table_name, where_spec='1=1',
                             order_spec=', '.join([f'{x} DESC' for x in self._quoted_key_field_names])
                         )
 
@@ -386,8 +400,9 @@ class TrackedTable(object):
 
         with self._db_conn.cursor() as cursor:
             start_time = time.perf_counter()
+            cursor.setinputsizes(constants.CHANGE_ROWS_QUERY_PARAM_TYPES)
             cursor.execute(self._change_rows_query, (self._last_read_change_table_index.lsn,
-                           self._last_read_change_table_index.seqval, self._last_read_change_table_index.lsn))
+                           self._last_read_change_table_index.seqval))
             change_row = None
             for change_row in cursor.fetchall():
                 change_rows_read_ctr += 1
@@ -405,17 +420,17 @@ class TrackedTable(object):
         self.lagging = change_rows_read_ctr == constants.DB_ROW_BATCH_SIZE
 
         if self.snapshot_allowed and not self.snapshot_complete and not self.lagging:
-            snapshot_query_params = [constants.DB_ROW_BATCH_SIZE]
+
             logger.debug('Polling DB for snapshot rows from %s', self.fq_name)
 
             with self._db_conn.cursor() as cursor:
                 start_time = time.perf_counter()
                 if self._last_read_key_for_snapshot == NEW_SNAPSHOT:
-                    cursor.execute(self._initial_snapshot_rows_query, snapshot_query_params)
+                    cursor.execute(self._initial_snapshot_rows_query, constants.DB_ROW_BATCH_SIZE)
                 else:
-                    for key_field_pos in range(len(self._last_read_key_for_snapshot)):
-                        snapshot_query_params.extend(self._last_read_key_for_snapshot[:key_field_pos + 1])
-                    cursor.execute(self._snapshot_rows_query, snapshot_query_params)
+                    cursor.setinputsizes(self._snapshot_query_param_types)
+                    params = [constants.DB_ROW_BATCH_SIZE] + self._last_read_key_for_snapshot
+                    cursor.execute(self._snapshot_rows_query, params)
 
                 snapshot_row = None
                 for snapshot_row in cursor.fetchall():
