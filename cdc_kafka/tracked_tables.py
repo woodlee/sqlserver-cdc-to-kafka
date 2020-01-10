@@ -283,7 +283,7 @@ class TrackedTable(object):
 
                 # You may find it odd that this query (as well as the change data query) has DECLARE statements in it.
                 # Why not just pass the parameters with the query like usual? We found that in composite-key cases,
-                # the need to pass the parameter for the bounding value of the non-last column more than once caused
+                # the need to pass the parameter for the bounding value of the non-last column(s) more than once caused
                 # SQL Server to treat those as different values (even though they were actually the same), and this
                 # messed up query plans and caused poor performance esp. since we're asking for results ordered
                 # backwards against the PK's index
