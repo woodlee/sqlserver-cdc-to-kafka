@@ -148,7 +148,8 @@ TRAN_END_TIME_NAME = '_cdc_tran_end_time'
 # craft something that would not induce SQL Server to resort to a full index scan. If you change it, run some
 # EXPLAINs and ensure that the steps are still only index SEEKs, not scans.
 
-# TODO FIX THIS NOW THAT YOU KNOW!
+# See comments in TrackedTable.finalize_table to understand other details of why these queries look as they do,
+# esp. in regard to the presence of DECLARE statements within them.
 
 CHANGE_ROWS_QUERY_PARAM_TYPES = [(pyodbc.SQL_BINARY, 10, None), (pyodbc.SQL_BINARY, 10, None)]
 CHANGE_ROWS_QUERY_TEMPLATE = f'''

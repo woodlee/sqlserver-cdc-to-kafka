@@ -280,6 +280,18 @@ class TrackedTable(object):
                 #   WHERE (field_a < @K0)
                 #    OR (field_a = @K0 AND field_b < @K1)
                 #    OR (field_a = @K0 AND field_b = @K1 AND field_c < @K2)
+
+                # You may find it odd that this query (as well as the change data query) has DECLARE statements in it.
+                # Why not just pass the parameters with the query like usual? We found that in composite-key cases,
+                # the need to pass the parameter for the bounding value of the non-last column more than once caused
+                # SQL Server to treat those as different values (even though they were actually the same), and this
+                # messed up query plans and caused poor performance esp. since we're asking for results ordered
+                # backwards against the PK's index
+                #
+                # Having the second layer of "declare indirection" seemed to be the only way to arrange reuse of the
+                # same passed parameter in more than one place via pyodbc, which only supports '?' positional
+                # placeholders for parameters.
+
                 where_clauses, param_declarations = [], []
 
                 for ix, field in enumerate(self._key_fields):
