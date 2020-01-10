@@ -277,20 +277,21 @@ class TrackedTable(object):
             if self._has_pk:
                 # For multi-column primary keys, this builds a WHERE clause of the following form, assuming
                 # for example a PK on (field_a, field_b, field_c):
-                #   WHERE (field_a < @P0)
-                #    OR (field_a = @P0 AND field_b < @P1)
-                #    OR (field_a = @P0 AND field_b = @P1 AND field_c < @P2)
+                #   WHERE (field_a < @K0)
+                #    OR (field_a = @K0 AND field_b < @K1)
+                #    OR (field_a = @K0 AND field_b = @K1 AND field_c < @K2)
                 where_clauses, param_declarations = [], []
 
                 for ix, field in enumerate(self._key_fields):
                     clauses = []
                     for jx, prior_field in enumerate(self._key_fields[0:ix]):
-                        clauses.append(f'[{prior_field.name}] = @P{jx}')
-                    clauses.append(f'[{field.name}] < @P{ix}')
+                        clauses.append(f'[{prior_field.name}] = @K{jx}')
+                    clauses.append(f'[{field.name}] < @K{ix}')
                     where_clauses.append(f"({' AND '.join(clauses)})")
                     data_type, type_name, column_size, decimal_digits = odbc_types[field.name.lower()]
+                    type_name = type_name.replace('identity', '')
                     self._snapshot_query_param_types.append((data_type, column_size, decimal_digits))
-                    param_declarations.append(f'@P{ix} {type_name} = ?')
+                    param_declarations.append(f'@K{ix} {type_name} = ?')
 
                 self._snapshot_rows_query = constants.SNAPSHOT_ROWS_QUERY_TEMPLATE.format(
                     declarations=', '.join(param_declarations), fields=select_column_specs,
@@ -314,7 +315,7 @@ class TrackedTable(object):
                                     ', '.join([f'{k}: {v}' for k, v in zip(self._key_field_names, key_max)]))
 
                         self._initial_snapshot_rows_query = constants.SNAPSHOT_ROWS_QUERY_TEMPLATE.format(
-                            declarations='@P0 int = 0', fields=select_column_specs,
+                            declarations='@K0 int = 0', fields=select_column_specs,
                             schema_name=self.schema_name, table_name=self.table_name, where_spec='1=1',
                             order_spec=', '.join([f'{x} DESC' for x in self._quoted_key_field_names])
                         )
@@ -426,11 +427,10 @@ class TrackedTable(object):
             with self._db_conn.cursor() as cursor:
                 start_time = time.perf_counter()
                 if self._last_read_key_for_snapshot == NEW_SNAPSHOT:
-                    cursor.execute(self._initial_snapshot_rows_query, constants.DB_ROW_BATCH_SIZE)
+                    cursor.execute(self._initial_snapshot_rows_query)
                 else:
                     cursor.setinputsizes(self._snapshot_query_param_types)
-                    params = [constants.DB_ROW_BATCH_SIZE] + self._last_read_key_for_snapshot
-                    cursor.execute(self._snapshot_rows_query, params)
+                    cursor.execute(self._snapshot_rows_query, self._last_read_key_for_snapshot)
 
                 snapshot_row = None
                 for snapshot_row in cursor.fetchall():
