@@ -1,10 +1,10 @@
 import datetime
-from typing import List, Dict, Any
+from typing import List, Any, Dict
 
 import pyodbc
 import sortedcontainers
 
-from .. import constants
+from .. import constants, sql_queries
 from . import metrics
 
 from typing import TYPE_CHECKING
@@ -16,14 +16,14 @@ class Accumulator(object):
     _instance = None
 
     def __init__(self, db_conn: pyodbc.Connection, clock_syncer: 'clock_sync.ClockSync',
-                 metrics_namespace: str, process_hostname: str):
+                 metrics_namespace: str, process_hostname: str) -> None:
         if Accumulator._instance is not None:
-            raise Exception('MetricsAccumulator class should be used as a singleton.')
+            raise Exception('metric_reporting.Accumulator class should be used as a singleton.')
 
-        self._db_conn = db_conn
-        self._clock_syncer = clock_syncer
-        self._metrics_namespace = metrics_namespace
-        self._process_hostname = process_hostname
+        self._db_conn: pyodbc.Connection = db_conn
+        self._clock_syncer: 'clock_sync.ClockSync' = clock_syncer
+        self._metrics_namespace: str = metrics_namespace
+        self._process_hostname: str = process_hostname
 
         self.reset_and_start()
 
@@ -51,6 +51,7 @@ class Accumulator(object):
         self._produced_metadata_records_count: int = 0
         self._produced_snapshot_records_count: int = 0
         self._produced_deletion_tombstones_count: int = 0
+        self._messages_copied_to_unified_topics: int = 0
         self._produced_update_changes_count: int = 0
 
     def end_and_get_values(self) -> metrics.Metrics:
@@ -61,12 +62,12 @@ class Accumulator(object):
         db_all_data_queries_count = self._db_snapshot_queries_count + self._db_change_data_queries_count
         kafka_produces_count = self._produced_delete_changes_count + self._produced_insert_changes_count + \
             self._produced_metadata_records_count + self._produced_snapshot_records_count + \
-            self._produced_deletion_tombstones_count + self._produced_update_changes_count
-        accounted_time_seconds = db_all_data_queries_total_time_sec + self._kafka_produces_total_time_sec + \
-            self._kafka_progress_commit_and_flush_total_time_sec + self._total_sleep_time_sec
+            self._produced_deletion_tombstones_count + self._produced_update_changes_count + \
+            self._messages_copied_to_unified_topics
 
         with self._db_conn.cursor() as cursor:
-            cursor.execute(constants.LATEST_CDC_ENTRY_TIME_QUERY)
+            q, p = sql_queries.get_latest_cdc_entry_time()
+            cursor.execute(q)
             cdc_lag = (datetime.datetime.utcnow() - self._clock_syncer.db_time_to_utc(cursor.fetchval())) \
                 .total_seconds()
 
@@ -80,13 +81,15 @@ class Accumulator(object):
         m.interval_delta_sec = interval_delta_sec
 
         m.earliest_change_lsn_produced = \
-            (self._change_lsns_produced and f'0x{self._change_lsns_produced[0].hex()}') or None
+            (self._change_lsns_produced and self._change_lsns_produced[0]) or None
         m.earliest_change_db_tran_end_time_produced = \
-            (self._change_db_tran_end_times_produced and self._change_db_tran_end_times_produced[0]) or None
+            (self._change_db_tran_end_times_produced and self._change_db_tran_end_times_produced[0]) \
+            or None
         m.latest_change_lsn_produced = \
-            (self._change_lsns_produced and f'0x{self._change_lsns_produced[-1].hex()}') or None
+            (self._change_lsns_produced and self._change_lsns_produced[-1]) or None
         m.latest_change_db_tran_end_time_produced = \
-            (self._change_db_tran_end_times_produced and self._change_db_tran_end_times_produced[-1]) or None
+            (self._change_db_tran_end_times_produced and self._change_db_tran_end_times_produced[-1]) \
+            or None
 
         m.e2e_latency_avg_sec = \
             (self._e2e_latencies_sec and sum(self._e2e_latencies_sec) / len(self._e2e_latencies_sec)) or None
@@ -137,63 +140,71 @@ class Accumulator(object):
         m.produced_snapshot_records_count = self._produced_snapshot_records_count
         m.produced_metadata_records_count = self._produced_metadata_records_count
         m.produced_deletion_tombstones_count = self._produced_deletion_tombstones_count
+        m.messages_copied_to_unified_topics = self._messages_copied_to_unified_topics
 
         m.total_sleep_time_sec = self._total_sleep_time_sec
-        m.unaccounted_time_sec = interval_delta_sec - accounted_time_seconds
 
         return m
 
     def register_sleep(self, sleep_time_seconds: float) -> None:
         self._total_sleep_time_sec += sleep_time_seconds
 
-    def register_db_query(self, seconds_elapsed: float, is_snapshot: bool, rows_retrieved: int) -> None:
-        if is_snapshot:
+    def register_db_query(self, seconds_elapsed: float, db_query_kind: str, retrieved_row_count: int) -> None:
+        if db_query_kind == constants.SNAPSHOT_ROWS_KIND:
             self._db_snapshot_queries_count += 1
-            self._db_snapshot_rows_retrieved_count += rows_retrieved
+            self._db_snapshot_rows_retrieved_count += retrieved_row_count
             self._db_snapshot_queries_total_time_sec += seconds_elapsed
-        else:
+        elif db_query_kind == constants.CHANGE_ROWS_KIND:
             self._db_change_data_queries_count += 1
-            self._db_change_data_rows_retrieved_count += rows_retrieved
+            self._db_change_data_rows_retrieved_count += retrieved_row_count
             self._db_change_data_queries_total_time_sec += seconds_elapsed
+        else:
+            raise Exception(f'Accumulator.register_db_query does not recognize db_query_kind "{db_query_kind}".')
 
-    def register_kafka_produce(self, seconds_elapsed: float, is_metadata_msg: bool,
-                               message_value: Dict[str, Any]) -> None:
+    def register_kafka_produce(self, seconds_elapsed: float, original_value: Dict[str, Any], message_type: str) -> None:
         self._kafka_produces_total_time_sec += seconds_elapsed
 
-        if message_value is None:
-            self._produced_deletion_tombstones_count += 1
-            return
-
-        if is_metadata_msg:
+        if message_type in (constants.CHANGE_PROGRESS_MESSAGE, constants.SNAPSHOT_PROGRESS_MESSAGE,
+                            constants.HEARTBEAT_PROGRESS_MESSAGE, constants.METRIC_REPORTING_MESSAGE):
             self._produced_metadata_records_count += 1
-            return
-
-        operation_name = message_value[constants.OPERATION_NAME]
-
-        if operation_name == constants.SNAPSHOT_OPERATION_NAME:
+        elif message_type == constants.DELETION_CHANGE_TOMBSTONE_MESSAGE:
+            self._produced_deletion_tombstones_count += 1
+        elif message_type == constants.UNIFIED_TOPIC_CHANGE_MESSAGE:
+            self._messages_copied_to_unified_topics += 1
+        elif message_type == constants.SINGLE_TABLE_SNAPSHOT_MESSAGE:
             self._produced_snapshot_records_count += 1
-            return
-
-        self._change_lsns_produced.add(message_value[constants.LSN_NAME])
-        self._change_db_tran_end_times_produced.add(message_value[constants.TRAN_END_TIME_NAME])
-
-        if operation_name == constants.DELETE_OPERATION_NAME:
-            self._produced_delete_changes_count += 1
-        elif operation_name == constants.INSERT_OPERATION_NAME:
-            self._produced_insert_changes_count += 1
-        elif operation_name == constants.POST_UPDATE_OPERATION_NAME:
-            self._produced_update_changes_count += 1
+        elif message_type == constants.SINGLE_TABLE_CHANGE_MESSAGE:
+            self._change_lsns_produced.add(original_value[constants.LSN_NAME])
+            self._change_db_tran_end_times_produced.add(original_value[constants.EVENT_TIME_NAME])
+            operation_name = original_value[constants.OPERATION_NAME]
+            if operation_name == constants.DELETE_OPERATION_NAME:
+                self._produced_delete_changes_count += 1
+            elif operation_name == constants.INSERT_OPERATION_NAME:
+                self._produced_insert_changes_count += 1
+            elif operation_name == constants.POST_UPDATE_OPERATION_NAME:
+                self._produced_update_changes_count += 1
+            else:
+                raise Exception(f'Accumulator.register_kafka_produce does not recognize operation name: '
+                                f'"{operation_name}".')
         else:
-            raise Exception(f'Unrecognized operation name: {operation_name}')
+            raise Exception(f'Accumulator.register_kafka_produce does not recognize message type: "{message_type}".')
 
     def register_kafka_commit(self, seconds_elapsed: float) -> None:
         self._kafka_progress_commit_and_flush_count += 1
         self._kafka_progress_commit_and_flush_total_time_sec += seconds_elapsed
 
-    def register_kafka_delivery_callback(self, message_value: Dict[str, Any],  produce_time: datetime.datetime) -> None:
+    def kafka_delivery_callback(self, message_type: str, original_value: Dict[str, Any],
+                                produce_datetime: datetime.datetime, **_) -> None:
         self._kafka_delivery_acks_count += 1
-        if message_value[constants.OPERATION_NAME] != constants.SNAPSHOT_OPERATION_NAME:
-            db_commit_time = self._clock_syncer.db_time_to_utc(datetime.datetime.fromisoformat(
-                message_value[constants.TRAN_END_TIME_NAME]))
-            e2e_latency = (produce_time - db_commit_time).total_seconds()
-            self._e2e_latencies_sec.append(e2e_latency)
+
+        if message_type == constants.SINGLE_TABLE_CHANGE_MESSAGE:
+            event_time = datetime.datetime.fromisoformat(original_value[constants.EVENT_TIME_NAME])
+        elif message_type == constants.UNIFIED_TOPIC_CHANGE_MESSAGE:
+            event_time = datetime.datetime.fromisoformat(original_value[constants.UNIFIED_TOPIC_MSG_DATA_WRAPPER_NAME]
+                                                         [constants.EVENT_TIME_NAME])
+        else:
+            return
+
+        db_commit_time = self._clock_syncer.db_time_to_utc(event_time)
+        e2e_latency = (produce_datetime - db_commit_time).total_seconds()
+        self._e2e_latencies_sec.append(e2e_latency)

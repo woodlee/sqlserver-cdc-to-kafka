@@ -1,20 +1,12 @@
-import collections
-import datetime
 import hashlib
-import json
 import logging
-import re
-import time
 import uuid
-from typing import Tuple, Dict, List, Union, Any, Callable
+from typing import Tuple, Dict, List, Any, Callable, Optional, Generator, TYPE_CHECKING
 
-import avro
-import confluent_kafka
 import pyodbc
 
-from . import avro_from_sql, constants, change_index
+from . import avro_from_sql, constants, change_index, options, sql_queries, sql_query_subprocess, parsed_row
 
-from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from . import clock_sync
     from .metric_reporting import accumulator
@@ -26,192 +18,150 @@ NEW_SNAPSHOT = object()
 
 class TrackedField(object):
     def __init__(self, name: str, sql_type_name: str, change_table_ordinal: int, primary_key_ordinal: int,
-                 decimal_precision: int, decimal_scale: int, truncate_after: Union[int, None] = None):
+                 decimal_precision: int, decimal_scale: int, truncate_after: Optional[int] = None) -> None:
         self.name: str = name
         self.sql_type_name: str = sql_type_name
         self.change_table_ordinal: int = change_table_ordinal
         self.primary_key_ordinal: int = primary_key_ordinal
-        self.avro_schema: Dict = avro_from_sql.avro_schema_from_sql_type(
+        self.avro_schema: Dict[str, Any] = avro_from_sql.avro_schema_from_sql_type(
             name, sql_type_name, decimal_precision, decimal_scale, False)
-        self.nullable_avro_schema: Dict = avro_from_sql.avro_schema_from_sql_type(
+        self.nullable_avro_schema: Dict[str, Any] = avro_from_sql.avro_schema_from_sql_type(
             name, sql_type_name, decimal_precision, decimal_scale, True)
-        self.transform_fn: Callable = avro_from_sql.avro_transform_fn_from_sql_type(sql_type_name)
+        self.transform_fn: Optional[Callable[[Any], Any]] = avro_from_sql.avro_transform_fn_from_sql_type(sql_type_name)
 
         if truncate_after is not None:
             if self.sql_type_name not in avro_from_sql.SQL_STRING_TYPES:
                 raise Exception(f'A truncation length was specified for field {name} but it does not appear to be a '
                                 f'string field (SQL type is {sql_type_name}).')
             orig_transform = self.transform_fn
-            self.transform_fn = lambda x: orig_transform(x)[:int(truncate_after)]
+            if orig_transform is not None:
+                self.transform_fn = lambda x: orig_transform(x)[:int(truncate_after)]
+            else:
+                self.transform_fn = lambda x: x[:int(truncate_after)]
 
 
 class TrackedTable(object):
-    _REGISTERED_TABLES_BY_KAFKA_TOPIC: Dict[str, 'TrackedTable'] = {}
-
     def __init__(self, db_conn: pyodbc.Connection, clock_syncer: 'clock_sync.ClockSync',
                  metrics_accumulator: 'accumulator.Accumulator',
-                 schema_name: str, table_name: str, capture_instance_name: str,
-                 topic_name: str, min_lsn: bytes, snapshot_allowed: bool):
-
-        if topic_name in TrackedTable._REGISTERED_TABLES_BY_KAFKA_TOPIC:
-            raise Exception('TrackedTable __init__ being called multiple times for Kafka topic %s', topic_name)
+                 sql_query_processor: sql_query_subprocess.SQLQueryProcessor, schema_name: str, table_name: str,
+                 capture_instance_name: str, topic_name: str, min_lsn: bytes, snapshot_allowed: bool):
+        self._db_conn: pyodbc.Connection = db_conn
+        self._clock_syncer: clock_sync.ClockSync = clock_syncer
+        self._metrics_accumulator: 'accumulator.Accumulator' = metrics_accumulator
+        self._sql_query_processor: sql_query_subprocess.SQLQueryProcessor = sql_query_processor
 
         self.schema_name: str = schema_name
         self.table_name: str = table_name
         self.capture_instance_name: str = capture_instance_name
         self.topic_name: str = topic_name
-        self.min_lsn: bytes = min_lsn
         self.snapshot_allowed: bool = snapshot_allowed
+        self.fq_name: str = f'{schema_name}.{table_name}'
+        self.change_table_name: str = f'{capture_instance_name}_CT'
 
-        self.fq_name: str = f'{self.schema_name}.{self.table_name}'
+        # Most of the below properties are not set until sometime after `finalize_table` is called:
 
-        # Most of the below properties are not set until `finalize_table` is called:
+        self.key_schema_id: int = -1
+        self.value_schema_id: int = -1
+        self.key_schema: Dict[str, Any] = {}
+        self.value_schema: Dict[str, Any] = {}
+        self.key_fields: Tuple[TrackedField] = tuple()
+        self.value_fields: Tuple[TrackedField] = tuple()
+        self.max_polled_change_index: change_index.ChangeIndex = change_index.LOWEST_CHANGE_INDEX
+        self.change_reads_are_lagging: bool = True
         self.snapshot_complete: bool = False
-        self.key_schema: Union[None, avro.schema.RecordSchema] = None
-        self.value_schema: Union[None, avro.schema.RecordSchema] = None
-        self.key_schema_id: Union[None, int] = None
-        self.value_schema_id: Union[None, int] = None
-        self.lagging: bool = False
+        self.min_lsn: bytes = min_lsn
 
-        self._key_fields: Union[None, List[TrackedField]] = None
-        self._key_field_names: Union[None, List[str]] = None
-        self._key_field_positions: Union[None, List[int]] = None
-        self._quoted_key_field_names: Union[None, List[str]] = None
-        self._value_fields: Union[None, List[TrackedField]] = None
-        self._value_field_names: Union[None, List[str]] = None
-        self._last_read_key_for_snapshot: Union[None, Tuple] = None
-        self._change_rows_query: Union[None, str] = None
-        self._snapshot_rows_query: Union[None, str] = None
-        self._snapshot_query_param_types: List[Tuple[int, int, int]] = []
-        self._initial_snapshot_rows_query: Union[None, str] = None
-        self._last_read_change_table_index: Union[None, change_index.ChangeIndex] = None
-        self._last_popped_snapshot_row: Union[Tuple, None] = None
-        self._last_popped_change_row: Union[Tuple, None] = None
-
+        self._key_field_names: Tuple[str] = tuple()
+        self._key_field_source_table_ordinals: Tuple[int] = tuple()
+        self._value_field_names: List[str] = []
+        self._last_read_key_for_snapshot: Optional[Tuple] = None
+        self._odbc_columns: Tuple[Tuple] = tuple()
+        self._change_rows_query: Optional[str] = None
+        self._change_rows_query_param_types: List[Tuple[int, int, int]] = []
+        self._snapshot_rows_query: Optional[str] = None
+        self._snapshot_rows_query_param_types: List[Tuple[int, int, int]] = []
+        self._initial_snapshot_rows_query: Optional[str] = None
         self._fields_added_pending_finalization: List[TrackedField] = []
-        self._row_buffer: collections.deque = collections.deque()
-        self._db_conn: pyodbc.Connection = db_conn
-        self._clock_syncer: clock_sync.ClockSync = clock_syncer
-        self._metrics_accumulator = metrics_accumulator
-        self._last_db_poll_time: datetime.datetime = constants.BEGINNING_DATETIME
         self._finalized: bool = False
         self._has_pk: bool = False
+        self._snapshot_query_pending: bool = False
+        self._changes_query_pending: bool = False
+        self._changes_query_queue_name: str = self.fq_name + constants.CHANGE_ROWS_KIND
+        self._snapshot_query_queue_name: str = self.fq_name + constants.SNAPSHOT_ROWS_KIND
 
     @property
-    def last_read_key_for_snapshot_display(self) -> Union[None, str]:
+    def last_read_key_for_snapshot_display(self) -> Optional[str]:
         if not self._last_read_key_for_snapshot or self._last_read_key_for_snapshot == NEW_SNAPSHOT:
             return None
         return ', '.join([f'{k}: {v}' for k, v in zip(self._key_field_names, self._last_read_key_for_snapshot)])
 
-    @staticmethod
-    def capture_instance_name_resolver(topic_name: str) -> str:
-        return TrackedTable._REGISTERED_TABLES_BY_KAFKA_TOPIC[topic_name].capture_instance_name
-
-    def pop_next(self) -> Tuple[Tuple, Union[Dict, None], Union[Dict, None]]:
-        self._maybe_refresh_buffer()
-
-        if len(self._row_buffer) == 0:
-            return self._get_queue_priority_tuple(None), None, None
-
-        next_row = self._row_buffer.popleft()
-        is_snapshot_row = next_row[constants.OPERATION_POS] == constants.SNAPSHOT_OPERATION_ID
-
-        # Sometimes the LEFT JOIN to lsn_time_mapping comes up empty. Not 100% sure why, may have something to do
-        # with change table rows corresponding to transactions still in progress? In any case if we encounter this
-        # we'll bail and set the progress horizon to the last row we read that has a tran_end_time:
-        if (not is_snapshot_row) and next_row[constants.TRAN_END_TIME_POS] is None:
-            if self._last_popped_change_row:
-                self._last_read_change_table_index = change_index.ChangeIndex(
-                    self._last_popped_change_row[constants.LSN_POS],
-                    self._last_popped_change_row[constants.SEQVAL_POS],
-                    self._last_popped_change_row[constants.OPERATION_POS]
-                )
-            if self._last_read_key_for_snapshot is not None and self._last_read_key_for_snapshot != NEW_SNAPSHOT \
-                    and self._last_popped_snapshot_row:
-                self._last_read_key_for_snapshot = tuple(
-                    self._last_popped_snapshot_row[n - 1 + constants.CDC_METADATA_COL_COUNT]
-                    for n in self._key_field_positions
-                )
-            self._row_buffer.clear()
-            logger.debug('Encountered change row missing a corresponding tran_end_time on %s. Flushing row buffer and '
-                         'will retry from last "good" change and snapshot indices.', self.fq_name)
-            return self._get_queue_priority_tuple(None), None, None
-
-        msg_key, msg_value = self._message_kv_from_change_row(next_row)
-
-        if is_snapshot_row:
-            self._last_popped_snapshot_row = next_row
-        else:
-            self._last_popped_change_row = next_row
-
-        return self._get_queue_priority_tuple(next_row), msg_key, msg_value
-
-    def add_field(self, field: TrackedField) -> None:
+    def append_field(self, field: TrackedField) -> None:
         self._fields_added_pending_finalization.append(field)
 
-    def get_source_table_count(self) -> int:
+    def get_source_table_count(self, low_key: Tuple, high_key: Tuple) -> int:
         with self._db_conn.cursor() as cursor:
-            cursor.execute(f'SELECT COUNT(*) FROM [{self.schema_name}].[{self.table_name}]')
+            q, p = sql_queries.get_table_count(self.schema_name, self.table_name, self._key_field_names,
+                                               self._odbc_columns)
+            cursor.setinputsizes(p)
+            cursor.execute(q, low_key + high_key)
             return cursor.fetchval()
 
-    def get_change_table_counts(self) -> Tuple[int, int, int]:
+    def get_change_table_counts(self, highest_change_index: change_index.ChangeIndex) -> Tuple[int, int, int]:
         with self._db_conn.cursor() as cursor:
-            delete, insert, update = 0, 0, 0
-            cursor.execute(f'SELECT COUNT(*), __$operation AS op FROM cdc.[{self.capture_instance_name}_CT] '
-                           f'WHERE __$operation != 3 GROUP BY __$operation')
+            deletes, inserts, updates = 0, 0, 0
+            q, p = sql_queries.get_change_table_count_by_operation(self.change_table_name)
+            cursor.setinputsizes(p)
+            cursor.execute(q, (highest_change_index.lsn, highest_change_index.seqval, highest_change_index.operation))
             for row in cursor.fetchall():
                 if row[1] == 1:
-                    delete = row[0]
+                    deletes = row[0]
                 elif row[1] == 2:
-                    insert = row[0]
+                    inserts = row[0]
                 elif row[1] == 4:
-                    update = row[0]
+                    updates = row[0]
                 else:
                     raise Exception('Unexpected __$operation')
 
-            return delete, insert, update
+            return deletes, inserts, updates
 
     # 'Finalizing' mostly means doing the things we can't do until we know all of the table's fields have been added
     def finalize_table(
-        self,
-        start_after_change_table_index: change_index.ChangeIndex,
-        start_from_key_for_snapshot: Dict[str, Any],
-        lsn_gap_handling: str,
-        schema_id_getter: Callable[[str, avro.schema.RecordSchema, avro.schema.RecordSchema], Tuple[int, int]] = None,
+        self, start_after_change_table_index: change_index.ChangeIndex,
+        start_from_key_for_snapshot: Optional[Dict[str, Any]], lsn_gap_handling: str,
+        schema_id_getter: Callable[[str, Dict[str, Any], Dict[str, Any]], Tuple[int, int]] = None,
         progress_reset_fn: Callable[[str, str], None] = None
     ) -> None:
-
         if self._finalized:
             raise Exception(f"Attempted to finalize table {self.fq_name} more than once")
 
         self._finalized = True
 
-        if change_index.BEGINNING_CHANGE_INDEX.lsn < start_after_change_table_index.lsn < self.min_lsn:
+        if change_index.LOWEST_CHANGE_INDEX.lsn < start_after_change_table_index.lsn < self.min_lsn:
             msg = (f'The earliest change LSN available in the DB for capture instance {self.capture_instance_name} '
                    f'(0x{self.min_lsn.hex()}) is later than the log position we need to start from based on the prior '
-                   f'progress LSN stored in Kafka (0x{start_after_change_table_index.lsn.hex()}). ')
+                   f'progress LSN stored in Kafka (0x{start_after_change_table_index.lsn.hex()}).')
 
-            if lsn_gap_handling == 'ignore':
-                logger.warning(msg + 'Proceeding anyway since lsn_gap_handling is set to "ignore"!')
-            elif lsn_gap_handling == 'begin_new_snapshot':
+            if lsn_gap_handling == options.LSN_GAP_HANDLING_IGNORE:
+                logger.warning('%s Proceeding anyway since lsn_gap_handling is set to "%s"!',
+                               msg, options.LSN_GAP_HANDLING_IGNORE)
+            elif lsn_gap_handling == options.LSN_GAP_HANDLING_BEGIN_NEW_SNAPSHOT:
                 if self.snapshot_allowed:
                     start_from_key_for_snapshot = None
-                    logger.warning(msg + 'Beginning new table snapshot!')
-                    progress_reset_fn(self.topic_name, self.capture_instance_name)
+                    logger.warning('%s Beginning new table snapshot!', msg)
+                    progress_reset_fn(self.topic_name)
                 else:
-                    raise Exception(msg + f'lsn_gap_handling was set to "begin_new_snapshot", but due to white/black-'
-                                          f'listing, snapshotting of table {self.fq_name} is not allowed!')
+                    raise Exception(
+                        f'{msg} lsn_gap_handling was set to "{options.LSN_GAP_HANDLING_BEGIN_NEW_SNAPSHOT}", but due '
+                        f'to white/black-listing, snapshotting of table {self.fq_name} is not allowed!')
             else:
-                raise Exception(msg + f'Cannot continue! Parameter lsn_gap_handling was set to "{lsn_gap_handling}".')
+                raise Exception(msg + f' Cannot continue! Parameter lsn_gap_handling was set to "{lsn_gap_handling}".')
 
-        self._last_read_change_table_index = start_after_change_table_index
+        self.max_polled_change_index = start_after_change_table_index
+        self.value_fields = tuple(sorted(self._fields_added_pending_finalization, key=lambda f: f.change_table_ordinal))
+        self._value_field_names = [f.name for f in self.value_fields]
+        self._fields_added_pending_finalization = []
 
-        self._value_fields = sorted(self._fields_added_pending_finalization, key=lambda f: f.change_table_ordinal)
-        self._value_field_names = [f.name for f in self._value_fields]
-
-        self._fields_added_pending_finalization = None
-
-        key_fields = [f for f in self._value_fields if f.primary_key_ordinal is not None]
+        key_fields = [f for f in self.value_fields if f.primary_key_ordinal is not None]
         if not key_fields:
             self._has_pk = False
             key_fields = [TrackedField(
@@ -219,97 +169,58 @@ class TrackedTable(object):
         else:
             self._has_pk = True
 
-        self._key_fields = sorted(key_fields, key=lambda f: f.primary_key_ordinal)
-        self._key_field_names = [f.name for f in self._key_fields]
-        self._key_field_positions = [f.change_table_ordinal for f in self._key_fields]
-        self._quoted_key_field_names = [f'[{f.name}]' for f in self._key_fields]
+        self.key_fields = tuple(sorted(key_fields, key=lambda f: f.primary_key_ordinal))
+        self._key_field_names = tuple([kf.name for kf in self.key_fields])
+        self._key_field_source_table_ordinals = tuple([kf.change_table_ordinal for kf in self.key_fields])
+        key_schema_fields = [kf.avro_schema for kf in self.key_fields]
 
-        self.key_schema = confluent_kafka.avro.loads(json.dumps({
+        self.key_schema = {
             "name": f"{self.schema_name}_{self.table_name}_cdc__key",
             "namespace": constants.AVRO_SCHEMA_NAMESPACE,
             "type": "record",
-            "fields": [f.avro_schema for f in self._key_fields]
-        }))
+            "fields": key_schema_fields
+        }
 
         value_fields_plus_metadata_fields = avro_from_sql.get_cdc_metadata_fields_avro_schemas(
-            self._value_field_names) + [f.nullable_avro_schema for f in self._value_fields]
+            self.fq_name, self._value_field_names) + [f.nullable_avro_schema for f in self.value_fields]
 
-        self.value_schema = confluent_kafka.avro.loads(json.dumps({
+        self.value_schema = {
             "name": f"{self.schema_name}_{self.table_name}_cdc__value",
             "namespace": constants.AVRO_SCHEMA_NAMESPACE,
             "type": "record",
             "fields": value_fields_plus_metadata_fields
-        }))
+        }
 
         if schema_id_getter:
-            self.key_schema_id, self.value_schema_id = schema_id_getter(
-                self.topic_name, self.key_schema, self.value_schema)
-
-        select_column_specs = ', '.join([f'ct.[{f}]' for f in self._value_field_names])
+            self.key_schema_id, self.value_schema_id = schema_id_getter(self.topic_name, self.key_schema,
+                                                                        self.value_schema)
 
         with self._db_conn.cursor() as cursor:
-            cursor.execute(constants.CHANGE_TABLE_INDEX_COLS_QUERY, (f'cdc.{self.capture_instance_name}_CT', ))
+            q, p = sql_queries.get_change_table_index_cols(self.change_table_name)
+            cursor.execute(q)
             change_table_clustered_idx_cols = [r[0] for r in cursor.fetchall()]
 
-        required_metadata_cols_ordered = ['__$start_lsn', '__$seqval', '__$operation']
+            self._odbc_columns = tuple(cursor.columns(schema=self.schema_name, table=self.table_name).fetchall())
+
+        required_metadata_cols_ordered = [constants.DB_LSN_COL_NAME, constants.DB_SEQVAL_COL_NAME,
+                                          constants.DB_OPERATION_COL_NAME]
         found_metadata_cols = [c for c in change_table_clustered_idx_cols if c in required_metadata_cols_ordered]
 
         if found_metadata_cols != required_metadata_cols_ordered:
-            raise Exception(f'The index for change table {self.capture_instance_name}_CT did not contain the expected '
+            raise Exception(f'The index for change table {self.change_table_name} did not contain the expected '
                             f'CDC metadata columns, or contained them in the wrong order. Index columns found '
                             f'were: {change_table_clustered_idx_cols}')
 
-        order_spec = ', '.join(change_table_clustered_idx_cols)
+        self._change_rows_query, self._change_rows_query_param_types = sql_queries.get_change_rows(
+            self.change_table_name, self._value_field_names, change_table_clustered_idx_cols)
 
-        self._change_rows_query = constants.CHANGE_ROWS_QUERY_TEMPLATE.format(
-            fields=select_column_specs, capture_instance_name=self.capture_instance_name, order_spec=order_spec)
-
-        if self.snapshot_allowed:
-            with self._db_conn.cursor() as cursor:
-                cursor.columns(schema=self.schema_name, table=self.table_name)
-                # 3) column_name
-                # 4) data_type
-                # 5) type_name
-                # 6) column_size
-                # 8) decimal_digits
-                odbc_types = {x[3].lower(): (x[4], x[5], x[6], x[8]) for x in cursor.fetchall()}
-
+        if not self.snapshot_allowed:
+            self.snapshot_complete = True
+        else:
             if self._has_pk:
-                # For multi-column primary keys, this builds a WHERE clause of the following form, assuming
-                # for example a PK on (field_a, field_b, field_c):
-                #   WHERE (field_a < @K0)
-                #    OR (field_a = @K0 AND field_b < @K1)
-                #    OR (field_a = @K0 AND field_b = @K1 AND field_c < @K2)
-
-                # You may find it odd that this query (as well as the change data query) has DECLARE statements in it.
-                # Why not just pass the parameters with the query like usual? We found that in composite-key cases,
-                # the need to pass the parameter for the bounding value of the non-last column(s) more than once caused
-                # SQL Server to treat those as different values (even though they were actually the same), and this
-                # messed up query plans and caused poor performance esp. since we're asking for results ordered
-                # backwards against the PK's index
-                #
-                # Having the second layer of "declare indirection" seemed to be the only way to arrange reuse of the
-                # same passed parameter in more than one place via pyodbc, which only supports '?' positional
-                # placeholders for parameters.
-
-                where_clauses, param_declarations = [], []
-
-                for ix, field in enumerate(self._key_fields):
-                    clauses = []
-                    for jx, prior_field in enumerate(self._key_fields[0:ix]):
-                        clauses.append(f'[{prior_field.name}] = @K{jx}')
-                    clauses.append(f'[{field.name}] < @K{ix}')
-                    where_clauses.append(f"({' AND '.join(clauses)})")
-                    data_type, type_name, column_size, decimal_digits = odbc_types[field.name.lower()]
-                    type_name = type_name.replace('identity', '')
-                    self._snapshot_query_param_types.append((data_type, column_size, decimal_digits))
-                    param_declarations.append(f'@K{ix} {type_name} = ?')
-
-                self._snapshot_rows_query = constants.SNAPSHOT_ROWS_QUERY_TEMPLATE.format(
-                    declarations=', '.join(param_declarations), fields=select_column_specs,
-                    schema_name=self.schema_name, table_name=self.table_name, where_spec=' OR '.join(where_clauses),
-                    order_spec=', '.join([f'{x} DESC' for x in self._quoted_key_field_names])
-                )
+                self._snapshot_rows_query, self._snapshot_rows_query_param_types = sql_queries.get_snapshot_rows(
+                    self.schema_name, self.table_name, self._value_field_names, self._key_field_names,
+                    False, self._odbc_columns)
 
                 if start_from_key_for_snapshot:
                     key_min_tuple = tuple(self._get_min_key_value() or [])
@@ -326,11 +237,9 @@ class TrackedTable(object):
                                     self.fq_name,
                                     ', '.join([f'{k}: {v}' for k, v in zip(self._key_field_names, key_max)]))
 
-                        self._initial_snapshot_rows_query = constants.SNAPSHOT_ROWS_QUERY_TEMPLATE.format(
-                            declarations='@K0 int = 0', fields=select_column_specs,
-                            schema_name=self.schema_name, table_name=self.table_name, where_spec='1=1',
-                            order_spec=', '.join([f'{x} DESC' for x in self._quoted_key_field_names])
-                        )
+                        self._initial_snapshot_rows_query, _ = sql_queries.get_snapshot_rows(
+                            self.schema_name, self.table_name, self._value_field_names, self._key_field_names,
+                            True, self._odbc_columns)
 
                         self._last_read_key_for_snapshot = NEW_SNAPSHOT
                     else:
@@ -342,40 +251,134 @@ class TrackedTable(object):
                     f"key (which is required for snapshotting at this time). You can get past this error by adding"
                     f"the table to the snapshot blacklist")
 
-        TrackedTable._REGISTERED_TABLES_BY_KAFKA_TOPIC[self.topic_name] = self
+    def enqueue_snapshot_query(self) -> None:
+        if self._snapshot_query_pending:
+            raise Exception('enqueue_snapshot_query called while a query was already pending')
 
-    def _message_kv_from_change_row(self, change_row: Tuple) -> Tuple[Dict[str, object], Dict[str, object]]:
-        meta_cols, table_cols = change_row[:constants.CDC_METADATA_COL_COUNT], \
-                                change_row[constants.CDC_METADATA_COL_COUNT:]
-        key, value = {}, {}
+        if self.snapshot_allowed and not self.snapshot_complete:
+            if self._last_read_key_for_snapshot == NEW_SNAPSHOT:
+                snap_query = sql_query_subprocess.SQLQueryRequest(self._snapshot_query_queue_name, None,
+                                                                  self._initial_snapshot_rows_query, None, None)
+            else:
+                snap_query = sql_query_subprocess.SQLQueryRequest(self._snapshot_query_queue_name, None,
+                                                                  self._snapshot_rows_query,
+                                                                  self._snapshot_rows_query_param_types,
+                                                                  self._last_read_key_for_snapshot)
+            self._sql_query_processor.enqueue_query(snap_query)
+            self._snapshot_query_pending = True
+
+    def enqueue_changes_query(self, lsn_limit: bytes) -> None:
+        if self._changes_query_pending:
+            raise Exception('enqueue_changes_query called while a query was already pending')
+
+        params = (self.max_polled_change_index.lsn, self.max_polled_change_index.seqval, lsn_limit)
+        changes_query = sql_query_subprocess.SQLQueryRequest(
+            self._changes_query_queue_name, lsn_limit, self._change_rows_query,
+            self._change_rows_query_param_types, params)
+        self._sql_query_processor.enqueue_query(changes_query)
+        self._changes_query_pending = True
+
+    def retrieve_snapshot_query_results(self) -> Generator[parsed_row.ParsedRow, None, None]:
+        if self._snapshot_query_pending:
+            res = self._sql_query_processor.get_result(self._snapshot_query_queue_name, constants.SQL_QUERY_TIMEOUT)
+            if res:
+                self._snapshot_query_pending = False
+                row_ctr = 0
+                last_row_read = None
+                for row in res.result_rows:
+                    last_row_read = self._parse_db_row(row)
+                    yield last_row_read
+                    row_ctr += 1
+                self._metrics_accumulator.register_db_query(
+                    res.query_took_sec, constants.SNAPSHOT_ROWS_KIND, row_ctr)
+                logger.debug('Rows polled - kind: %s\tnbr returned: %s\ttook ms: %s\tsource: %s @ %s',
+                             constants.SNAPSHOT_ROWS_KIND.ljust(14),
+                             str(row_ctr).rjust(5), str(int(res.query_took_sec * 1000)).rjust(5),
+                             self.fq_name, res.query_params)
+                if last_row_read is not None:
+                    self._last_read_key_for_snapshot = last_row_read.ordered_key_field_values
+                else:
+                    logger.info("SNAPSHOT COMPLETED for table %s. Last read key: (%s)", self.fq_name, ', '.join(
+                        [f'{k}: {v}' for k, v in zip(self._key_field_names, self._last_read_key_for_snapshot)]))
+                    self._last_read_key_for_snapshot = None
+                    self.snapshot_complete = True
+            else:
+                raise Exception('TrackedTable.retrieve_snapshot_query_results failed retrieving SQL query results.')
+
+    def retrieve_changes_query_results(self) -> Generator[parsed_row.ParsedRow, None, None]:
+        if self._changes_query_pending:
+            res = self._sql_query_processor.get_result(self._changes_query_queue_name, constants.SQL_QUERY_TIMEOUT)
+            if res:
+                self._changes_query_pending = False
+                row_ctr = 0
+                last_row_read = None
+                for row in res.result_rows:
+                    last_row_read = self._parse_db_row(row)
+                    yield last_row_read
+                    row_ctr += 1
+                self._metrics_accumulator.register_db_query(
+                    res.query_took_sec, constants.CHANGE_ROWS_KIND, row_ctr)
+                lsn = res.query_params[0].hex()
+                logger.debug('Rows polled - kind: %s\tnbr returned: %s\ttook ms: %s\tsource: %s @ %s',
+                             constants.CHANGE_ROWS_KIND.ljust(14),
+                             str(row_ctr).rjust(5), str(int(res.query_took_sec * 1000)).rjust(5),
+                             self.fq_name, f'0x{lsn[:8]} {lsn[8:16]} {lsn[16:]}')
+                if row_ctr == constants.DB_ROW_BATCH_SIZE:
+                    self.change_reads_are_lagging = True
+                    self.max_polled_change_index = last_row_read.change_idx
+                else:
+                    self.change_reads_are_lagging = False
+                    self.max_polled_change_index = change_index.ChangeIndex(
+                        res.reflected_query_request_metadata, change_index.HIGHEST_CHANGE_INDEX.seqval,
+                        change_index.HIGHEST_CHANGE_INDEX.operation)
+            else:
+                raise Exception('TrackedTable.retrieve_changes_query_results failed retrieving SQL query results.')
+
+    def get_change_rows_per_second(self) -> int:
+        with self._db_conn.cursor() as cursor:
+            q, p = sql_queries.get_change_rows_per_second(self.change_table_name)
+            cursor.execute(q)
+            return cursor.fetchval() or 0
+
+    def _parse_db_row(self, db_row: Tuple) -> parsed_row.ParsedRow:
+        operation_id, event_db_time, lsn, seqval, update_mask, *table_cols = db_row
+        operation_name = constants.CDC_OPERATION_ID_TO_NAME[operation_id]
+        if operation_id == constants.SNAPSHOT_OPERATION_ID:
+            row_kind = constants.SNAPSHOT_ROWS_KIND
+            change_idx = None
+            value_dict: Dict[str, Any] = {
+                constants.OPERATION_NAME: constants.SNAPSHOT_OPERATION_NAME,
+                constants.LSN_NAME: None,
+                constants.SEQVAL_NAME: None,
+                constants.UPDATED_FIELDS_NAME: self._value_field_names
+            }
+        else:
+            row_kind = constants.CHANGE_ROWS_KIND
+            change_idx = change_index.ChangeIndex(lsn, seqval, operation_id)
+            value_dict: Dict[str, Any] = change_idx.to_avro_ready_dict()
+            value_dict[constants.UPDATED_FIELDS_NAME] = list(self._updated_col_names_from_mask(update_mask))
+
+        value_dict[constants.EVENT_TIME_NAME] = event_db_time.isoformat()
+        value_dict.update({fld.name: fld.transform_fn(table_cols[ix]) if fld.transform_fn else table_cols[ix]
+                           for ix, fld in enumerate(self.value_fields)})
 
         if self._has_pk:
-            for field in self._key_fields:
-                key[field.name] = field.transform_fn(table_cols[field.change_table_ordinal - 1])
+            ordered_key_field_values: List[Any] = [table_cols[kfo - 1] for kfo in self._key_field_source_table_ordinals]
         else:
             # CAUTION: this strategy for handling PK-less tables means that if columns are added or removed from the
             # capture instance in the future, the key value computed for the same source table row will change:
             m = hashlib.md5()
             m.update(str(zip(self._value_field_names, table_cols)).encode('utf8'))
             row_hash = uuid.uuid5(uuid.UUID(bytes=m.digest()), self.fq_name)
-            key[constants.MESSAGE_KEY_FIELD_NAME_WHEN_PK_ABSENT] = row_hash
+            ordered_key_field_values: List[Any] = [row_hash]
 
-        for ix, field in enumerate(self._value_fields):
-            value[field.name] = field.transform_fn(table_cols[ix])
+        key_dict: Dict[str, Any] = dict(zip(self._key_field_names, ordered_key_field_values))
 
-        value[constants.LSN_NAME] = meta_cols[constants.LSN_POS]
-        value[constants.SEQVAL_NAME] = meta_cols[constants.SEQVAL_POS]
-        value[constants.OPERATION_NAME] = constants.CDC_OPERATION_ID_TO_NAME[meta_cols[constants.OPERATION_POS]]
-        value[constants.TRAN_END_TIME_NAME] = meta_cols[constants.TRAN_END_TIME_POS].isoformat()
+        return parsed_row.ParsedRow(self.fq_name, row_kind, operation_name, event_db_time, change_idx,
+                                    tuple(ordered_key_field_values), self.topic_name, self.key_schema_id,
+                                    self.value_schema_id, key_dict, value_dict)
 
-        if meta_cols[constants.OPERATION_POS] == constants.SNAPSHOT_OPERATION_ID:
-            value['_cdc_updated_fields'] = self._value_field_names
-        else:
-            value['_cdc_updated_fields'] = list(self._updated_cols_from_mask(meta_cols[constants.UPDATE_MASK_POS]))
-
-        return key, value
-
-    def _updated_cols_from_mask(self, cdc_update_mask: bytes) -> List[str]:
+    def _updated_col_names_from_mask(self, cdc_update_mask: bytes) -> List[str]:
         pos = 0
         for byte in reversed(cdc_update_mask):
             for j in range(8):
@@ -383,208 +386,14 @@ class TrackedTable(object):
                     yield self._value_field_names[pos]
                 pos += 1
 
-    # This method's Return value is used to order results in the priority queue used to determine the sequence in
-    # which rows are published.
-    def _get_queue_priority_tuple(
-            self, row: Union[None, Tuple[Any]]) -> Tuple[datetime.datetime, bytes, bytes, int, str]:
-        if row is None:
-            return (datetime.datetime.utcnow() + constants.DB_TABLE_POLL_INTERVAL,  # defer until ready for next poll
-                    change_index.BEGINNING_CHANGE_INDEX.lsn,
-                    change_index.BEGINNING_CHANGE_INDEX.seqval,
-                    0,
-                    self.fq_name)
-
-        return (self._clock_syncer.db_time_to_utc(row[constants.TRAN_END_TIME_POS]),
-                row[constants.LSN_POS],
-                row[constants.SEQVAL_POS],
-                row[constants.OPERATION_POS],
-                self.fq_name)
-
-    def _maybe_refresh_buffer(self) -> None:
-        if len(self._row_buffer) > 0:
-            return
-
-        if not self.lagging and (datetime.datetime.utcnow() - self._last_db_poll_time) < \
-                constants.DB_TABLE_POLL_INTERVAL:
-            return
-
-        change_rows_read_ctr, snapshot_rows_read_ctr = 0, 0
-        logger.debug('Polling DB for capture instance %s', self.capture_instance_name)
-
+    def _get_max_key_value(self) -> Optional[Tuple[Any]]:
         with self._db_conn.cursor() as cursor:
-            start_time = time.perf_counter()
-            cursor.setinputsizes(constants.CHANGE_ROWS_QUERY_PARAM_TYPES)
-            cursor.execute(self._change_rows_query, (self._last_read_change_table_index.lsn,
-                           self._last_read_change_table_index.seqval))
-            change_row = None
-            for change_row in cursor.fetchall():
-                change_rows_read_ctr += 1
-                self._row_buffer.append(change_row)
-            elapsed = (time.perf_counter() - start_time)
-            self._metrics_accumulator.register_db_query(elapsed, False, change_rows_read_ctr)
-
-        self._last_db_poll_time = datetime.datetime.utcnow()
-
-        if change_row:
-            logger.debug('Retrieved %s change rows', change_rows_read_ctr)
-            self._last_read_change_table_index = change_index.ChangeIndex(
-                change_row[constants.LSN_POS], change_row[constants.SEQVAL_POS], change_row[constants.OPERATION_POS])
-
-        self.lagging = change_rows_read_ctr == constants.DB_ROW_BATCH_SIZE
-
-        if self.snapshot_allowed and not self.snapshot_complete and not self.lagging:
-
-            logger.debug('Polling DB for snapshot rows from %s', self.fq_name)
-
-            with self._db_conn.cursor() as cursor:
-                start_time = time.perf_counter()
-                if self._last_read_key_for_snapshot == NEW_SNAPSHOT:
-                    cursor.execute(self._initial_snapshot_rows_query)
-                else:
-                    cursor.setinputsizes(self._snapshot_query_param_types)
-                    cursor.execute(self._snapshot_rows_query, self._last_read_key_for_snapshot)
-
-                snapshot_row = None
-                for snapshot_row in cursor.fetchall():
-                    snapshot_rows_read_ctr += 1
-                    self._row_buffer.append(snapshot_row)
-                elapsed = (time.perf_counter() - start_time)
-                self._metrics_accumulator.register_db_query(elapsed, True, snapshot_rows_read_ctr)
-
-            if snapshot_row:
-                self._last_read_key_for_snapshot = tuple(snapshot_row[n - 1 + constants.CDC_METADATA_COL_COUNT]
-                                                         for n in self._key_field_positions)
-                logger.debug('Retrieved %s snapshot rows', snapshot_rows_read_ctr)
-            else:
-                logger.info("SNAPSHOT COMPLETED for table %s. Last read key: (%s)", self.fq_name, ', '.join(
-                    [f'{k}: {v}' for k, v in zip(self._key_field_names, self._last_read_key_for_snapshot)]))
-                self._last_read_key_for_snapshot = None
-                self.snapshot_complete = True
-
-    def _get_max_key_value(self) -> Union[None, Tuple[Any]]:
-        order_by_spec = ", ".join([f'{fn} DESC' for fn in self._quoted_key_field_names])
-
-        with self._db_conn.cursor() as cursor:
-            cursor.execute(f'SELECT TOP 1 {", ".join(self._quoted_key_field_names)} '
-                           f'FROM [{self.schema_name}].[{self.table_name}] ORDER BY {order_by_spec}')
+            q, p = sql_queries.get_max_key_value(self.schema_name, self.table_name, self._key_field_names)
+            cursor.execute(q)
             return cursor.fetchone()
 
-    def _get_min_key_value(self) -> Union[None, Tuple[Any]]:
-        order_by_spec = ", ".join([f'{fn} ASC' for fn in self._quoted_key_field_names])
-
+    def _get_min_key_value(self) -> Optional[Tuple[Any]]:
         with self._db_conn.cursor() as cursor:
-            cursor.execute(f'SELECT TOP 1 {", ".join(self._quoted_key_field_names)} '
-                           f'FROM [{self.schema_name}].[{self.table_name}] ORDER BY {order_by_spec}')
+            q, p = sql_queries.get_min_key_value(self.schema_name, self.table_name, self._key_field_names)
+            cursor.execute(q)
             return cursor.fetchone()
-
-    def get_change_rows_per_second(self) -> int:
-        with self._db_conn.cursor() as cursor:
-            cursor.execute(constants.CHANGE_ROWS_PER_SECOND_QUERY.format(
-                capture_instance_name=self.capture_instance_name))
-            return cursor.fetchval() or 0
-
-
-# This pulls the "greatest" capture instance running for each source table, in the event there is more than one.
-def get_latest_capture_instance_names(db_conn: pyodbc.Connection, capture_instance_version_strategy: str,
-                                      capture_instance_version_regex: str) -> List[str]:
-    if capture_instance_version_strategy == 'regex' and not capture_instance_version_regex:
-        raise Exception('Please provide a capture_instance_version_regex when specifying the `regex` '
-                        'capture_instance_version_strategy.')
-    result = []
-    table_to_capture_instances = collections.defaultdict(list)
-    capture_instance_version_regex = capture_instance_version_regex and re.compile(capture_instance_version_regex)
-
-    with db_conn.cursor() as cursor:
-        cursor.execute(constants.CDC_CAPTURE_INSTANCES_QUERY)
-        for row in cursor.fetchall():
-            as_dict = {
-                'source_object_id': row[0],
-                'capture_instance': row[1],
-                'create_date': row[2],
-            }
-            if capture_instance_version_regex:
-                match = capture_instance_version_regex.match(row[1])
-                as_dict['regex_matched_group'] = match and match.group(1) or ''
-            table_to_capture_instances[as_dict['source_object_id']].append(as_dict)
-
-    for source_id, capture_instances in table_to_capture_instances.items():
-        if capture_instance_version_strategy == 'create_date':
-            latest_instance = sorted(capture_instances, key=lambda x: x['create_date'])[-1]
-        elif capture_instance_version_strategy == 'regex':
-            latest_instance = sorted(capture_instances, key=lambda x: x['regex_matched_group'])[-1]
-        else:
-            raise Exception(f'Capture instance version strategy "{capture_instance_version_strategy}" not recognized.')
-        result.append(latest_instance['capture_instance'])
-
-    return result
-
-
-def build_tracked_tables_from_cdc_metadata(
-    db_conn: pyodbc.Connection, clock_syncer: 'clock_sync.ClockSync', metrics_accumulator: 'accumulator.Accumulator',
-    topic_name_template: str, table_whitelist_regex: str, table_blacklist_regex: str,
-    snapshot_table_whitelist_regex: str, snapshot_table_blacklist_regex: str, capture_instance_version_strategy: str,
-    capture_instance_version_regex: str, truncate_fields: Dict[str, int]
-) -> List[TrackedTable]:
-    result = []
-
-    truncate_fields = {k.lower(): v for k, v in truncate_fields.items()}
-
-    latest_names = get_latest_capture_instance_names(
-        db_conn, capture_instance_version_strategy, capture_instance_version_regex)
-    logger.debug('Latest capture instance names determined by "%s" strategy: %s', capture_instance_version_strategy,
-                 sorted(latest_names))
-
-    table_whitelist_regex = table_whitelist_regex and re.compile(
-        table_whitelist_regex, re.IGNORECASE)
-    table_blacklist_regex = table_blacklist_regex and re.compile(
-        table_blacklist_regex, re.IGNORECASE)
-    snapshot_table_whitelist_regex = snapshot_table_whitelist_regex and re.compile(
-        snapshot_table_whitelist_regex, re.IGNORECASE)
-    snapshot_table_blacklist_regex = snapshot_table_blacklist_regex and re.compile(
-        snapshot_table_blacklist_regex, re.IGNORECASE)
-
-    meta_query = constants.CDC_METADATA_QUERY.replace('?', ', '.join(['?'] * len(latest_names)))
-    name_to_meta_fields = collections.defaultdict(list)
-
-    with db_conn.cursor() as cursor:
-        cursor.execute(meta_query, latest_names)
-        for row in cursor.fetchall():
-            # 0:4 gets schema name, table name, capture instance name, min captured LSN:
-            name_to_meta_fields[tuple(row[0:4])].append(row[4:])
-
-    for (schema_name, table_name, capture_instance_name, min_lsn), fields in name_to_meta_fields.items():
-        fq_table_name = f'{schema_name}.{table_name}'
-
-        can_snapshot = False
-
-        if table_whitelist_regex and not table_whitelist_regex.match(fq_table_name):
-            logger.debug('Table %s excluded by whitelist', fq_table_name)
-            continue
-
-        if table_blacklist_regex and table_blacklist_regex.match(fq_table_name):
-            logger.debug('Table %s excluded by blacklist', fq_table_name)
-            continue
-
-        if snapshot_table_whitelist_regex and snapshot_table_whitelist_regex.match(fq_table_name):
-            logger.debug('Table %s WILL be snapshotted due to whitelisting', fq_table_name)
-            can_snapshot = True
-
-        if snapshot_table_blacklist_regex and snapshot_table_blacklist_regex.match(fq_table_name):
-            logger.debug('Table %s will NOT be snapshotted due to blacklisting', fq_table_name)
-            can_snapshot = False
-
-        topic_name = topic_name_template.format(
-            schema_name=schema_name, table_name=table_name, capture_instance_name=capture_instance_name)
-
-        tracked_table = TrackedTable(db_conn, clock_syncer, metrics_accumulator, schema_name, table_name,
-                                     capture_instance_name, topic_name, min_lsn, can_snapshot)
-
-        for (change_table_ordinal, column_name, sql_type_name, primary_key_ordinal, decimal_precision,
-             decimal_scale) in fields:
-            truncate_after = truncate_fields.get(f'{schema_name}.{table_name}.{column_name}'.lower())
-            tracked_table.add_field(TrackedField(column_name, sql_type_name, change_table_ordinal, primary_key_ordinal,
-                                                 decimal_precision, decimal_scale, truncate_after))
-
-        result.append(tracked_table)
-
-    return result

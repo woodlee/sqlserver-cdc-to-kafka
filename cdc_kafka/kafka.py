@@ -1,16 +1,16 @@
 import collections
-import csv
 import datetime
+import io
 import json
 import logging
-import os
 import socket
+import struct
 import time
-from typing import List, Dict, Tuple, Any, Callable, Union, Generator
+from typing import List, Dict, Tuple, Any, Callable, Union, Generator, Optional, Iterable
 
-import avro
 import confluent_kafka.admin
 import confluent_kafka.avro
+import fastavro
 
 from . import constants
 
@@ -23,35 +23,28 @@ logger = logging.getLogger(__name__)
 
 class KafkaClient(object):
     _instance = None
-    WARNED_TIMESTAMPS = False
+    TIMESTAMP_WARNING_LOGGED = False
 
-    def __init__(self,
-                 metrics_accumulator: 'accumulator.Accumulator',
-                 bootstrap_servers: str,
-                 schema_registry_url: str,
-                 kafka_timeout_seconds: int,
-                 progress_topic_name: str,
-                 capture_instance_name_resolver: Callable[[str], str],
-                 extra_kafka_consumer_config: Dict[str, Union[str, int]],
-                 extra_kafka_producer_config: Dict[str, Union[str, int]]):
-
+    def __init__(self, metrics_accumulator: 'accumulator.Accumulator', bootstrap_servers: str,
+                 schema_registry_url: str, extra_kafka_consumer_config: Dict[str, Union[str, int]],
+                 extra_kafka_producer_config: Dict[str, Union[str, int]], disable_writing: bool = False) -> None:
         if KafkaClient._instance is not None:
             raise Exception('KafkaClient class should be used as a singleton.')
 
-        self._metrics_accumulator = metrics_accumulator
-        self._kafka_timeout_seconds: int = kafka_timeout_seconds
-        self._progress_topic_name: str = progress_topic_name
-        self._capture_instance_name_resolver: Callable[[str], str] = capture_instance_name_resolver
+        self._metrics_accumulator: 'accumulator.Accumulator' = metrics_accumulator
 
+        # Kafka consumer/producer librdkafka config defaults are here:
         consumer_config = {**{
             'bootstrap.servers': bootstrap_servers,
-            'group.id': f'cdc_to_kafka_progress_check_{socket.getfqdn()}',
-            'enable.partition.eof': True
+            'group.id': f'cdc_to_kafka_{socket.getfqdn()}',
+            'enable.partition.eof': True,
+            'enable.auto.commit': False
         }, **extra_kafka_consumer_config}
         producer_config = {**{
             'bootstrap.servers': bootstrap_servers,
             'linger.ms': '50',
             'enable.idempotence': True,
+            'statistics.interval.ms': 30 * 60 * 1000,
             'enable.gapless.guarantee': True,
             'retry.backoff.ms': 250,
             'compression.codec': 'snappy'
@@ -68,170 +61,139 @@ class KafkaClient(object):
         consumer_config['throttle_cb'] = KafkaClient._log_kafka_throttle_event
         consumer_config['logger'] = logger
         producer_config['error_cb'] = KafkaClient._raise_kafka_error
+        producer_config['stats_cb'] = KafkaClient._emit_producer_stats
         producer_config['throttle_cb'] = KafkaClient._log_kafka_throttle_event
         producer_config['logger'] = logger
         admin_config['error_cb'] = KafkaClient._raise_kafka_error
         admin_config['throttle_cb'] = KafkaClient._log_kafka_throttle_event
         admin_config['logger'] = logger
 
-        self._schema_registry = confluent_kafka.avro.CachedSchemaRegistryClient(schema_registry_url)
-        self._avro_serializer = confluent_kafka.avro.MessageSerializer(self._schema_registry)
-        self._consumer = confluent_kafka.Consumer(consumer_config)
-        self._producer = confluent_kafka.Producer(producer_config)
-        self._admin = confluent_kafka.admin.AdminClient(admin_config)
-        self._avro_deserializers = {}
-        self._commit_order_enforcer: Dict[Tuple, int] = {}
-
-        self._cluster_metadata = None
-        self.refresh_cluster_metadata()
-
-        self._last_progress_commit_time: datetime.datetime = datetime.datetime.utcnow()
+        self._schema_registry: confluent_kafka.avro.CachedSchemaRegistryClient = \
+            confluent_kafka.avro.CachedSchemaRegistryClient(schema_registry_url)
+        self._consumer: confluent_kafka.Consumer = confluent_kafka.Consumer(consumer_config)
+        self._producer: confluent_kafka.Producer = confluent_kafka.Producer(producer_config)
+        self._admin: confluent_kafka.admin.AdminClient = confluent_kafka.admin.AdminClient(admin_config)
+        self._avro_serializer: confluent_kafka.avro.MessageSerializer = \
+            confluent_kafka.avro.MessageSerializer(self._schema_registry)
+        self._avro_decoders: Dict[int, Callable] = {}
+        self._delivery_callbacks: Dict[str, List[Callable[[Any], None]]] = collections.defaultdict(list)
+        self._delivery_callbacks_finalized: bool = False
+        self._global_produce_sequence_nbr: int = 0
+        self._cluster_metadata: Optional[confluent_kafka.admin.ClusterMetadata] = None
         self._last_full_flush_time: datetime.datetime = datetime.datetime.utcnow()
-        self._successfully_delivered_messages_counter: int = 0
-        self._produce_sequence: int = 0
-        self._progress_messages_awaiting_commit: Dict[Tuple, Dict[int, Tuple]] = collections.defaultdict(dict)
+        self._disable_writing = disable_writing
 
-        k_id, v_id = self.register_schemas(
-            self._progress_topic_name, constants.PROGRESS_MESSAGE_AVRO_KEY_SCHEMA,
-            constants.PROGRESS_MESSAGE_AVRO_VALUE_SCHEMA)
-        self._progress_key_schema_id: int = k_id
-        self._progress_value_schema_id: int = v_id
+        self._refresh_cluster_metadata()
 
         KafkaClient._instance = self
 
-    def refresh_cluster_metadata(self) -> None:
-        self._cluster_metadata = self._admin.list_topics(timeout=self._kafka_timeout_seconds)
-        if self._cluster_metadata is None:
-            raise Exception(f'Cluster metadata request to Kafka timed out')
-
-    def __enter__(self):
+    def __enter__(self) -> 'KafkaClient':
         return self
 
-    def __exit__(self, exc_type, value, traceback):
-        logger.info("Committing progress and cleaning up Kafka resources...")
+    def __exit__(self, exc_type, value, traceback) -> None:
+        logger.info("Cleaning up Kafka resources...")
         self._consumer.close()
-        self.commit_progress(True)
+        self.flush(final=True)
         logger.info("Done.")
 
+    def register_delivery_callback(self, for_message_types: Iterable[str], callback: Callable[[Any], None]) -> None:
+        for message_type in for_message_types:
+            if message_type not in constants.ALL_KAFKA_MESSAGE_TYPES:
+                raise Exception('Unrecognized message type: %s', message_type)
+            self._delivery_callbacks[message_type].append(callback)
+
+    # a return of None indicates the topic does not exist
+    def get_topic_partition_count(self, topic_name: str) -> Optional[int]:
+        if topic_name not in self._cluster_metadata.topics:
+            return None
+        return len(self._cluster_metadata.topics[topic_name].partitions)
+
     def produce(self, topic: str, key: Dict[str, Any], key_schema_id: int, value: Union[None, Dict[str, Any]],
-                value_schema_id: int) -> None:
+                value_schema_id: int, message_type: str) -> None:
+        if self._disable_writing:
+            return
+
         start_time = time.perf_counter()
 
         key_ser = self._avro_serializer.encode_record_with_schema_id(key_schema_id, key, True)
-        if value is None:
-            # deletion tombstone
+        if value is None:  # a deletion tombstone probably
             value_ser = None
         else:
             value_ser = self._avro_serializer.encode_record_with_schema_id(value_schema_id, value, False)
-        # the callback function receives the binary-serialized payload, so instead of specifying it
-        # directly as the delivery callback we wrap it in a lambda that also passes the original not-yet-
-        # serialized key and value so that we don't have to re-deserialize it later:
-        self._produce_sequence += 1
-        seq = self._produce_sequence
+
+        seq = self._global_produce_sequence_nbr + 1
+        self._global_produce_sequence_nbr = seq
+
         while True:
             try:
+                # the callback function receives the binary-serialized payload, so instead of specifying it directly
+                # as the delivery callback we wrap it in a lambda that also captures and passes the original not-yet-
+                # serialized key and value so that we don't have to re-deserialize it later:
                 self._producer.produce(
                     topic=topic, value=value_ser, key=key_ser,
-                    callback=lambda err, msg: self._delivery_callback(err, msg, key, value, seq))
+                    on_delivery=lambda err, msg: self._delivery_callback(message_type, err, msg, key, value, seq),
+                    headers={'cdc_to_kafka_message_type': message_type}
+                )
                 break
             except BufferError:
                 time.sleep(1)
                 logger.debug('Sleeping due to Kafka producer buffer being full...')
-                self.commit_progress()  # clear some space before retrying
+                self.flush()  # clear some space before retrying
             except Exception:
                 logger.error('The following exception occurred producing to topic %s', topic)
                 raise
 
         elapsed = (time.perf_counter() - start_time)
-        is_metadata_msg = value and constants.OPERATION_NAME not in value
-        self._metrics_accumulator.register_kafka_produce(elapsed, is_metadata_msg, value)
+        self._metrics_accumulator.register_kafka_produce(elapsed, value, message_type)
 
-    def reset_progress(self, topic_name: str, capture_instance_name: str) -> None:
-        key = {
-            'progress_kind': constants.CHANGE_ROWS_PROGRESS_KIND,
-            'topic_name': topic_name,
-            'capture_instance_name': capture_instance_name
-        }
-        self.produce(self._progress_topic_name, key, self._progress_key_schema_id, None, self._progress_value_schema_id)
-        key = {
-            'progress_kind': constants.SNAPSHOT_ROWS_PROGRESS_KIND,
-            'topic_name': topic_name,
-            'capture_instance_name': capture_instance_name
-        }
-        self.produce(self._progress_topic_name, key, self._progress_key_schema_id, None, self._progress_value_schema_id)
-        logger.info('Deleted existing progress records for topic %s.', topic_name)
-
-    def commit_progress(self, final: bool = False) -> None:
-        if (datetime.datetime.utcnow() - self._last_progress_commit_time) < constants.PROGRESS_COMMIT_INTERVAL \
-                and not final:
-            return
+    def flush(self, final: bool = False) -> bool:
+        if self._disable_writing:
+            return True
 
         start_time = time.perf_counter()
-        full_flush_due = (datetime.datetime.utcnow() - self._last_full_flush_time) > constants.FULL_FLUSH_MAX_INTERVAL
-        flush_timeout = 30 if (final or full_flush_due) else 0.1
-        still_in_queue_count = self._producer.flush(flush_timeout)  # triggers the _delivery_callback
+        do_full_flush = final or ((datetime.datetime.utcnow() - self._last_full_flush_time) >
+                                  constants.KAFKA_PRODUCER_FULL_FLUSH_INTERVAL)
+        flush_timeout = constants.KAFKA_FULL_FLUSH_TIMEOUT_SECS if do_full_flush else 0.1
+        still_in_queue_count = self._producer.flush(flush_timeout)  # this triggers delivery callbacks
         flushed_all = still_in_queue_count == 0
+
         if flushed_all:
             self._last_full_flush_time = datetime.datetime.utcnow()
+        elif do_full_flush:
+            logger.error('Could not complete full Kafka producer flush within %s second timeout. Messages not '
+                         'flushed: %s', constants.KAFKA_FULL_FLUSH_TIMEOUT_SECS, still_in_queue_count)
 
-        for (kind, topic), progress_by_partition in self._progress_messages_awaiting_commit.items():
-            commit_sequence, commit_partition = None, None
-            if (not flushed_all) and len(progress_by_partition) < len(self._cluster_metadata.topics[topic].partitions):
-                # not safe to commit anything if not all partitions have acked since there may still be some
-                # less-progressed messages in flight for the non-acked partition:
-                continue
-            for partition, (produce_sequence, progress_msg) in progress_by_partition.items():
-                if flushed_all:
-                    if commit_sequence is None or produce_sequence > commit_sequence:
-                        commit_sequence = produce_sequence
-                        commit_partition = partition
-                else:
-                    if commit_sequence is None or produce_sequence < commit_sequence:
-                        commit_sequence = produce_sequence
-                        commit_partition = partition
+        if final:  # Do it again to ensure flushing of anything that was produced by delivery callbacks:
+            flushed_all = self._producer.flush(constants.KAFKA_FULL_FLUSH_TIMEOUT_SECS) == 0
 
-            if commit_partition is not None:
-                produce_sequence, progress_msg = progress_by_partition.pop(commit_partition)
-                prior_sequence = self._commit_order_enforcer.get((kind, topic))
-                if prior_sequence is not None and produce_sequence < prior_sequence:
-                    raise Exception('Committing progress out of order. There is a bug. Fix it.')
-                self._commit_order_enforcer[(kind, topic)] = produce_sequence
-                key = {
-                    'progress_kind': kind,
-                    'topic_name': topic,
-                    'capture_instance_name': self._capture_instance_name_resolver(topic)
-                }
-                self.produce(self._progress_topic_name, key, self._progress_key_schema_id, progress_msg,
-                             self._progress_value_schema_id)
-
-            if final:
-                if self._producer.flush(30) > 0:
-                    logger.error('Unable to complete final flush of Kafka producer queue.')
-
-        if flushed_all:
-            self._progress_messages_awaiting_commit = collections.defaultdict(dict)
-
-        self._last_progress_commit_time = datetime.datetime.utcnow()
         elapsed = time.perf_counter() - start_time
         self._metrics_accumulator.register_kafka_commit(elapsed)
-        logger.debug('_commit_progress took %s ms (final=%s, flushed_all=%s)', elapsed * 1000, final, flushed_all)
+        return flushed_all
 
-    def consume_all(self, topic_name: str) -> Generator[confluent_kafka.Message, None, None]:
-        topic_metadata = self._cluster_metadata.topics.get(topic_name)
+    def consume_all(self, topic_name: str, approx_max_recs: Optional[int] = None) -> \
+            Generator[confluent_kafka.Message, None, None]:
+        part_count = self.get_topic_partition_count(topic_name)
 
-        if not topic_metadata:
+        if part_count is None:
             logger.warning(
-                'consume_all: Requested topic %s does not appear to existing. Returning nothing.', topic_name)
+                'consume_all: Requested topic %s does not appear to exist. Returning nothing.', topic_name)
             return
 
-        self._consumer.assign([confluent_kafka.TopicPartition(topic_name, part_id, confluent_kafka.OFFSET_BEGINNING)
-                               for part_id in topic_metadata.partitions.keys()])
+        if approx_max_recs is None:
+            self._consumer.assign([confluent_kafka.TopicPartition(topic_name, part_id, confluent_kafka.OFFSET_BEGINNING)
+                                   for part_id in range(part_count)])
+        else:
+            rewind_per_part = int(approx_max_recs / part_count)
+            watermarks = self.get_topic_watermarks([topic_name])[topic_name]
+            offsets = [max(lo, hi - rewind_per_part) for lo, hi in watermarks]
+            self._consumer.assign([confluent_kafka.TopicPartition(topic_name, part_id, offset)
+                                   for part_id, offset in enumerate(offsets)])
 
-        finished_parts = [False] * len(topic_metadata.partitions.keys())
+        finished_parts = [False] * part_count
         ctr = 0
 
         while True:
-            msg = self._consumer.poll(self._kafka_timeout_seconds)
+            msg = self._consumer.poll(constants.KAFKA_REQUEST_TIMEOUT_SECS)
 
             if msg is None:
                 time.sleep(1)
@@ -250,17 +212,27 @@ class KafkaClient(object):
             if ctr % 100000 == 0:
                 logger.debug('consume_all has yielded %s messages so far from topic %s', ctr, topic_name)
 
-            deserializer = self._avro_deserializers[msg.topic()]
-
-            if msg.value() is not None:
-                msg.set_value(deserializer.decode_message(msg.value(), is_key=False))
-            if msg.key() is not None:
-                msg.set_key(deserializer.decode_message(msg.key(), is_key=True))
+            for msg_part, setter in ((msg.key(), msg.set_key), (msg.value(), msg.set_value)):
+                if msg_part is not None:
+                    payload = io.BytesIO(msg_part)
+                    _, schema_id = struct.unpack('>bI', payload.read(5))
+                    if schema_id not in self._avro_decoders:
+                        self._set_decoder(schema_id)
+                    decoder = self._avro_decoders[schema_id]
+                    setter(decoder(payload))
+                    payload.close()
 
             yield msg
 
+    def _set_decoder(self, schema_id):
+        schema = fastavro.parse_schema(self._schema_registry.get_by_id(schema_id).to_json())
+        self._avro_decoders[schema_id] = lambda p: fastavro.schemaless_reader(p, schema)
+
     def create_topic(self, topic_name: str, partition_count: int, replication_factor: int = None,
                      extra_config: Dict[str, Union[str, int]] = None) -> None:
+        if self._disable_writing:
+            return
+
         if not replication_factor:
             replication_factor = min(len(self._cluster_metadata.brokers), 3)
 
@@ -270,103 +242,49 @@ class KafkaClient(object):
         logger.debug('Kafka topic configuration for %s: %s', topic_name, json.dumps(topic_config))
         topic = confluent_kafka.admin.NewTopic(topic_name, partition_count, replication_factor, config=topic_config)
         self._admin.create_topics([topic])[topic_name].result()
-
-    def get_prior_progress_or_create_progress_topic(self, log_to_file_path: str = None) -> Dict[Tuple, Dict[str, Any]]:
-        result = {}
-
-        if self._progress_topic_name not in self._cluster_metadata.topics:
-            logger.warning('No existing snapshot progress storage topic found; creating topic %s',
-                           self._progress_topic_name)
-            # log.segment.bytes set to 16 MB. Compaction will not run until the next log segment rolls so we set this
-            # a bit low (the default is 1 GB) to prevent having to read too much from the topic on process start:
-            self.create_topic(self._progress_topic_name, 1, extra_config={"segment.bytes": 16777216})
-            time.sleep(5)
-            self.refresh_cluster_metadata()
-            return {}
-
-        header, all_csv_writer, all_file = None, None, None
-        if log_to_file_path is not None:
-            all_file = open(os.path.join(log_to_file_path, 'all_progress_entries.csv'), 'w')
-            all_csv_writer = csv.writer(all_file, quoting=csv.QUOTE_ALL)
-
-        progress_msg_ctr = 0
-        for progress_msg in self.consume_all(self._progress_topic_name):
-            progress_msg_ctr += 1
-            # Need to reform the key into a stably-sorted tuple of kv pairs so it can be used as a dictionary key:
-            key = tuple(sorted(progress_msg.key().items(), key=lambda kv: kv[0]))
-
-            if progress_msg.value() is None:
-                if key in result:
-                    del result[key]
-                continue
-
-            result[key] = dict(progress_msg.value())  # last read for a given key will win
-
-            if log_to_file_path is not None:
-                sorted_vals = tuple(sorted(progress_msg.value().items(), key=lambda kv: kv[0]))
-                if not header:
-                    header = ['timestamp', 'progress_offset'] + [key_k for key_k, _ in key] + \
-                             [val_k for val_k, _ in sorted_vals]
-                    all_csv_writer.writerow(header)
-                timestamp = datetime.datetime.utcfromtimestamp(progress_msg.timestamp()[1] / 1000.0).isoformat()
-                row = [timestamp, progress_msg.offset()] + [key_v for _, key_v in key] + \
-                      [f'0x{val_v.hex()}' if isinstance(val_v, bytes) else val_v for _, val_v in sorted_vals]
-                all_csv_writer.writerow(row)
-
-        if log_to_file_path is not None:
-            all_file.close()
-            with open(os.path.join(log_to_file_path, 'latest_progress_entries.csv'), 'w') as latest_file:
-                latest_csv_writer = csv.writer(latest_file, quoting=csv.QUOTE_ALL)
-                latest_csv_writer.writerow(header[2:])
-                for k, v in result.items():
-                    sorted_vals = tuple(sorted(v.items(), key=lambda kv: kv[0]))
-                    row = [key_v for _, key_v in k] + \
-                          [f'0x{val_v.hex()}' if isinstance(val_v, bytes) else val_v for _, val_v in sorted_vals]
-                    latest_csv_writer.writerow(row)
-
-        logger.debug('Read %s prior progress messages from Kafka topic %s', progress_msg_ctr,
-                     self._progress_topic_name)
-
-        return result
+        time.sleep(constants.KAFKA_CONFIG_RELOAD_DELAY_SECS)
+        self._refresh_cluster_metadata()
 
     # Returns dict where key is topic name and value is ordered list of tuples of (low, high) watermarks per partition:
     def get_topic_watermarks(self, topic_names: List[str]) -> Dict[str, List[Tuple[int, int]]]:
         result = collections.defaultdict(list)
 
         for topic_name in topic_names:
-            topic_metadata = self._cluster_metadata.topics.get(topic_name)
+            part_count = self.get_topic_partition_count(topic_name)
 
-            if topic_metadata is None:
+            if part_count is None:
                 logger.warning('Topic name %s was not found in Kafka. This process will create it if corresponding '
                                'CDC entries are found.', topic_name)
                 continue
 
-            partition_count = len(topic_metadata.partitions)
-
-            for partition_ix in range(partition_count):
+            for part_id in range(part_count):
                 watermarks = self._consumer.get_watermark_offsets(
-                    confluent_kafka.TopicPartition(topic_name, partition_ix), timeout=self._kafka_timeout_seconds)
+                    confluent_kafka.TopicPartition(topic_name, part_id), timeout=constants.KAFKA_REQUEST_TIMEOUT_SECS)
                 if watermarks is None:
                     raise Exception(f'Timeout requesting watermark offsets from Kafka for topic {topic_name}, '
-                                    f'partition {partition_ix}')
+                                    f'partition {part_id}')
                 result[topic_name].append(watermarks)
 
         return result
 
-    def register_schemas(self, topic_name: str, key_schema: avro.schema.RecordSchema,
-                         value_schema: avro.schema.RecordSchema) -> Tuple[int, int]:
+    # returns (key schema ID, value schema ID)
+    def register_schemas(self, topic_name: str, key_schema: Dict[str, Any], value_schema: Dict[str, Any]) \
+            -> Tuple[int, int]:
+        key_schema = confluent_kafka.avro.loads(json.dumps(key_schema))
+        value_schema = confluent_kafka.avro.loads(json.dumps(value_schema))
+
         key_subject, value_subject = topic_name + '-key', topic_name + '-value'
         registered = False
 
         key_schema_id, current_key_schema, _ = self._schema_registry.get_latest_schema(key_subject)
-        if current_key_schema is None or current_key_schema != key_schema:
+        if (current_key_schema is None or current_key_schema != key_schema) and not self._disable_writing:
             logger.info('Key schema for subject %s does not exist or is outdated; registering now.', key_subject)
             key_schema_id = self._schema_registry.register(key_subject, key_schema)
             self._schema_registry.update_compatibility(constants.KEY_SCHEMA_COMPATIBILITY_LEVEL, key_subject)
             registered = True
 
         value_schema_id, current_value_schema, _ = self._schema_registry.get_latest_schema(value_subject)
-        if current_value_schema is None or current_value_schema != value_schema:
+        if (current_value_schema is None or current_value_schema != value_schema) and not self._disable_writing:
             logger.info('Value schema for subject %s does not exist or is outdated; registering now.', value_subject)
             value_schema_id = self._schema_registry.register(value_subject, value_schema)
             self._schema_registry.update_compatibility(constants.VALUE_SCHEMA_COMPATIBILITY_LEVEL, value_subject)
@@ -374,15 +292,40 @@ class KafkaClient(object):
 
         if registered:
             # some older versions of the Confluent schema registry have a bug that leads to duplicate schema IDs in
-            # some circumstances; delay a bit if we actually registered a new schema, to give the registry  a chance
+            # some circumstances; delay a bit if we actually registered a new schema, to give the registry a chance
             # to become consistent (see https://github.com/confluentinc/schema-registry/pull/1003 and linked issues
             # for context):
-            time.sleep(3)
-
-        self._avro_deserializers[topic_name] = confluent_kafka.avro.MessageSerializer(
-            self._schema_registry, key_schema, value_schema)
+            time.sleep(constants.KAFKA_CONFIG_RELOAD_DELAY_SECS)
 
         return key_schema_id, value_schema_id
+
+    def _refresh_cluster_metadata(self) -> None:
+        self._cluster_metadata = self._admin.list_topics(timeout=constants.KAFKA_REQUEST_TIMEOUT_SECS)
+        if self._cluster_metadata is None:
+            raise Exception(f'Cluster metadata request to Kafka timed out')
+
+    def _delivery_callback(self, message_type: str, err: confluent_kafka.KafkaError, message: confluent_kafka.Message,
+                           original_key: Dict[str, Any], original_value: Dict[str, Any], produce_sequence: int) -> None:
+        if err is not None:
+            raise confluent_kafka.KafkaException(f'Delivery error on topic {message.topic()}: {err}')
+
+        timestamp_type, timestamp = message.timestamp()
+        if timestamp_type != confluent_kafka.TIMESTAMP_CREATE_TIME:
+            if not KafkaClient.TIMESTAMP_WARNING_LOGGED:
+                logger.warning('Kafka message producer timestamps not available; falling back to delivery '
+                               'callback times for measuring E2E latencies.')
+                KafkaClient.TIMESTAMP_WARNING_LOGGED = True
+            produce_datetime = datetime.datetime.utcnow()
+        else:
+            produce_datetime = datetime.datetime.utcfromtimestamp(timestamp / 1000.0)
+
+        for cb in self._delivery_callbacks[message_type]:
+            cb(message_type=message_type,
+               message=message,
+               original_key=original_key,
+               original_value=original_value,
+               produce_sequence=produce_sequence,
+               produce_datetime=produce_datetime)
 
     @staticmethod
     def _raise_kafka_error(err: confluent_kafka.KafkaError) -> None:
@@ -396,43 +339,6 @@ class KafkaClient(object):
     def _log_kafka_throttle_event(evt: confluent_kafka.ThrottleEvent) -> None:
         logger.warning('Kafka throttle event: %s', evt)
 
-    def _delivery_callback(self, err: confluent_kafka.KafkaError, msg: confluent_kafka.Message,
-                           orig_key: Dict[str, Any], orig_value: Dict[str, Any], produce_sequence: int) -> None:
-        if err is not None:
-            raise confluent_kafka.KafkaException(f'Delivery error on topic {msg.topic()}: {err}')
-
-        self._successfully_delivered_messages_counter += 1
-        if self._successfully_delivered_messages_counter % constants.KAFKA_DELIVERY_SUCCESS_LOG_EVERY_NTH_MSG == 0:
-            logger.debug(f'{self._successfully_delivered_messages_counter} messages successfully produced '
-                         f'to Kafka so far.')
-
-        if orig_value is None or constants.OPERATION_NAME not in orig_value:
-            # is a metadata message (progress-tracking or metrics) or deletion tombstone
-            return
-
-        progress_msg = {'last_ack_partition': msg.partition(), 'last_ack_offset': msg.offset()}
-
-        if orig_value[constants.OPERATION_NAME] == constants.SNAPSHOT_OPERATION_NAME:
-            kind = constants.SNAPSHOT_ROWS_PROGRESS_KIND
-            progress_msg['last_ack_snapshot_key_field_values'] = orig_key
-        else:
-            kind = constants.CHANGE_ROWS_PROGRESS_KIND
-            progress_msg['last_ack_change_table_lsn'] = orig_value[constants.LSN_NAME]
-            progress_msg['last_ack_change_table_seqval'] = orig_value[constants.SEQVAL_NAME]
-            progress_msg['last_ack_change_table_operation'] = \
-                constants.CDC_OPERATION_NAME_TO_ID[orig_value[constants.OPERATION_NAME]]
-
-        key = (kind, msg.topic())
-        self._progress_messages_awaiting_commit[key][msg.partition()] = (produce_sequence, progress_msg)
-
-        timestamp_type, timestamp = msg.timestamp()
-        if timestamp_type != confluent_kafka.TIMESTAMP_CREATE_TIME:
-            if not KafkaClient.WARNED_TIMESTAMPS:
-                logger.warning('Kafka message producer timestamps not available; falling back to delivery '
-                               'callback times for measuring E2E latencies.')
-                KafkaClient.WARNED_TIMESTAMPS = True
-            produce_time = datetime.datetime.utcnow()
-        else:
-            produce_time = datetime.datetime.utcfromtimestamp(timestamp / 1000.0)
-
-        self._metrics_accumulator.register_kafka_delivery_callback(orig_value, produce_time)
+    @staticmethod
+    def _emit_producer_stats(stats_json: str) -> None:
+        logger.info('Kafka producer statistics: %s', stats_json)

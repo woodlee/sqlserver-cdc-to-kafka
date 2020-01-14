@@ -4,6 +4,20 @@ import json
 import os
 import socket
 
+from typing import Tuple, List
+
+
+# String constants for options with discrete choices:
+CAPTURE_INSTANCE_VERSION_STRATEGY_REGEX = 'regex'
+CAPTURE_INSTANCE_VERSION_STRATEGY_CREATE_DATE = 'create_date'
+LSN_GAP_HANDLING_RAISE_EXCEPTION = 'raise_exception'
+LSN_GAP_HANDLING_BEGIN_NEW_SNAPSHOT = 'begin_new_snapshot'
+LSN_GAP_HANDLING_IGNORE = 'ignore'
+NEW_CAPTURE_INSTANCE_SNAPSHOT_HANDLING_BEGIN_NEW = 'begin_new_snapshot'
+NEW_CAPTURE_INSTANCE_SNAPSHOT_HANDLING_IGNORE = 'ignore'
+NEW_CAPTURE_INSTANCE_OVERLAP_HANDLING_REPUBLISH = 'republish_from_new_instance'
+NEW_CAPTURE_INSTANCE_OVERLAP_HANDLING_PICKUP = 'start_from_prior_progress'
+
 
 def str2bool(v: str) -> bool:
     if isinstance(v, bool):
@@ -16,7 +30,7 @@ def str2bool(v: str) -> bool:
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
 
-def get_options_and_reporters():
+def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List]:
     p = argparse.ArgumentParser()
 
     # Required
@@ -33,12 +47,6 @@ def get_options_and_reporters():
                    help='URL to your Confluent Schema Registry, e.g. "http://localhost:8081"')
 
     # Optional
-    p.add_argument('--kafka-timeout-seconds',
-                   type=int,
-                   default=os.environ.get('KAFKA_TIMEOUT_SECONDS', 10),
-                   help="Timeout to use when interacting with Kafka during startup for checking topic watermarks and "
-                        "pulling messages to check existing progress.")
-
     p.add_argument('--extra-kafka-consumer-config',
                    default=os.environ.get('EXTRA_KAFKA_CONSUMER_CONFIG', {}), type=json.loads,
                    help='Optional JSON object of additional librdkafka config parameters to be used when instantiating '
@@ -88,14 +96,17 @@ def get_options_and_reporters():
                         "Tables names are specified in dot-separated 'schema_name.table_name' form.")
 
     p.add_argument('--capture-instance-version-strategy',
-                   choices=('regex', 'create_date'),
-                   default=os.environ.get('CAPTURE_INSTANCE_VERSION_STRATEGY', 'create_date'),
-                   help="If there is more than one capture instance following a given source table, how do you want to "
-                        "select which one this tool reads? `create_date` (the default) will follow the one most "
-                        "recently created. `regex` allows you to specify a regex against the capture instance name "
-                        "(as argument `capture-instance-version-regex`, the first captured group of which will be used "
-                        "in a lexicographic ordering of capture instance names to select the highest one. This can be "
-                        "useful if your capture instance names have a version number in them.")
+                   choices=(CAPTURE_INSTANCE_VERSION_STRATEGY_REGEX, CAPTURE_INSTANCE_VERSION_STRATEGY_CREATE_DATE),
+                   default=os.environ.get('CAPTURE_INSTANCE_VERSION_STRATEGY',
+                                          CAPTURE_INSTANCE_VERSION_STRATEGY_CREATE_DATE),
+                   help=f"If there is more than one capture instance following a given source table, how do you want "
+                        f"to select which one this tool reads? `{CAPTURE_INSTANCE_VERSION_STRATEGY_CREATE_DATE}` (the "
+                        f"default) will follow the one most recently created. "
+                        f"`{CAPTURE_INSTANCE_VERSION_STRATEGY_REGEX}` allows you to specify a regex against the "
+                        f"capture instance name (as argument `capture-instance-version-regex`, the first captured "
+                        f"group of which will be used in a lexicographic ordering of capture instance names to select "
+                        f"the highest one. This can be useful if your capture instance names have a version number in "
+                        f"them.")
 
     p.add_argument('--capture-instance-version-regex',
                    default=os.environ.get('CAPTURE_INSTANCE_VERSION_REGEX'),
@@ -105,20 +116,61 @@ def get_options_and_reporters():
                    default=os.environ.get('PROGRESS_TOPIC_NAME', '_cdc_to_kafka_progress'),
                    help="Name of the topic used to store progress details reading change tables (and also source "
                         "tables, in the case of snapshots). This process will create the topic if it does not yet "
-                        "exist. It should have only one partition.")
+                        "exist. IMPORTANT: It should have only one partition.")
 
     p.add_argument('--disable-deletion-tombstones',
                    type=str2bool, nargs='?', const=True,
                    default=str2bool(os.environ.get('DISABLE_DELETION_TOMBSTONES', False)),
-                   help="Name of the topic used to store progress details reading change tables (and also source "
-                        "tables, in the case of snapshots). This process will create the topic if it does not yet "
-                        "exist. It should have only one partition.")
+                   help="When false (the default), CDC deletion events will lead to emitting two records: one with "
+                        "the CDC data and a second with the same key but a null value, to signal Kafka log compaction "
+                        "to remove the entry for that key. If set to true, the null-value 'tombstones' are not "
+                        "emitted.")
 
     p.add_argument('--lsn-gap-handling',
-                   choices=('raise_exception', 'begin_new_snapshot', 'ignore'),
-                   default=os.environ.get('LSN_GAP_HANDLING', 'raise_exception'),
-                   help="Controls what happens if the earliest available change LSN in a capture instance is after "
-                        "the LSN of the latest change published to Kafka.")
+                   choices=(LSN_GAP_HANDLING_RAISE_EXCEPTION, LSN_GAP_HANDLING_BEGIN_NEW_SNAPSHOT,
+                            LSN_GAP_HANDLING_IGNORE),
+                   default=os.environ.get('LSN_GAP_HANDLING', LSN_GAP_HANDLING_RAISE_EXCEPTION),
+                   help=f"Controls what happens if the earliest available change LSN in a capture instance is after "
+                        f"the LSN of the latest change published to Kafka. Defaults to "
+                        f"`{LSN_GAP_HANDLING_RAISE_EXCEPTION}`")
+
+    p.add_argument('--unified-topics',
+                   default=os.environ.get('UNIFIED_TOPICS', {}), type=json.loads,
+                   help=f'A string that is a JSON object of {{"<topic_name>": "<included_tables_regex>"}} pairs. If '
+                        f'specified, all change data entries for source tables that match the regex will be produced '
+                        f'to the specified topic in globally-consistent LSN order. This means the topic will contain '
+                        f'messages with multiple Avro schemas, AND IDEALLY should be a single-partition topic to '
+                        f'simplify in-order consumption of the messages. Unlike other topics, this process WILL NOT '
+                        f'automatically create this topic for you. Snapshot entries will not be included, and messages '
+                        f'will be keyed by their LSN alone, so topic compaction should not be used.')
+
+    p.add_argument('--new-capture-instance-snapshot-handling',
+                   choices=(NEW_CAPTURE_INSTANCE_SNAPSHOT_HANDLING_BEGIN_NEW,
+                            NEW_CAPTURE_INSTANCE_SNAPSHOT_HANDLING_IGNORE),
+                   default=os.environ.get('NEW_CAPTURE_INSTANCE_SNAPSHOT_HANDLING',
+                                          NEW_CAPTURE_INSTANCE_SNAPSHOT_HANDLING_BEGIN_NEW),
+                   help=f"When the process begins consuming from a newer capture instance for a given source table, "
+                        f"how is snapshot data handled? `{NEW_CAPTURE_INSTANCE_SNAPSHOT_HANDLING_BEGIN_NEW}`, the "
+                        f"default, will begin a new full snapshot of the corresponding source table to pick up data "
+                        f"from any new columns added in the newer instance. The behavior of "
+                        f"`{NEW_CAPTURE_INSTANCE_SNAPSHOT_HANDLING_IGNORE}` depends on whether there was a snapshot "
+                        f"already in progress: if so, the snapshot will continue from where it left off but will begin "
+                        f"including any new columns added in the newer capture instance. If the snapshot was already "
+                        f"complete, nothing further will happen.")
+
+    p.add_argument('--new-capture-instance-overlap-handling',
+                   choices=(NEW_CAPTURE_INSTANCE_OVERLAP_HANDLING_REPUBLISH,
+                            NEW_CAPTURE_INSTANCE_OVERLAP_HANDLING_PICKUP),
+                   default=os.environ.get('NEW_CAPTURE_INSTANCE_OVERLAP_HANDLING',
+                                          NEW_CAPTURE_INSTANCE_OVERLAP_HANDLING_PICKUP),
+                   help=f"When the process begins consuming from a newer capture instance for a given source table, "
+                        f"how should we handle change data that appears in both instances' change tables? "
+                        f"`{NEW_CAPTURE_INSTANCE_OVERLAP_HANDLING_PICKUP}`, the default, will skip over any entries "
+                        f"in the newer change table that were previously published based on the older instance, "
+                        f"preventing duplication of events. `{NEW_CAPTURE_INSTANCE_OVERLAP_HANDLING_REPUBLISH}` will "
+                        f"publish all change entries from the beginning of the new instance's change table, maximizing "
+                        f"the amount of change data published for any columns you may have added at the cost of "
+                        f"duplicate messages.")
 
     p.add_argument('--run-validations',
                    type=str2bool, nargs='?', const=True,
@@ -132,11 +184,6 @@ def get_options_and_reporters():
                    help="Comma-separated list of <module_name>.<class_name>s of metric reporters you want this app "
                         "to emit to.")
 
-    p.add_argument('--metrics-reporting-interval',
-                   type=int,
-                   default=os.environ.get('METRICS_REPORTING_INTERVAL', 15),
-                   help="Interval in seconds between calls to metric reporters.")
-
     p.add_argument('--metrics-namespace',
                    default=os.environ.get('METRICS_NAMESPACE', socket.getfqdn()),
                    help="Namespace used to key metrics for certain metric reporters, and which is embedded in the "
@@ -145,20 +192,15 @@ def get_options_and_reporters():
 
     p.add_argument('--process-hostname',
                    default=os.environ.get('PROCESS_HOSTNAME', socket.getfqdn()),
-                   help="Hostname inserted into progress-tracking and metrics metadata messages. "
-                        "Defaults to the value returned by `socket.getfqdn()`.")
+                   help="Hostname inserted into metrics metadata messages. Defaults to the value returned by "
+                        "`socket.getfqdn()`.")
 
     p.add_argument('--partition-count',
                    type=int,
                    default=os.environ.get('PARTITION_COUNT'),
-                   help="Number of partitions to specify when creating new topics. If left empty, defaults to 2 or "
-                        "the daily average number of rows currently on the change table integer-divided by 500,000, "
+                   help="Number of partitions to specify when creating new topics. If left empty, defaults to 1 or "
+                        "the average number of rows per second in the corresponding change table divided by 10, "
                         "whichever is larger.")
-
-    p.add_argument('--progress-csv-path',
-                   default=os.environ.get('PROGRESS_CSV_PATH'),
-                   help="File path to which CSV files will be written with data read from the existing progress "
-                        "topic at startup time.")
 
     p.add_argument('--replication-factor',
                    type=int,
@@ -172,6 +214,17 @@ def get_options_and_reporters():
                         'characters that should be copied into the Kafka message for that field\'s values. The schema, '
                         'table, and column names are case-insensitive. Example: `{"dbo.order.gift_note": 65536}`. '
                         'Note that this truncates based on _character_ length, not _byte_ length!')
+
+    p.add_argument('--terminate-on-capture-instance-change',
+                   type=str2bool, nargs='?', const=True,
+                   default=str2bool(os.environ.get('TERMINATE_ON_CAPTURE_INSTANCE_CHANGE', False)),
+                   help="When true, will cause the process to terminate if it detects a change in the set of capture "
+                        "instances tracked based on the CAPTURE_INSTANCE_VERSION_* settings, BUT NOT UNTIL the "
+                        "existing process has caught up to the minimum LSN available in the new capture instance(s) "
+                        "for all such tables. Checked on a period defined in constants.CAPTURE_INSTANCE_EVAL_INTERVAL. "
+                        "This is intended to be used with a process supervisor (e.g., the Kubernetes restart loop) "
+                        "that will restart the process, to allow transparent migration to updated capture instances. "
+                        "Defaults to False")
 
     opts = p.parse_args()
 

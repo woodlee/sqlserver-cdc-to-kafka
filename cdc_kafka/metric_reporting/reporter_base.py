@@ -2,7 +2,8 @@ import argparse
 import datetime
 from abc import ABC, abstractmethod
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
+
 if TYPE_CHECKING:
     from .metrics import Metrics
 
@@ -21,7 +22,7 @@ class ReporterBase(ABC):
         pass
 
     @staticmethod
-    def json_serialize_datetimes(obj):
+    def json_serialize_datetimes(obj) -> Optional[str]:
         if isinstance(obj, (datetime.datetime, datetime.date)):
             return obj.isoformat()
         raise TypeError("Type %s not serializable" % type(obj))

@@ -1,87 +1,107 @@
-from typing import List, Dict, Callable, Any
+from typing import List, Dict, Callable, Any, Optional
 
 from . import constants
 
 SQL_STRING_TYPES = ('char', 'nchar', 'varchar', 'ntext', 'nvarchar', 'text')
 
 
-# These fields are common to all messages (except progress tracking messages) published to Kafka by this process
-def get_cdc_metadata_fields_avro_schemas(source_field_names: List[str]) -> List[Dict[str, Any]]:
+# These fields are common to all change/snapshot data messages published to Kafka by this process
+def get_cdc_metadata_fields_avro_schemas(table_fq_name: str, source_field_names: List[str]) -> List[Dict[str, Any]]:
+    base_name = table_fq_name.replace('.', '_')
     return [
         {
+            "name": constants.OPERATION_NAME,
+            "type": {
+                "type": "enum",
+                "name": f'{base_name}{constants.OPERATION_NAME}',
+                "symbols": list(constants.CDC_OPERATION_NAME_TO_ID.keys())
+            }
+        },
+        {
+            # as ISO 8601 timestamp... either the change's tran_end_time OR the time the snapshot row was read:
+            "name": constants.EVENT_TIME_NAME,
+            "type": "string"
+        },
+        {
             "name": constants.LSN_NAME,
-            "type": "bytes"
+            "type": ["null", "string"]
         },
         {
             "name": constants.SEQVAL_NAME,
-            "type": "bytes"
+            "type": ["null", "string"]
         },
         {
-            "name": constants.OPERATION_NAME,
-            "type": {"type": "enum", "name": "cdc_operation",
-                     "symbols": list(constants.CDC_OPERATION_NAME_TO_ID.keys())}
-        },
-        {
-            "name": constants.TRAN_END_TIME_NAME,
-            "type": "string"  # as ISO 8601 timestamp
-        },
-        {
-            # Messages will list the names of all fields that were updated in the CDC event
-            "name": "_cdc_updated_fields",
-            "type": {"type": "array", "items": {"type": "enum", "name": "updated_fields",
-                                                "symbols": source_field_names}}
+            # Messages will list the names of all fields that were updated in the event (for snapshots or CDC insert
+            # records this will be all rows):
+            "name": constants.UPDATED_FIELDS_NAME,
+            "type": {
+                "type": "array",
+                "items": {
+                    "type": "enum",
+                    "name": f'{base_name}{constants.UPDATED_FIELDS_NAME}',
+                    "default": constants.UNRECOGNIZED_COLUMN_DEFAULT_NAME,
+                    "symbols": [constants.UNRECOGNIZED_COLUMN_DEFAULT_NAME] + source_field_names
+                }
+            }
         }
     ]
 
 
 # In CDC tables, all columns are nullable so that if the column is dropped from the source table, the capture instance
-# need not be updated. We align with that by making that Avro value schema for all captured fields nullable (which also
-# helps with maintaining Avro schema compatibility).
+# need not be updated. We align with that by making the Avro value schema for all captured fields nullable (which also
+# helps with maintaining future Avro schema compatibility).
 def avro_schema_from_sql_type(source_field_name: str, sql_type_name: str, decimal_precision: int,
                               decimal_scale: int, make_nullable: bool) -> Dict[str, Any]:
-    def maybe_null_union(avro_type):
-        if make_nullable:
-            return ["null", avro_type]
-        return avro_type
-
     if sql_type_name in ('decimal', 'numeric'):
         if not decimal_precision or not decimal_scale:
             raise Exception(f"Field '{source_field_name}': For SQL decimal or numeric types, the scale and precision "
                             f"must be provided.")
-        return {
-            "name": source_field_name,
-            "type": maybe_null_union({
-                "type": "bytes",
-                "logicalType": "decimal",
-                "precision": decimal_precision,
-                "scale": decimal_scale
-            })
+        avro_type = {
+            "type": "bytes",
+            "logicalType": "decimal",
+            "precision": decimal_precision,
+            "scale": decimal_scale
         }
     elif sql_type_name == 'bigint':
-        return {"name": source_field_name, "type": maybe_null_union("long")}
+        avro_type = "long"
     elif sql_type_name == 'bit':
-        return {"name": source_field_name, "type": maybe_null_union("boolean")}
+        avro_type = "boolean"
     elif sql_type_name == 'date':
-        return {"name": source_field_name, "type": maybe_null_union({"type": "int", "logicalType": "date"})}
+        avro_type = {"type": "int", "logicalType": "date"}
     elif sql_type_name in ('int', 'smallint', 'tinyint'):
-        return {"name": source_field_name, "type": maybe_null_union("int")}
+        avro_type = "int"
     elif sql_type_name in ('datetime', 'datetime2') + SQL_STRING_TYPES:
-        return {"name": source_field_name, "type": maybe_null_union("string")}
+        avro_type = "string"
     elif sql_type_name == 'time':
-        return {"name": source_field_name, "type": maybe_null_union({"type": "int", "logicalType": "time-millis"})}
+        avro_type = {"type": "int", "logicalType": "time-millis"}
     elif sql_type_name == 'uniqueidentifier':
-        return {"name": source_field_name, "type": maybe_null_union({"type": "string", "logicalType": "uuid"})}
+        avro_type = {"type": "string", "logicalType": "uuid"}
     elif sql_type_name in ('binary', 'image', 'varbinary'):
-        return {"name": source_field_name, "type": maybe_null_union("bytes")}
+        avro_type = "bytes"
     else:
         raise Exception(f"Field '{source_field_name}': I am unsure how to convert SQL type {sql_type_name} to Avro")
 
+    if make_nullable:
+        return {
+            "name": source_field_name,
+            "type": [
+                "null",
+                avro_type
+            ],
+            "default": None
+        }
+    else:
+        return {
+            "name": source_field_name,
+            "type": avro_type
+        }
 
-def avro_transform_fn_from_sql_type(sql_type_name: str) -> Callable[[Any], Any]:
+
+def avro_transform_fn_from_sql_type(sql_type_name: str) -> Optional[Callable[[Any], Any]]:
     if sql_type_name in ('datetime', 'datetime2'):
-        # We have chose to represent datetime values as ISO8601 strings rather than using the usual Avro convention of
+        # We have chosen to represent datetime values as ISO8601 strings rather than using the usual Avro convention of
         # an int type + 'timestamp-millis' logical type that captures them as ms since the Unix epoch. This is because
         # the latter presumes the time is in UTC, whereas we do not always know the TZ of datetimes we pull from the
         # DB. It seems more 'faithful' to represent them exactly as they exist in the DB.
         return lambda x: x and x.isoformat()
-    return lambda x: x
+    return None
