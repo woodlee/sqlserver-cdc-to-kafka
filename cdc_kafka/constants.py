@@ -1,67 +1,49 @@
 import datetime
-import json
 
-import confluent_kafka.avro
-import pyodbc
+# Timing intervals
 
-# General; some of these things could be made configurable later if needed:
+MIN_CDC_POLLING_INTERVAL = datetime.timedelta(seconds=3)
+MAX_CDC_POLLING_INTERVAL = datetime.timedelta(seconds=10)
+METRICS_REPORTING_INTERVAL = datetime.timedelta(seconds=20)
+KAFKA_PRODUCER_FULL_FLUSH_INTERVAL = datetime.timedelta(seconds=60)
+CHANGED_CAPTURE_INSTANCES_CHECK_INTERVAL = datetime.timedelta(seconds=60)
+SQL_QUERY_TIMEOUT = datetime.timedelta(seconds=60)
+SLOW_TABLE_PROGRESS_HEARTBEAT_INTERVAL = datetime.timedelta(minutes=3)
+DB_CLOCK_SYNC_INTERVAL = datetime.timedelta(minutes=5)
+
+WATERMARK_STABILITY_CHECK_DELAY_SECS = 10
+KAFKA_REQUEST_TIMEOUT_SECS = 15
+KAFKA_FULL_FLUSH_TIMEOUT_SECS = 30
+KAFKA_CONFIG_RELOAD_DELAY_SECS = 2
+
+# General
 
 DB_ROW_BATCH_SIZE = 1000
-DB_TABLE_POLL_INTERVAL = datetime.timedelta(seconds=3)
-STABLE_WATERMARK_CHECKS_DELAY_SECONDS = 5
-PROGRESS_COMMIT_INTERVAL = datetime.timedelta(seconds=5)
-FULL_FLUSH_MAX_INTERVAL = datetime.timedelta(seconds=60)
-KAFKA_DELIVERY_SUCCESS_LOG_EVERY_NTH_MSG = 1000
-BEGINNING_DATETIME = datetime.datetime(2000, 1, 1)
-MESSAGE_KEY_FIELD_NAME_WHEN_PK_ABSENT = 'row_hash'
+MESSAGE_KEY_FIELD_NAME_WHEN_PK_ABSENT = '_row_hash'
 KEY_SCHEMA_COMPATIBILITY_LEVEL = 'FULL'
 VALUE_SCHEMA_COMPATIBILITY_LEVEL = 'FORWARD'
-
-# Progress tracking schema
-
 AVRO_SCHEMA_NAMESPACE = "cdc_to_kafka"
-CHANGE_ROWS_PROGRESS_KIND = "change_rows"
-SNAPSHOT_ROWS_PROGRESS_KIND = "snapshot_rows"
+CDC_DB_SCHEMA_NAME = 'cdc'
+UNRECOGNIZED_COLUMN_DEFAULT_NAME = 'UNKNOWN_COL'
+VALIDATION_MAXIMUM_SAMPLE_SIZE_PER_TOPIC = 1_000_000
 
-PROGRESS_MESSAGE_AVRO_KEY_SCHEMA = confluent_kafka.avro.loads(json.dumps({
-    "name": f"{AVRO_SCHEMA_NAMESPACE}__progress_tracking__key",
-    "namespace": AVRO_SCHEMA_NAMESPACE,
-    "type": "record",
-    "fields": [
-        {"name": "topic_name", "type": "string"},
-        {"name": "capture_instance_name", "type": "string"},
-        {"name": "progress_kind", "type": {"type": "enum", "name": "progress_kind", "symbols": [
-            CHANGE_ROWS_PROGRESS_KIND, SNAPSHOT_ROWS_PROGRESS_KIND
-        ]}}
-    ]
-}))
-PROGRESS_MESSAGE_AVRO_VALUE_SCHEMA = confluent_kafka.avro.loads(json.dumps({
-    "name": f"{AVRO_SCHEMA_NAMESPACE}__progress_tracking__value",
-    "namespace": AVRO_SCHEMA_NAMESPACE,
-    "type": "record",
-    "fields": [
-        {"name": "last_ack_change_table_lsn", "type": ["null", "bytes"]},
-        {"name": "last_ack_change_table_seqval", "type": ["null", "bytes"]},
-        {"name": "last_ack_change_table_operation", "type": ["null", "int"]},
-        {"name": "last_ack_snapshot_key_field_values", "type": ["null", {
-            "type": "map",
-            "values": ["string", "int"]
-        }]},
-        {"name": "last_ack_partition", "type": "int"},
-        {"name": "last_ack_offset", "type": "int"},
-    ]
-}))
+CHANGE_ROWS_KIND = "change_rows"
+SNAPSHOT_ROWS_KIND = "snapshot_rows"
 
 # CDC operation types; IDs 1-4 here match what SQL Server provides; ID 0 is of our own creation:
 
 SNAPSHOT_OPERATION_ID = 0
 SNAPSHOT_OPERATION_NAME = 'Snapshot'
+
 DELETE_OPERATION_ID = 1
 DELETE_OPERATION_NAME = 'Delete'
+
 INSERT_OPERATION_ID = 2
 INSERT_OPERATION_NAME = 'Insert'
+
 PRE_UPDATE_OPERATION_ID = 3
 PRE_UPDATE_OPERATION_NAME = 'PreUpdate'
+
 POST_UPDATE_OPERATION_ID = 4
 POST_UPDATE_OPERATION_NAME = 'PostUpdate'
 
@@ -81,121 +63,74 @@ CDC_OPERATION_NAME_TO_ID = {
     POST_UPDATE_OPERATION_NAME: POST_UPDATE_OPERATION_ID,
 }
 
-# SQL queries
+# Metadata column names and positions
 
-CDC_CAPTURE_INSTANCES_QUERY = '''
-SELECT
-    source_object_id
-    , capture_instance
-    , create_date
-FROM cdc.change_tables
-ORDER BY source_object_id
-'''
+OPERATION_POS = 0
+OPERATION_NAME = '__operation'
 
-CDC_METADATA_QUERY = '''
-SELECT
-    OBJECT_SCHEMA_NAME(ct.source_object_id) AS schema_name
-    , OBJECT_NAME(ct.source_object_id) AS table_name
-    , ct.capture_instance AS capture_instance_name
-    , ct.start_lsn AS capture_min_lsn
-    , cc.column_ordinal AS change_table_ordinal
-    , cc.column_name AS column_name
-    , cc.column_type AS sql_type_name
-    , ic.index_ordinal AS primary_key_ordinal
-    , sc.precision AS decimal_precision
-    , sc.scale AS decimal_scale
-FROM
-    cdc.change_tables AS ct
-    INNER JOIN cdc.captured_columns AS cc ON (ct.object_id = cc.object_id)
-    LEFT JOIN cdc.index_columns AS ic ON (cc.object_id = ic.object_id AND cc.column_id = ic.column_id)
-    LEFT JOIN sys.columns AS sc ON (sc.object_id = ct.source_object_id AND sc.column_id = cc.column_id)
-WHERE ct.capture_instance IN (?)
-ORDER BY ct.object_id, cc.column_ordinal
-'''
+EVENT_TIME_POS = 1
+EVENT_TIME_NAME = '__event_time'
 
-LATEST_CDC_ENTRY_TIME_QUERY = '''
-SELECT TOP 1 tran_end_time FROM cdc.lsn_time_mapping ORDER BY tran_end_time DESC
-'''
+LSN_POS = 2
+LSN_NAME = '__log_lsn'
 
-CHANGE_ROWS_PER_SECOND_QUERY = '''
-SELECT COUNT(*) / DATEDIFF(second, MIN(ltm.tran_end_time), MAX(ltm.tran_end_time))
-FROM cdc.[{capture_instance_name}_CT] AS ct WITH (NOLOCK)
-INNER JOIN cdc.lsn_time_mapping AS ltm WITH (NOLOCK) ON ct.__$start_lsn = ltm.start_lsn
-'''
+SEQVAL_POS = 3
+SEQVAL_NAME = '__log_seqval'
 
-CHANGE_TABLE_INDEX_COLS_QUERY = '''
-SELECT COL_NAME(ic.object_id, ic.column_id)
-FROM sys.indexes AS i
-INNER JOIN sys.index_columns AS ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
-WHERE i.object_id = OBJECT_ID(?) AND type_desc = 'CLUSTERED'
-ORDER BY key_ordinal
-'''
+UPDATED_FIELDS_POS = 4
+UPDATED_FIELDS_NAME = '__updated_fields'
 
-CDC_METADATA_COL_COUNT = 5
+UNIFIED_TOPIC_MSG_SOURCE_TABLE_NAME = '__source_table'
+UNIFIED_TOPIC_MSG_DATA_WRAPPER_NAME = '__change_data'
 
-LSN_POS = 0
-LSN_NAME = '_cdc_start_lsn'
-SEQVAL_POS = 1
-SEQVAL_NAME = '_cdc_seqval'
-OPERATION_POS = 2
-OPERATION_NAME = '_cdc_operation'
-UPDATE_MASK_POS = 3
-UPDATE_MASK_NAME = '_cdc_update_mask'
-TRAN_END_TIME_POS = 4
-TRAN_END_TIME_NAME = '_cdc_tran_end_time'
+DB_LSN_COL_NAME = '__$start_lsn'
+DB_SEQVAL_COL_NAME = '__$seqval'
+DB_OPERATION_COL_NAME = '__$operation'
 
-# You may feel tempted to change or simplify this query. TREAD CAREFULLY. There was a lot of iterating here to
-# craft something that would not induce SQL Server to resort to a full index scan. If you change it, run some
-# EXPLAINs and ensure that the steps are still only index SEEKs, not scans.
+# Kafka message types
 
-# See comments in TrackedTable.finalize_table to understand other details of why these queries look as they do,
-# esp. in regard to the presence of DECLARE statements within them.
+SINGLE_TABLE_CHANGE_MESSAGE = 'table-change'
+UNIFIED_TOPIC_CHANGE_MESSAGE = 'unified-change'
+SINGLE_TABLE_SNAPSHOT_MESSAGE = 'table-snapshot'
+DELETION_CHANGE_TOMBSTONE_MESSAGE = 'deletion-tombstone'
+CHANGE_PROGRESS_MESSAGE = 'change-progress'
+SNAPSHOT_PROGRESS_MESSAGE = 'snapshot-progress'
+HEARTBEAT_PROGRESS_MESSAGE = 'heartbeat-progress'
+PROGRESS_DELETION_TOMBSTONE_MESSAGE = 'progress-deletion-tombstone'
+METRIC_REPORTING_MESSAGE = 'metric-reporting'
 
-CHANGE_ROWS_QUERY_PARAM_TYPES = [(pyodbc.SQL_BINARY, 10, None), (pyodbc.SQL_BINARY, 10, None)]
-CHANGE_ROWS_QUERY_TEMPLATE = f'''
-DECLARE 
-    @LSN BINARY(10) = ?
-    , @SEQ BINARY(10) = ?
-;
+ALL_KAFKA_MESSAGE_TYPES = (
+    SINGLE_TABLE_CHANGE_MESSAGE, UNIFIED_TOPIC_CHANGE_MESSAGE, SINGLE_TABLE_SNAPSHOT_MESSAGE,
+    DELETION_CHANGE_TOMBSTONE_MESSAGE, CHANGE_PROGRESS_MESSAGE, SNAPSHOT_PROGRESS_MESSAGE, HEARTBEAT_PROGRESS_MESSAGE,
+    PROGRESS_DELETION_TOMBSTONE_MESSAGE, METRIC_REPORTING_MESSAGE)
 
-WITH ct AS (
-    SELECT *
-    FROM cdc.[{{capture_instance_name}}_CT] AS ct WITH (NOLOCK)
-    WHERE ct.__$start_lsn = @LSN AND ct.__$seqval > @SEQ
+# Unified topics schema
 
-    UNION ALL
+UNIFIED_TOPIC_SCHEMA_VERSION = '2'
+UNIFIED_TOPIC_KEY_SCHEMA = {
+    "name": f"{AVRO_SCHEMA_NAMESPACE}__unified_changes_v{UNIFIED_TOPIC_SCHEMA_VERSION}__key",
+    "namespace": AVRO_SCHEMA_NAMESPACE,
+    "type": "record",
+    "fields": [
+        {
+            "name": LSN_NAME,
+            "type": "string"
+        }
+    ]
+}
 
-    SELECT *
-    FROM cdc.[{{capture_instance_name}}_CT] AS ct WITH (NOLOCK)
-    WHERE ct.__$start_lsn > @LSN
-)
-SELECT TOP ({DB_ROW_BATCH_SIZE})
-    ct.__$start_lsn AS {LSN_NAME}
-    , ct.__$seqval AS {SEQVAL_NAME}
-    , ct.__$operation AS {OPERATION_NAME}
-    , ct.__$update_mask AS {UPDATE_MASK_NAME}
-    , ltm.tran_end_time AS {TRAN_END_TIME_NAME}
-    , {{fields}}
-FROM ct 
-LEFT JOIN cdc.lsn_time_mapping AS ltm WITH (NOLOCK) ON (ct.__$start_lsn = ltm.start_lsn)
-WHERE ct.__$operation = 1 OR ct.__$operation = 2 OR ct.__$operation = 4
-ORDER BY {{order_spec}}
-'''
-
-SNAPSHOT_ROWS_QUERY_TEMPLATE = f'''
-DECLARE 
-    {{declarations}}
-;
-
-SELECT TOP ({DB_ROW_BATCH_SIZE})
-    0x00000000000000000000 AS {LSN_NAME}
-    , 0x00000000000000000000 AS {SEQVAL_NAME}
-    , {SNAPSHOT_OPERATION_ID} AS {OPERATION_NAME}
-    , NULL AS {UPDATE_MASK_NAME}
-    , GETDATE() AS {TRAN_END_TIME_NAME}
-    , {{fields}}
-FROM
-    [{{schema_name}}].[{{table_name}}] AS ct
-WHERE {{where_spec}}
-ORDER BY {{order_spec}}
-'''
+UNIFIED_TOPIC_VALUE_SCHEMA = {
+    "name": f"{AVRO_SCHEMA_NAMESPACE}__unified_changes_v{UNIFIED_TOPIC_SCHEMA_VERSION}__value",
+    "namespace": AVRO_SCHEMA_NAMESPACE,
+    "type": "record",
+    "fields": [
+        {
+            "name": UNIFIED_TOPIC_MSG_SOURCE_TABLE_NAME,
+            "type": "string"
+        },
+        {
+            "name": UNIFIED_TOPIC_MSG_DATA_WRAPPER_NAME,
+            "type": []  # this will be a union type of the record value schemas for all tables included in the topic
+        }
+    ]
+}

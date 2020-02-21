@@ -1,7 +1,4 @@
-import json
 from typing import Any, Dict
-
-import confluent_kafka.avro
 
 from .. import constants
 
@@ -56,28 +53,39 @@ class Metrics(object):
         ("produced_snapshot_records_count", "int"),
         ("produced_metadata_records_count", "int"),
         ("produced_deletion_tombstones_count", "int"),
+        ("messages_copied_to_unified_topics", "int"),
 
         ("total_sleep_time_sec", "float"),
-        ("unaccounted_time_sec", "float"),
     ]
 
     FIELD_NAMES = {ft[0] for ft in FIELDS_AND_TYPES}
+    METRICS_SCHEMA_VERSION = '2'
 
-    AVRO_KEY_SCHEMA = confluent_kafka.avro.loads(json.dumps({
-        "name": f"{constants.AVRO_SCHEMA_NAMESPACE}__metrics__key",
+    METRICS_AVRO_KEY_SCHEMA = {
+        "name": f"{constants.AVRO_SCHEMA_NAMESPACE}__metrics_v{METRICS_SCHEMA_VERSION}__key",
         "namespace": constants.AVRO_SCHEMA_NAMESPACE,
         "type": "record",
-        "fields": [{"name": "metrics_namespace", "type": "string"}]
-    }))
+        "fields": [
+            {
+                "name": "metrics_namespace",
+                "type": "string"
+            }
+        ]
+    }
 
-    AVRO_VALUE_SCHEMA = confluent_kafka.avro.loads(json.dumps({
-        "name": f"{constants.AVRO_SCHEMA_NAMESPACE}__metrics__value",
+    METRICS_AVRO_VALUE_SCHEMA = {
+        "name": f"{constants.AVRO_SCHEMA_NAMESPACE}__metrics_v{METRICS_SCHEMA_VERSION}__value",
         "namespace": constants.AVRO_SCHEMA_NAMESPACE,
         "type": "record",
-        "fields": [{"name": k, "type": v} for (k, v) in FIELDS_AND_TYPES]
-    }))
+        "fields": [
+            {
+                "name": k,
+                "type": v
+            } for (k, v) in FIELDS_AND_TYPES
+        ]
+    }
 
-    def __setattr__(self, attr, value):
+    def __setattr__(self, attr: str, value) -> None:
         if attr not in Metrics.FIELD_NAMES:
             raise AttributeError(f'Metric name {attr} not recognized.')
         super(Metrics, self).__setattr__(attr, value)

@@ -19,5 +19,5 @@ class StdoutReporter(reporter_base.ReporterBase):
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
         pass
 
-    def set_options(self, opts) -> None:
+    def set_options(self, opts: argparse.Namespace) -> None:
         pass

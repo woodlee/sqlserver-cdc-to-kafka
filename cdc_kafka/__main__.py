@@ -1,3 +1,4 @@
-from . import main
+from cdc_kafka import main
 
-main.run()
+if __name__ == '__main__':
+    main.run()
