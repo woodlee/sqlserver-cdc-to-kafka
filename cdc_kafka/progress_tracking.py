@@ -56,7 +56,7 @@ PROGRESS_TRACKING_AVRO_VALUE_SCHEMA = {
         },
         {
             "name": "last_ack_offset",
-            "type": ["null", "int"]
+            "type": ["null", "long"]
         },
         {
             "name": "last_ack_position",
@@ -93,7 +93,7 @@ PROGRESS_TRACKING_AVRO_VALUE_SCHEMA = {
                             "name": "key_fields",
                             "type": {
                                 "type": "map",
-                                "values": ["string", "int"]
+                                "values": ["string", "long"]
                             }
                         }
                     ]
