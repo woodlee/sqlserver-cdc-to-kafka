@@ -26,7 +26,7 @@ class SQLQueryResult(NamedTuple):
     query_executed_utc: datetime.datetime
     query_took_sec: float
     result_rows: Tuple[Tuple]
-    query_params: Optional[Iterable[Any]]
+    query_params: Optional[Tuple[Any]]
 
 
 class SQLQueryProcessor(object):

@@ -129,7 +129,7 @@ class TrackedTable(object):
         self, start_after_change_table_index: change_index.ChangeIndex,
         start_from_key_for_snapshot: Optional[Dict[str, Any]], lsn_gap_handling: str,
         schema_id_getter: Callable[[str, Dict[str, Any], Dict[str, Any]], Tuple[int, int]] = None,
-        progress_reset_fn: Callable[[str, str], None] = None
+        progress_reset_fn: Callable[[str], None] = None
     ) -> None:
         if self._finalized:
             raise Exception(f"Attempted to finalize table {self.fq_name} more than once")

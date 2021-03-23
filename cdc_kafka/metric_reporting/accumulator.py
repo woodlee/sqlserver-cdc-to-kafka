@@ -1,4 +1,5 @@
 import datetime
+from abc import ABC
 from typing import List, Any, Dict
 
 import pyodbc
@@ -12,7 +13,18 @@ if TYPE_CHECKING:
     from .. import clock_sync
 
 
-class Accumulator(object):
+class AccumulatorAbstract(ABC):
+    def reset_and_start(self) -> None: pass
+    def end_and_get_values(self) -> metrics.Metrics: pass
+    def register_sleep(self, sleep_time_seconds: float) -> None: pass
+    def register_db_query(self, seconds_elapsed: float, db_query_kind: str, retrieved_row_count: int) -> None: pass
+    def register_kafka_produce(self, secs_elapsed: float, orig_value: Dict[str, Any], message_type: str) -> None: pass
+    def register_kafka_commit(self, seconds_elapsed: float) -> None: pass
+    def kafka_delivery_callback(self, message_type: str, original_value: Dict[str, Any],
+                                produce_datetime: datetime.datetime, **_) -> None: pass
+
+
+class Accumulator(AccumulatorAbstract):
     _instance = None
 
     def __init__(self, db_conn: pyodbc.Connection, clock_syncer: 'clock_sync.ClockSync',

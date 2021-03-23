@@ -25,13 +25,13 @@ class KafkaClient(object):
     _instance = None
     TIMESTAMP_WARNING_LOGGED = False
 
-    def __init__(self, metrics_accumulator: 'accumulator.Accumulator', bootstrap_servers: str,
+    def __init__(self, metrics_accumulator: 'accumulator.AccumulatorAbstract', bootstrap_servers: str,
                  schema_registry_url: str, extra_kafka_consumer_config: Dict[str, Union[str, int]],
                  extra_kafka_producer_config: Dict[str, Union[str, int]], disable_writing: bool = False) -> None:
         if KafkaClient._instance is not None:
             raise Exception('KafkaClient class should be used as a singleton.')
 
-        self._metrics_accumulator: 'accumulator.Accumulator' = metrics_accumulator
+        self._metrics_accumulator: 'accumulator.AccumulatorAbstract' = metrics_accumulator
 
         # Kafka consumer/producer librdkafka config defaults are here:
         consumer_config = {**{
@@ -76,7 +76,7 @@ class KafkaClient(object):
         self._avro_serializer: confluent_kafka.avro.MessageSerializer = \
             confluent_kafka.avro.MessageSerializer(self._schema_registry)
         self._avro_decoders: Dict[int, Callable] = {}
-        self._delivery_callbacks: Dict[str, List[Callable[[Any], None]]] = collections.defaultdict(list)
+        self._delivery_callbacks: Dict[str, List[Callable]] = collections.defaultdict(list)
         self._delivery_callbacks_finalized: bool = False
         self._global_produce_sequence_nbr: int = 0
         self._cluster_metadata: Optional[confluent_kafka.admin.ClusterMetadata] = None
@@ -268,7 +268,9 @@ class KafkaClient(object):
         return result
 
     # returns (key schema ID, value schema ID)
-    def register_schemas(self, topic_name: str, key_schema: Dict[str, Any], value_schema: Dict[str, Any]) \
+    def register_schemas(self, topic_name: str, key_schema: Dict[str, Any], value_schema: Dict[str, Any],
+                         key_schema_compatibility_level: str = constants.DEFAULT_KEY_SCHEMA_COMPATIBILITY_LEVEL,
+                         value_schema_compatibility_level: str = constants.DEFAULT_VALUE_SCHEMA_COMPATIBILITY_LEVEL) \
             -> Tuple[int, int]:
         key_schema = confluent_kafka.avro.loads(json.dumps(key_schema))
         value_schema = confluent_kafka.avro.loads(json.dumps(value_schema))
@@ -280,14 +282,18 @@ class KafkaClient(object):
         if (current_key_schema is None or current_key_schema != key_schema) and not self._disable_writing:
             logger.info('Key schema for subject %s does not exist or is outdated; registering now.', key_subject)
             key_schema_id = self._schema_registry.register(key_subject, key_schema)
-            self._schema_registry.update_compatibility(constants.KEY_SCHEMA_COMPATIBILITY_LEVEL, key_subject)
+            if current_key_schema is None:
+                time.sleep(constants.KAFKA_CONFIG_RELOAD_DELAY_SECS)
+                self._schema_registry.update_compatibility(key_schema_compatibility_level, key_subject)
             registered = True
 
         value_schema_id, current_value_schema, _ = self._schema_registry.get_latest_schema(value_subject)
         if (current_value_schema is None or current_value_schema != value_schema) and not self._disable_writing:
             logger.info('Value schema for subject %s does not exist or is outdated; registering now.', value_subject)
             value_schema_id = self._schema_registry.register(value_subject, value_schema)
-            self._schema_registry.update_compatibility(constants.VALUE_SCHEMA_COMPATIBILITY_LEVEL, value_subject)
+            if current_value_schema is None:
+                time.sleep(constants.KAFKA_CONFIG_RELOAD_DELAY_SECS)
+                self._schema_registry.update_compatibility(value_schema_compatibility_level, value_subject)
             registered = True
 
         if registered:
