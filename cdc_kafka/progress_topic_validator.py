@@ -6,16 +6,13 @@ import re
 from typing import Dict, Tuple
 
 from cdc_kafka import kafka, constants, progress_tracking, options
+from .metric_reporting import accumulator
 
 logger = logging.getLogger(__name__)
 
 
-class Noop(object):
-    def noop(*args, **kw):
-        pass
-
-    def __getattr__(self, _):
-        return self.noop
+class NoopAccumulator(accumulator.AccumulatorAbstract):
+    pass
 
 
 def main() -> None:
@@ -38,7 +35,8 @@ def main() -> None:
     if not (opts.schema_registry_url and opts.kafka_bootstrap_servers):
         raise Exception('Arguments schema_registry_url and kafka_bootstrap_servers are required.')
 
-    with kafka.KafkaClient(Noop(), opts.kafka_bootstrap_servers, opts.schema_registry_url, {}, {}) as kafka_client:
+    with kafka.KafkaClient(NoopAccumulator(), opts.kafka_bootstrap_servers,
+                           opts.schema_registry_url, {}, {}) as kafka_client:
         kafka_client.register_schemas(opts.progress_topic_name, progress_tracking.PROGRESS_TRACKING_AVRO_KEY_SCHEMA,
                                       progress_tracking.PROGRESS_TRACKING_AVRO_VALUE_SCHEMA)
 
@@ -124,5 +122,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # noinspection PyUnresolvedReferences
     from cdc_kafka import progress_topic_validator  # so we pick up the logging config in __init__; better way??
     progress_topic_validator.main()

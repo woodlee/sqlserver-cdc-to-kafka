@@ -102,7 +102,8 @@ def run() -> None:
                         unified_value_schema = copy.deepcopy(constants.UNIFIED_TOPIC_VALUE_SCHEMA)
                         unified_value_schema['fields'][1]['type'] = [t.value_schema for t in matched_tables]
                         unified_key_schema_id, unified_value_schema_id = kafka_client.register_schemas(
-                            unified_topic_name, constants.UNIFIED_TOPIC_KEY_SCHEMA, unified_value_schema)
+                            unified_topic_name, constants.UNIFIED_TOPIC_KEY_SCHEMA, unified_value_schema,
+                            value_schema_compatibility_level=constants.UNIFIED_TOPIC_VALUE_SCHEMA_COMPATIBILITY_LEVEL)
                         unified_topic_tuple = (unified_topic_name, unified_key_schema_id, unified_value_schema_id)
                         for matched_table in matched_tables:
                             table_to_unified_topics_map[matched_table.fq_name].append(unified_topic_tuple)
