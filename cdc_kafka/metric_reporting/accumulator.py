@@ -177,7 +177,8 @@ class Accumulator(AccumulatorAbstract):
         self._kafka_produces_total_time_sec += seconds_elapsed
 
         if message_type in (constants.CHANGE_PROGRESS_MESSAGE, constants.SNAPSHOT_PROGRESS_MESSAGE,
-                            constants.HEARTBEAT_PROGRESS_MESSAGE, constants.METRIC_REPORTING_MESSAGE):
+                            constants.HEARTBEAT_PROGRESS_MESSAGE, constants.METRIC_REPORTING_MESSAGE,
+                            constants.PROGRESS_DELETION_TOMBSTONE_MESSAGE):
             self._produced_metadata_records_count += 1
         elif message_type == constants.DELETION_CHANGE_TOMBSTONE_MESSAGE:
             self._produced_deletion_tombstones_count += 1
