@@ -313,6 +313,11 @@ def get_latest_capture_instances_by_fq_name(
                 logger.debug('Table %s excluded by blacklist', fq_table_name)
                 continue
 
+            if row[3] is None or row[4] is None:
+                logger.debug('Capture instance for %s appears to be brand-new; will evaluate again on '
+                             'next pass', fq_table_name)
+                continue
+
             as_dict = {
                 'fq_name': fq_table_name,
                 'capture_instance_name': row[2],
@@ -538,12 +543,17 @@ def should_terminate_due_to_capture_instance_change(
                 change_index.LOWEST_CHANGE_INDEX
             new_ci_min_index = change_index.ChangeIndex(new_ci['start_lsn'], b'\x00' * 10, 0)
             if not last_recorded_progress or (last_recorded_progress.change_index < new_ci_min_index):
-                logger.info('Progress against existing capture instance ("%s") for table "%s" has reached index %s, '
-                            'but the new capture instance ("%s") does not begin until index %s. Deferring termination '
-                            'to maintain data integrity and will try again on next capture instance evaluation '
-                            'iteration.', current_ci['capture_instance_name'], fq_name, current_idx,
-                            new_ci['capture_instance_name'], new_ci_min_index)
-                return False
+                with db_conn.cursor() as cursor:
+                    ci_table_name = f"[{constants.CDC_DB_SCHEMA_NAME}].[{current_ci['capture_instance_name']}_CT]"
+                    cursor.execute(f"SELECT TOP 1 1 FROM {ci_table_name} WITH (NOLOCK)")
+                    has_rows = cursor.fetchval() is not None
+                if has_rows:
+                    logger.info('Progress against existing capture instance ("%s") for table "%s" has reached index %s, '
+                                'but the new capture instance ("%s") does not begin until index %s. Deferring termination '
+                                'to maintain data integrity and will try again on next capture instance evaluation '
+                                'iteration.', current_ci['capture_instance_name'], fq_name, current_idx,
+                                new_ci['capture_instance_name'], new_ci_min_index)
+                    return False
 
     logger.warning('Terminating process due to change in capture instances. This behavior can be controlled by '
                    'changing option TERMINATE_ON_CAPTURE_INSTANCE_CHANGE.')

@@ -355,7 +355,8 @@ class ProgressTracker(object):
                     else constants.CHANGE_PROGRESS_MESSAGE
                 self._kafka_client.produce(self._progress_topic_name, progress_entry.key, self._progress_key_schema_id,
                                            progress_entry.value, self._progress_value_schema_id, message_type)
-                self._last_recorded_progress_by_topic[topic] = progress_entry
+                if message_type == constants.CHANGE_PROGRESS_MESSAGE:
+                    self._last_recorded_progress_by_topic[topic] = progress_entry
 
         if final:
             if not self._kafka_client.flush(True):
