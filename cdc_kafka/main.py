@@ -108,6 +108,17 @@ def run() -> None:
                         for matched_table in matched_tables:
                             table_to_unified_topics_map[matched_table.fq_name].append(unified_topic_tuple)
                             unified_topic_to_tables_map[unified_topic_name].append(matched_table)
+                        part_count = kafka_client.get_topic_partition_count(unified_topic_name)
+                        if part_count:
+                            logger.info('Existing unified topic %s found, with %s partition(s)',
+                                        unified_topic_name, part_count)
+                        else:
+                            part_count = opts.unified_topics_partition_count or 1
+                            logger.info('Unified topic %s not found, creating with %s replicas, %s partition(s), and '
+                                        'extra config %s', unified_topic_name, opts.replication_factor, part_count,
+                                        opts.unified_topics_extra_config)
+                            kafka_client.create_topic(unified_topic_name, part_count, opts.replication_factor,
+                                                      opts.unified_topics_extra_config)
 
             if table_to_unified_topics_map:
                 logger.debug('Unified topics being produced to, by table: %s', table_to_unified_topics_map)
