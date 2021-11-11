@@ -35,9 +35,10 @@ class TrackedField(object):
                                 f'string field (SQL type is {sql_type_name}).')
             orig_transform = self.transform_fn
             if orig_transform is not None:
-                self.transform_fn = lambda x: orig_transform(x)[:int(truncate_after)]
+                # TODO: this prevents orig_transform from ever receiving a None argument; is that okay??
+                self.transform_fn = lambda x: orig_transform(x)[:int(truncate_after)] if x is not None else x
             else:
-                self.transform_fn = lambda x: x[:int(truncate_after)]
+                self.transform_fn = lambda x: x[:int(truncate_after)] if x is not None else x
 
 
 class TrackedTable(object):
