@@ -343,9 +343,13 @@ class Validator(object):
 
     def _process_single_table_topic(self, table: 'tracked_tables.TrackedTable') -> TableMessagesSummary:
         table_summary = TableMessagesSummary(table)
-        logger.info('Validation: consuming records from topic %s', table.topic_name)
+        logger.info('Validation: consuming records from topic %s...', table.topic_name)
+        msg_count = 0
         for msg in self._kafka_client.consume_all(table.topic_name, constants.VALIDATION_MAXIMUM_SAMPLE_SIZE_PER_TOPIC):
+            msg_count += 1
             table_summary.process_message(msg)
+        logger.info('Validation: consumed %s records from topic %s', msg_count, table.topic_name)
+        print(table_summary)
         return table_summary
 
     def _process_unified_topic(self, topic_name: str, expected_tables: Iterable['tracked_tables.TrackedTable']) -> \
