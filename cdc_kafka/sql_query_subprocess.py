@@ -169,8 +169,8 @@ def get_db_conn(odbc_conn_string: str) -> pyodbc.Connection:
         # around that.
         try:
             return raw_bytes.decode("utf-16le")
-        except UnicodeDecodeError as e:
-            return raw_bytes[:e.start].decode("utf-16le")
+        except UnicodeDecodeError as ex:
+            return raw_bytes[:ex.start].decode("utf-16le")
 
     conn.add_output_converter(pyodbc.SQL_WVARCHAR, decode_truncated_utf16)
     conn.add_output_converter(pyodbc.SQL_WCHAR, decode_truncated_utf16)

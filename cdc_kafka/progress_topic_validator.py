@@ -36,7 +36,7 @@ def main() -> None:
         raise Exception('Arguments schema_registry_url and kafka_bootstrap_servers are required.')
 
     with kafka.KafkaClient(NoopAccumulator(), opts.kafka_bootstrap_servers,
-                           opts.schema_registry_url, {}, {}) as kafka_client:
+                           opts.schema_registry_url, {}, {}, disable_writing=True) as kafka_client:
         kafka_client.register_schemas(opts.progress_topic_name, progress_tracking.PROGRESS_TRACKING_AVRO_KEY_SCHEMA,
                                       progress_tracking.PROGRESS_TRACKING_AVRO_VALUE_SCHEMA)
 
@@ -66,16 +66,17 @@ def main() -> None:
             if topic_blacklist_re and topic_blacklist_re.match(topic):
                 continue
 
+            current_timestamp = datetime.datetime.fromtimestamp(progress_msg.timestamp()[1] / 1000)
+
             if progress_msg.value() is None:
                 logger.warning('Progress for %s reset at %s partition %s, offset %s, time %s', result_key,
                                opts.progress_topic_name, progress_msg.partition(), progress_msg.offset(),
-                               progress_msg.timestamp())
+                               current_timestamp)
                 if result_key in result:
                     del result[result_key]
                 continue
 
             current_entry = progress_tracking.ProgressEntry(message=progress_msg)
-            current_timestamp = datetime.datetime.fromtimestamp(progress_msg.timestamp()[1] / 1000)
             current_ack_part = '-' if current_entry.last_ack_partition is None else current_entry.last_ack_partition
             current_ack_offset = 'Heartbt' if current_entry.last_ack_offset is None \
                 else current_entry.last_ack_offset

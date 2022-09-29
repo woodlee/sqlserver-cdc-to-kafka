@@ -192,9 +192,16 @@ ORDER BY {order_spec}
 
 
 def get_snapshot_rows(
-        schema_name: str, table_name: str, field_names: Collection[str], pk_cols: Collection[str], first_read: bool,
-        odbc_columns: Collection[Tuple]) -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
-    select_column_specs = ', '.join([f'[{f}]' for f in field_names])
+        schema_name: str, table_name: str, field_names: Collection[str], removed_field_names: Collection[str],
+        pk_cols: Collection[str], first_read: bool, odbc_columns: Collection[Tuple]) \
+        -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
+    select_cols = []
+    for fn in field_names:
+        if fn in removed_field_names:
+            select_cols.append(f'NULL AS [{fn}]')
+        else:
+            select_cols.append(f'[{fn}]')
+    select_column_specs = ', '.join(select_cols)
     order_spec = ', '.join([f'[{x}] DESC' for x in pk_cols])
 
     if first_read:

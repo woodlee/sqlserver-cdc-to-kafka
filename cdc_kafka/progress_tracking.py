@@ -270,7 +270,7 @@ class ProgressTracker(object):
         if self._kafka_client.get_topic_partition_count(self._progress_topic_name) is None:
             logger.warning('No existing progress storage topic found; creating topic %s', self._progress_topic_name)
 
-            # log.segment.bytes set to 16 MB. Compaction will not run until the next log segment rolls so we set this
+            # log.segment.bytes set to 16 MB. Compaction will not run until the next log segment rolls, so we set this
             # a bit low (the default is 1 GB!) to prevent having to read too much from the topic on process startup:
             self._kafka_client.create_topic(self._progress_topic_name, 1, extra_config={"segment.bytes": 16777216})
             return {}
@@ -309,20 +309,33 @@ class ProgressTracker(object):
         logger.info('Read %s prior progress messages from Kafka topic %s', progress_msg_ctr, self._progress_topic_name)
         return result
 
-    def reset_all_progress(self, topic_name: str) -> None:
+    def reset_progress(self, topic_name: str, kind_to_reset: str) -> None:
         # Produce messages with empty values to "delete" them from Kafka
-        key = {
-            'topic_name': topic_name,
-            'progress_kind': constants.CHANGE_ROWS_KIND,
-        }
-        self._kafka_client.produce(self._progress_topic_name, key, self._progress_key_schema_id, None,
-                                   self._progress_value_schema_id, constants.PROGRESS_DELETION_TOMBSTONE_MESSAGE)
+        matched = False
 
-        key['progress_kind'] = constants.SNAPSHOT_ROWS_KIND
-        self._kafka_client.produce(self._progress_topic_name, key, self._progress_key_schema_id, None,
-                                   self._progress_value_schema_id, constants.PROGRESS_DELETION_TOMBSTONE_MESSAGE)
+        if kind_to_reset in (constants.CHANGE_ROWS_KIND, constants.ALL_PROGRESS_KINDS):
+            key = {
+                'topic_name': topic_name,
+                'progress_kind': constants.CHANGE_ROWS_KIND,
+            }
+            self._kafka_client.produce(self._progress_topic_name, key, self._progress_key_schema_id, None,
+                                       self._progress_value_schema_id, constants.PROGRESS_DELETION_TOMBSTONE_MESSAGE)
+            logger.info('Deleted existing change rows progress records for topic %s.', topic_name)
+            matched = True
 
-        logger.info('Deleted existing progress records for topic %s.', topic_name)
+        if kind_to_reset in (constants.SNAPSHOT_ROWS_KIND, constants.ALL_PROGRESS_KINDS):
+            key = {
+                'topic_name': topic_name,
+                'progress_kind': constants.SNAPSHOT_ROWS_KIND,
+            }
+            self._kafka_client.produce(self._progress_topic_name, key, self._progress_key_schema_id, None,
+                                       self._progress_value_schema_id, constants.PROGRESS_DELETION_TOMBSTONE_MESSAGE)
+            logger.info('Deleted existing snapshot progress records for topic %s.', topic_name)
+            matched = True
+
+        if not matched:
+            raise Exception(f'Function reset_progress received unrecognized argument "{kind_to_reset}" for '
+                            f'kind_to_reset.')
 
     def commit_progress(self, final: bool = False) -> None:
         # this will trigger calls to the delivery callbacks which will update progress_messages_awaiting_commit

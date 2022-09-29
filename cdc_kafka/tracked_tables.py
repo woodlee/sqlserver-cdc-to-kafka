@@ -125,12 +125,12 @@ class TrackedTable(object):
 
             return deletes, inserts, updates
 
-    # 'Finalizing' mostly means doing the things we can't do until we know all of the table's fields have been added
+    # 'Finalizing' mostly means doing the things we can't do until we know all the table's fields have been added
     def finalize_table(
         self, start_after_change_table_index: change_index.ChangeIndex,
         start_from_key_for_snapshot: Optional[Dict[str, Any]], lsn_gap_handling: str,
         schema_id_getter: Callable[[str, Dict[str, Any], Dict[str, Any]], Tuple[int, int]] = None,
-        progress_reset_fn: Callable[[str], None] = None
+        progress_reset_fn: Callable[[str, str], None] = None
     ) -> None:
         if self._finalized:
             raise Exception(f"Attempted to finalize table {self.fq_name} more than once")
@@ -149,7 +149,7 @@ class TrackedTable(object):
                 if self.snapshot_allowed:
                     start_from_key_for_snapshot = None
                     logger.warning('%s Beginning new table snapshot!', msg)
-                    progress_reset_fn(self.topic_name)
+                    progress_reset_fn(self.topic_name, constants.ALL_PROGRESS_KINDS)
                 else:
                     raise Exception(
                         f'{msg} lsn_gap_handling was set to "{options.LSN_GAP_HANDLING_BEGIN_NEW_SNAPSHOT}", but due '
@@ -218,10 +218,18 @@ class TrackedTable(object):
         if not self.snapshot_allowed:
             self.snapshot_complete = True
         else:
+            columns_actually_on_base_table = {x[3] for x in self._odbc_columns}
+            columns_no_longer_on_base_table = set(self._value_field_names) - columns_actually_on_base_table
+
+            if columns_no_longer_on_base_table:
+                logger.warning('Some column(s) found in the capture instance appear to no longer be present on base '
+                               'table %s. Column(s): %s',
+                               self.fq_name,
+                               ', '.join(columns_no_longer_on_base_table))
             if self._has_pk:
                 self._snapshot_rows_query, self._snapshot_rows_query_param_types = sql_queries.get_snapshot_rows(
-                    self.schema_name, self.table_name, self._value_field_names, self._key_field_names,
-                    False, self._odbc_columns)
+                    self.schema_name, self.table_name, self._value_field_names, columns_no_longer_on_base_table,
+                    self._key_field_names, False, self._odbc_columns)
 
                 if start_from_key_for_snapshot:
                     key_min_tuple = tuple(self._get_min_key_value() or [])
@@ -239,8 +247,8 @@ class TrackedTable(object):
                                     ', '.join([f'{k}: {v}' for k, v in zip(self._key_field_names, key_max)]))
 
                         self._initial_snapshot_rows_query, _ = sql_queries.get_snapshot_rows(
-                            self.schema_name, self.table_name, self._value_field_names, self._key_field_names,
-                            True, self._odbc_columns)
+                            self.schema_name, self.table_name, self._value_field_names,
+                            columns_no_longer_on_base_table, self._key_field_names, True, self._odbc_columns)
 
                         self._last_read_key_for_snapshot = NEW_SNAPSHOT
                     else:
