@@ -30,6 +30,7 @@ VALIDATION_MAXIMUM_SAMPLE_SIZE_PER_TOPIC = 3_000_000
 
 CHANGE_ROWS_KIND = "change_rows"
 SNAPSHOT_ROWS_KIND = "snapshot_rows"
+ALL_PROGRESS_KINDS = "all_progress"
 
 # CDC operation types; IDs 1-4 here match what SQL Server provides; ID 0 is of our own creation:
 

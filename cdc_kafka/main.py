@@ -124,7 +124,7 @@ def run() -> None:
                 logger.debug('Unified topics being produced to, by table: %s', table_to_unified_topics_map)
 
             # Validations will go through all messages in all topics and try to warn of any inconsistencies between
-            # those and the source DB data. It take a while; probably don't run this on very large datasets!
+            # those and the source DB data. It takes a while; probably don't run this on very large datasets!
             if opts.run_validations:
                 validator: validation.Validator = validation.Validator(
                     kafka_client, tables, progress_tracker, unified_topic_to_tables_map)
@@ -495,7 +495,7 @@ def determine_start_points_and_finalize_tables(
         starting_snapshot_index = snapshot_progress and snapshot_progress.snapshot_index
 
         table.finalize_table(starting_change_index, starting_snapshot_index, lsn_gap_handling,
-                             kafka_client.register_schemas, progress_tracker.reset_all_progress)
+                             kafka_client.register_schemas, progress_tracker.reset_progress)
 
         if not table.snapshot_allowed:
             snapshot_state = '<not doing>'
@@ -559,10 +559,10 @@ def should_terminate_due_to_capture_instance_change(
                     cursor.execute(f"SELECT TOP 1 1 FROM {ci_table_name} WITH (NOLOCK)")
                     has_rows = cursor.fetchval() is not None
                 if has_rows:
-                    logger.info('Progress against existing capture instance ("%s") for table "%s" has reached index %s, '
-                                'but the new capture instance ("%s") does not begin until index %s. Deferring termination '
-                                'to maintain data integrity and will try again on next capture instance evaluation '
-                                'iteration.', current_ci['capture_instance_name'], fq_name, current_idx,
+                    logger.info('Progress against existing capture instance ("%s") for table "%s" has reached index '
+                                '%s, but the new capture instance ("%s") does not begin until index %s. Deferring '
+                                'termination to maintain data integrity and will try again on next capture instance '
+                                'evaluation iteration.', current_ci['capture_instance_name'], fq_name, current_idx,
                                 new_ci['capture_instance_name'], new_ci_min_index)
                     return False
 

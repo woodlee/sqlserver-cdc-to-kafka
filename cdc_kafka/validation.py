@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 @functools.total_ordering
 class SQLServerUUID(object):
-    # implements UUID comparison the way SQL Server does it so we can order them the same way
+    # implements UUID comparison the way SQL Server does it, so we can order them the same way
 
     def __init__(self, uuid: Union[str, UUID]) -> None:
         self.uuid = UUID(uuid) if isinstance(uuid, str) else uuid
@@ -134,7 +134,6 @@ class TableMessagesSummary(object):
             if message.partition() in self._last_snapshot_key_seen_for_partition and \
                     self._last_snapshot_key_seen_for_partition[message.partition()] < key:
                 self.snapshot_key_order_regressions_count += 1
-                print(message.offset())
             self._last_snapshot_key_seen_for_partition[message.partition()] = key
             return
 
@@ -252,7 +251,10 @@ class Validator(object):
             elif (datetime.datetime.utcnow() - summary.latest_change_seen) > datetime.timedelta(days=1):
                 warnings.append(f'Last change entry seen in Kafka was dated {summary.latest_change_seen}.')
 
-            if changes_progress.is_heartbeat:
+            if changes_progress is None:
+                failures.append(f'No changes progress found. Last key found in topic was '
+                                f'{summary.max_change_index_seen}')
+            elif changes_progress.is_heartbeat:
                 if summary.max_change_index_seen and summary.max_change_index_seen > changes_progress_index:
                     failures.append(f'Changes progress mismatch. Last recorded heartbeat progress was '
                                     f'{changes_progress_index} but last key found in topic was '
