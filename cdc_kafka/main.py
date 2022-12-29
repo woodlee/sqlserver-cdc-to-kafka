@@ -138,7 +138,7 @@ def run() -> None:
             next_cdc_poll_due_time: datetime.datetime = datetime.datetime.utcnow()
             last_produced_row: Optional['parsed_row.ParsedRow'] = None
             last_topic_produces: Dict[str, datetime.datetime] = {}
-            change_rows_queue: List['parsed_row.ParsedRow'] = []
+            change_rows_queue: List[Tuple[change_index.ChangeIndex, 'parsed_row.ParsedRow']] = []
             queued_change_row_counts: Dict[str, int] = {t.topic_name: 0 for t in tables}
 
             # Returned bool indicates whether the process should halt
@@ -244,7 +244,7 @@ def run() -> None:
                     for t in tables:
                         for row in t.retrieve_changes_query_results():
                             queued_change_row_counts[t.topic_name] += 1
-                            heapq.heappush(change_rows_queue, row)
+                            heapq.heappush(change_rows_queue, (row.change_idx, row))
                         if t.max_polled_change_index < common_lsn_limit:
                             common_lsn_limit = t.max_polled_change_index
 
@@ -254,10 +254,10 @@ def run() -> None:
                     # ----- Produce change data to Kafka and commit progress -----
 
                     while change_rows_queue:
-                        row: 'parsed_row.ParsedRow' = heapq.heappop(change_rows_queue)
+                        row: 'parsed_row.ParsedRow' = heapq.heappop(change_rows_queue)[1]
 
                         if row.change_idx > common_lsn_limit:
-                            heapq.heappush(change_rows_queue, row)
+                            heapq.heappush(change_rows_queue, (row.change_idx, row))
                             break
 
                         if last_produced_row and row.change_idx < last_produced_row.change_idx:

@@ -4,6 +4,7 @@ import logging
 import multiprocessing as mp
 import queue
 import re
+import struct
 import time
 from typing import Any, Tuple, Dict, Optional, Iterable, NamedTuple
 
@@ -172,7 +173,15 @@ def get_db_conn(odbc_conn_string: str) -> pyodbc.Connection:
         except UnicodeDecodeError as ex:
             return raw_bytes[:ex.start].decode("utf-16le")
 
+    def decode_datetimeoffset(raw_bytes):
+        tup = struct.unpack("<6hI2h", raw_bytes)
+        return datetime.datetime(
+            tup[0], tup[1], tup[2], tup[3], tup[4], tup[5], tup[6] // 1000,
+            datetime.timezone(datetime.timedelta(hours=tup[7], minutes=tup[8]))
+        )
+
     conn.add_output_converter(pyodbc.SQL_WVARCHAR, decode_truncated_utf16)
     conn.add_output_converter(pyodbc.SQL_WCHAR, decode_truncated_utf16)
+    conn.add_output_converter(-155, decode_datetimeoffset)
 
     return conn

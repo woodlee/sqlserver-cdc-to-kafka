@@ -42,7 +42,7 @@ class KafkaClient(object):
         }, **extra_kafka_consumer_config}
         producer_config = {**{
             'bootstrap.servers': bootstrap_servers,
-            'linger.ms': '50',
+            'linger.ms': '200',
             'enable.idempotence': True,
             'statistics.interval.ms': 30 * 60 * 1000,
             'enable.gapless.guarantee': True,
@@ -114,7 +114,6 @@ class KafkaClient(object):
             return
 
         start_time = time.perf_counter()
-
         key_ser = self._avro_serializer.encode_record_with_schema_id(key_schema_id, key, True)
         if value is None:  # a deletion tombstone probably
             value_ser = None
@@ -137,7 +136,7 @@ class KafkaClient(object):
                 break
             except BufferError:
                 time.sleep(1)
-                logger.debug('Sleeping due to Kafka producer buffer being full...')
+                logger.warning('Sleeping due to Kafka producer buffer being full...')
                 self.flush()  # clear some space before retrying
             except Exception:
                 logger.error('The following exception occurred producing to topic %s', topic)
