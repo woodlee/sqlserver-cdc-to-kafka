@@ -210,14 +210,10 @@ class Accumulator(AccumulatorAbstract):
                                 produce_datetime: datetime.datetime, **_) -> None:
         self._kafka_delivery_acks_count += 1
 
-        if message_type == constants.SINGLE_TABLE_CHANGE_MESSAGE:
-            event_time = datetime.datetime.fromisoformat(original_value[constants.EVENT_TIME_NAME])
-        elif message_type == constants.UNIFIED_TOPIC_CHANGE_MESSAGE:
-            event_time = datetime.datetime.fromisoformat(original_value[constants.UNIFIED_TOPIC_MSG_DATA_WRAPPER_NAME]
-                                                         [constants.EVENT_TIME_NAME])
-        else:
+        if message_type not in (constants.SINGLE_TABLE_CHANGE_MESSAGE, constants.UNIFIED_TOPIC_CHANGE_MESSAGE):
             return
 
+        event_time = datetime.datetime.fromisoformat(original_value[constants.EVENT_TIME_NAME])
         db_commit_time = self._clock_syncer.db_time_to_utc(event_time)
         e2e_latency = (produce_datetime - db_commit_time).total_seconds()
         self._e2e_latencies_sec.append(e2e_latency)

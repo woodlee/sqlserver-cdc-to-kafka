@@ -3,6 +3,7 @@ from typing import Dict, Any
 
 from . import constants
 
+
 @total_ordering
 class ChangeIndex(object):
     __slots__ = 'lsn', 'seqval', 'operation'

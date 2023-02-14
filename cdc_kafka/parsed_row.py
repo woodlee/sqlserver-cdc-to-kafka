@@ -3,6 +3,7 @@ from typing import Tuple, Any, Dict, Optional
 
 from . import change_index
 
+
 class ParsedRow(object):
     __slots__ = 'table_fq_name', 'row_kind', 'operation_name', 'event_db_time', 'change_idx', \
         'ordered_key_field_values', 'destination_topic', 'avro_key_schema_id', 'avro_value_schema_id', 'key_dict', \
