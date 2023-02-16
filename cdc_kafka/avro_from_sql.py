@@ -52,10 +52,10 @@ def get_cdc_metadata_fields_avro_schemas(table_fq_name: str, source_field_names:
 # helps with maintaining future Avro schema compatibility).
 def avro_schema_from_sql_type(source_field_name: str, sql_type_name: str, decimal_precision: int,
                               decimal_scale: int, make_nullable: bool) -> Dict[str, Any]:
-    if sql_type_name in ('decimal', 'numeric'):
-        if not decimal_precision or not decimal_scale:
-            raise Exception(f"Field '{source_field_name}': For SQL decimal or numeric types, the scale and precision "
-                            f"must be provided.")
+    if sql_type_name in ('decimal', 'numeric', 'money', 'smallmoney'):
+        if (not decimal_precision) or decimal_scale is None:
+            raise Exception(f"Field '{source_field_name}': For SQL decimal, money, or numeric types, the scale and "
+                            f"precision must be provided.")
         avro_type = {
             "type": "bytes",
             "logicalType": "decimal",
@@ -66,17 +66,21 @@ def avro_schema_from_sql_type(source_field_name: str, sql_type_name: str, decima
         avro_type = "long"
     elif sql_type_name == 'bit':
         avro_type = "boolean"
+    elif sql_type_name == 'float':
+        avro_type = "double"
+    elif sql_type_name == 'real':
+        avro_type = "float"
     elif sql_type_name == 'date':
         avro_type = {"type": "int", "logicalType": "date"}
     elif sql_type_name in ('int', 'smallint', 'tinyint'):
         avro_type = "int"
-    elif sql_type_name in ('datetime', 'datetime2') + SQL_STRING_TYPES:
+    elif sql_type_name in ('datetime', 'datetime2', 'datetimeoffset', 'smalldatetime', 'xml') + SQL_STRING_TYPES:
         avro_type = "string"
     elif sql_type_name == 'time':
         avro_type = {"type": "int", "logicalType": "time-millis"}
     elif sql_type_name == 'uniqueidentifier':
         avro_type = {"type": "string", "logicalType": "uuid"}
-    elif sql_type_name in ('binary', 'image', 'varbinary'):
+    elif sql_type_name in ('binary', 'image', 'varbinary', 'rowversion'):
         avro_type = "bytes"
     else:
         raise Exception(f"Field '{source_field_name}': I am unsure how to convert SQL type {sql_type_name} to Avro")
@@ -98,7 +102,7 @@ def avro_schema_from_sql_type(source_field_name: str, sql_type_name: str, decima
 
 
 def avro_transform_fn_from_sql_type(sql_type_name: str) -> Optional[Callable[[Any], Any]]:
-    if sql_type_name in ('datetime', 'datetime2'):
+    if sql_type_name in ('datetime', 'datetime2', 'datetimeoffset', 'smalldatetime'):
         # We have chosen to represent datetime values as ISO8601 strings rather than using the usual Avro convention of
         # an int type + 'timestamp-millis' logical type that captures them as ms since the Unix epoch. This is because
         # the latter presumes the time is in UTC, whereas we do not always know the TZ of datetimes we pull from the

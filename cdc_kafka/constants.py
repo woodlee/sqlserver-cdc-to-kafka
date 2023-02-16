@@ -18,11 +18,10 @@ KAFKA_CONFIG_RELOAD_DELAY_SECS = 5
 
 # General
 
-DB_ROW_BATCH_SIZE = 1000
+DB_ROW_BATCH_SIZE = 2000
 MESSAGE_KEY_FIELD_NAME_WHEN_PK_ABSENT = '_row_hash'
 DEFAULT_KEY_SCHEMA_COMPATIBILITY_LEVEL = 'FULL'
 DEFAULT_VALUE_SCHEMA_COMPATIBILITY_LEVEL = 'FORWARD'
-UNIFIED_TOPIC_VALUE_SCHEMA_COMPATIBILITY_LEVEL = 'BACKWARD'
 AVRO_SCHEMA_NAMESPACE = "cdc_to_kafka"
 CDC_DB_SCHEMA_NAME = 'cdc'
 UNRECOGNIZED_COLUMN_DEFAULT_NAME = 'UNKNOWN_COL'
@@ -82,9 +81,6 @@ SEQVAL_NAME = '__log_seqval'
 UPDATED_FIELDS_POS = 4
 UPDATED_FIELDS_NAME = '__updated_fields'
 
-UNIFIED_TOPIC_MSG_SOURCE_TABLE_NAME = '__source_table'
-UNIFIED_TOPIC_MSG_DATA_WRAPPER_NAME = '__change_data'
-
 DB_LSN_COL_NAME = '__$start_lsn'
 DB_SEQVAL_COL_NAME = '__$seqval'
 DB_OPERATION_COL_NAME = '__$operation'
@@ -105,34 +101,3 @@ ALL_KAFKA_MESSAGE_TYPES = (
     SINGLE_TABLE_CHANGE_MESSAGE, UNIFIED_TOPIC_CHANGE_MESSAGE, SINGLE_TABLE_SNAPSHOT_MESSAGE,
     DELETION_CHANGE_TOMBSTONE_MESSAGE, CHANGE_PROGRESS_MESSAGE, SNAPSHOT_PROGRESS_MESSAGE, HEARTBEAT_PROGRESS_MESSAGE,
     PROGRESS_DELETION_TOMBSTONE_MESSAGE, METRIC_REPORTING_MESSAGE)
-
-# Unified topics schema
-
-UNIFIED_TOPIC_SCHEMA_VERSION = '2'
-UNIFIED_TOPIC_KEY_SCHEMA = {
-    "name": f"{AVRO_SCHEMA_NAMESPACE}__unified_changes_v{UNIFIED_TOPIC_SCHEMA_VERSION}__key",
-    "namespace": AVRO_SCHEMA_NAMESPACE,
-    "type": "record",
-    "fields": [
-        {
-            "name": LSN_NAME,
-            "type": "string"
-        }
-    ]
-}
-
-UNIFIED_TOPIC_VALUE_SCHEMA = {
-    "name": f"{AVRO_SCHEMA_NAMESPACE}__unified_changes_v{UNIFIED_TOPIC_SCHEMA_VERSION}__value",
-    "namespace": AVRO_SCHEMA_NAMESPACE,
-    "type": "record",
-    "fields": [
-        {
-            "name": UNIFIED_TOPIC_MSG_SOURCE_TABLE_NAME,
-            "type": "string"
-        },
-        {
-            "name": UNIFIED_TOPIC_MSG_DATA_WRAPPER_NAME,
-            "type": []  # this will be a union type of the record value schemas for all tables included in the topic
-        }
-    ]
-}

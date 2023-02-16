@@ -116,11 +116,7 @@ class TableMessagesSummary(object):
             self.tombstone_count += 1
             return
 
-        if constants.UNIFIED_TOPIC_MSG_DATA_WRAPPER_NAME in message.value():
-            message_body = dict(message.value()[constants.UNIFIED_TOPIC_MSG_DATA_WRAPPER_NAME])
-        else:
-            message_body = dict(message.value())
-
+        message_body = dict(message.value())
         key = extract_key_tuple(self.table, message_body)
         operation_name = message_body[constants.OPERATION_NAME]
 
@@ -377,9 +373,9 @@ class Validator(object):
                 tombstones_count += 1
                 continue
 
-            msg_table = msg.value()[constants.UNIFIED_TOPIC_MSG_SOURCE_TABLE_NAME]
-            msg_change_index = change_index.ChangeIndex.from_avro_ready_dict(
-                dict(msg.value()[constants.UNIFIED_TOPIC_MSG_DATA_WRAPPER_NAME]))
+            msg_val = dict(msg.value())
+            msg_table = msg_val.pop('__avro_schema_name').replace('_cdc__value', '').replace('_', '.', 1)
+            msg_change_index = change_index.ChangeIndex.from_avro_ready_dict(msg_val)
 
             if prior_read_change_index is not None and prior_read_change_index > msg_change_index:
                 if len(sample_regression_indices) < 10:

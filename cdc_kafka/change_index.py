@@ -6,6 +6,8 @@ from . import constants
 
 @total_ordering
 class ChangeIndex(object):
+    __slots__ = 'lsn', 'seqval', 'operation'
+
     def __init__(self, lsn: bytes, seqval: bytes, operation: int) -> None:
         self.lsn: bytes = lsn
         self.seqval: bytes = seqval
@@ -19,13 +21,23 @@ class ChangeIndex(object):
 
     def __eq__(self, other: 'ChangeIndex') -> bool:
         if isinstance(other, ChangeIndex):
-            return self.lsn + self.seqval + bytes([self.operation]) == \
-                   other.lsn + other.seqval + bytes([other.operation])
+            # I know the below logic seems awkward, but it was the result of performance profiling. Short-circuiting
+            # early when we can, since this will most often return False:
+            return not (
+                self.lsn != other.lsn
+                or self.seqval != other.seqval
+                or self.operation != other.operation
+            )
         return False
 
     def __lt__(self, other: 'ChangeIndex') -> bool:
-        return self.lsn + self.seqval + bytes([self.operation]) < \
-               other.lsn + other.seqval + bytes([other.operation])
+        if self.lsn != other.lsn:
+            return self.lsn < other.lsn
+        if self.seqval != other.seqval:
+            return self.seqval < other.seqval
+        if self.operation != other.operation:
+            return self.operation < other.operation
+        return False
 
     # For user-friendly display in logging etc.; not the format to be used for persistent data storage
     def __repr__(self) -> str:

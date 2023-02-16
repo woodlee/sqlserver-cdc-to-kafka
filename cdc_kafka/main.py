@@ -1,6 +1,5 @@
 import argparse
 import collections
-import copy
 import datetime
 import heapq
 import json
@@ -89,36 +88,32 @@ def run() -> None:
                 opts.replication_factor, opts.extra_topic_config, opts.run_validations, redo_snapshot_for_new_instance,
                 publish_duplicate_changes_from_new_instance)
 
-            table_to_unified_topics_map: Dict[str, List[Tuple[str, int, int]]] = collections.defaultdict(list)
+            table_to_unified_topics_map: Dict[str, List[Tuple[str]]] = collections.defaultdict(list)
             unified_topic_to_tables_map: Dict[str, List[tracked_tables.TrackedTable]] = collections.defaultdict(list)
 
             # "Unified" topics contain change messages from multiple capture instances in a globally-consistent LSN
             # order. They don't contain snapshot messages.
             if opts.unified_topics:
-                for unified_topic_name, included_tables_regex in opts.unified_topics.items():
+                for unified_topic_name, unified_topic_config in opts.unified_topics.items():
+                    included_tables_regex = unified_topic_config['included_tables']
                     compiled_regex = re.compile(included_tables_regex, re.IGNORECASE)
                     matched_tables = [table for table in tables if compiled_regex.match(table.fq_name)]
                     if matched_tables:
-                        unified_value_schema = copy.deepcopy(constants.UNIFIED_TOPIC_VALUE_SCHEMA)
-                        unified_value_schema['fields'][1]['type'] = [t.value_schema for t in matched_tables]
-                        unified_key_schema_id, unified_value_schema_id = kafka_client.register_schemas(
-                            unified_topic_name, constants.UNIFIED_TOPIC_KEY_SCHEMA, unified_value_schema,
-                            value_schema_compatibility_level=constants.UNIFIED_TOPIC_VALUE_SCHEMA_COMPATIBILITY_LEVEL)
-                        unified_topic_tuple = (unified_topic_name, unified_key_schema_id, unified_value_schema_id)
                         for matched_table in matched_tables:
-                            table_to_unified_topics_map[matched_table.fq_name].append(unified_topic_tuple)
+                            table_to_unified_topics_map[matched_table.fq_name].append(unified_topic_name)
                             unified_topic_to_tables_map[unified_topic_name].append(matched_table)
                         part_count = kafka_client.get_topic_partition_count(unified_topic_name)
                         if part_count:
                             logger.info('Existing unified topic %s found, with %s partition(s)',
                                         unified_topic_name, part_count)
                         else:
-                            part_count = opts.unified_topics_partition_count or 1
+                            part_count = unified_topic_config.get('partition_count', 1)
+                            extra_config = unified_topic_config.get('extra_topic_config', {})
                             logger.info('Unified topic %s not found, creating with %s replicas, %s partition(s), and '
                                         'extra config %s', unified_topic_name, opts.replication_factor, part_count,
-                                        opts.unified_topics_extra_config)
+                                        extra_config)
                             kafka_client.create_topic(unified_topic_name, part_count, opts.replication_factor,
-                                                      opts.unified_topics_extra_config)
+                                                      extra_config)
 
             if table_to_unified_topics_map:
                 logger.debug('Unified topics being produced to, by table: %s', table_to_unified_topics_map)
@@ -138,7 +133,7 @@ def run() -> None:
             next_cdc_poll_due_time: datetime.datetime = datetime.datetime.utcnow()
             last_produced_row: Optional['parsed_row.ParsedRow'] = None
             last_topic_produces: Dict[str, datetime.datetime] = {}
-            change_rows_queue: List['parsed_row.ParsedRow'] = []
+            change_rows_queue: List[Tuple[change_index.ChangeIndex, 'parsed_row.ParsedRow']] = []
             queued_change_row_counts: Dict[str, int] = {t.topic_name: 0 for t in tables}
 
             # Returned bool indicates whether the process should halt
@@ -244,7 +239,7 @@ def run() -> None:
                     for t in tables:
                         for row in t.retrieve_changes_query_results():
                             queued_change_row_counts[t.topic_name] += 1
-                            heapq.heappush(change_rows_queue, row)
+                            heapq.heappush(change_rows_queue, (row.change_idx, row))
                         if t.max_polled_change_index < common_lsn_limit:
                             common_lsn_limit = t.max_polled_change_index
 
@@ -254,10 +249,10 @@ def run() -> None:
                     # ----- Produce change data to Kafka and commit progress -----
 
                     while change_rows_queue:
-                        row: 'parsed_row.ParsedRow' = heapq.heappop(change_rows_queue)
+                        row: 'parsed_row.ParsedRow' = heapq.heappop(change_rows_queue)[1]
 
                         if row.change_idx > common_lsn_limit:
-                            heapq.heappush(change_rows_queue, row)
+                            heapq.heappush(change_rows_queue, (row.change_idx, row))
                             break
 
                         if last_produced_row and row.change_idx < last_produced_row.change_idx:
@@ -268,18 +263,9 @@ def run() -> None:
 
                         kafka_client.produce(row.destination_topic, row.key_dict, row.avro_key_schema_id,
                                              row.value_dict, row.avro_value_schema_id,
-                                             constants.SINGLE_TABLE_CHANGE_MESSAGE)
+                                             constants.SINGLE_TABLE_CHANGE_MESSAGE,
+                                             table_to_unified_topics_map.get(row.table_fq_name, []))
                         last_topic_produces[row.destination_topic] = datetime.datetime.utcnow()
-
-                        unified_topic_tuples = table_to_unified_topics_map.get(row.table_fq_name, [])
-
-                        if unified_topic_tuples:
-                            ut_key = {constants.LSN_NAME: row.change_idx.to_avro_ready_dict()[constants.LSN_NAME]}
-                            ut_value = {constants.UNIFIED_TOPIC_MSG_SOURCE_TABLE_NAME: row.table_fq_name,
-                                        constants.UNIFIED_TOPIC_MSG_DATA_WRAPPER_NAME: row.value_dict}
-                            for ut_name, ut_key_schema_id, ut_value_schema_id in unified_topic_tuples:
-                                kafka_client.produce(ut_name, ut_key, ut_key_schema_id, ut_value,
-                                                     ut_value_schema_id, constants.UNIFIED_TOPIC_CHANGE_MESSAGE)
 
                         if not opts.disable_deletion_tombstones and row.operation_name == \
                                 constants.DELETE_OPERATION_NAME:
@@ -385,11 +371,11 @@ def build_tracked_tables_from_cdc_metadata(
         can_snapshot = False
 
         if snapshot_table_whitelist_regex and snapshot_table_whitelist_regex.match(fq_table_name):
-            logger.debug('Table %s WILL be snapshotted due to whitelisting', fq_table_name)
+            logger.debug('Table %s matched snapshotting whitelist', fq_table_name)
             can_snapshot = True
 
         if snapshot_table_blacklist_regex and snapshot_table_blacklist_regex.match(fq_table_name):
-            logger.debug('Table %s will NOT be snapshotted due to blacklisting', fq_table_name)
+            logger.debug('Table %s matched snapshotting blacklist and will NOT be snapshotted', fq_table_name)
             can_snapshot = False
 
         topic_name = topic_name_template.format(

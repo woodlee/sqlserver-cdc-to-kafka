@@ -6,7 +6,7 @@ import logging
 import socket
 import struct
 import time
-from typing import List, Dict, Tuple, Any, Callable, Union, Generator, Optional, Iterable
+from typing import List, Dict, Tuple, Any, Callable, Union, Generator, Optional, Iterable, Set
 
 import confluent_kafka.admin
 import confluent_kafka.avro
@@ -42,7 +42,7 @@ class KafkaClient(object):
         }, **extra_kafka_consumer_config}
         producer_config = {**{
             'bootstrap.servers': bootstrap_servers,
-            'linger.ms': '50',
+            'linger.ms': '200',
             'enable.idempotence': True,
             'statistics.interval.ms': 30 * 60 * 1000,
             'enable.gapless.guarantee': True,
@@ -75,13 +75,15 @@ class KafkaClient(object):
         self._admin: confluent_kafka.admin.AdminClient = confluent_kafka.admin.AdminClient(admin_config)
         self._avro_serializer: confluent_kafka.avro.MessageSerializer = \
             confluent_kafka.avro.MessageSerializer(self._schema_registry)
-        self._avro_decoders: Dict[int, Callable] = {}
+        self._avro_decoders: Dict[int, Callable] = dict()
+        self._schema_ids_to_names: Dict[int, str] = dict()
         self._delivery_callbacks: Dict[str, List[Callable]] = collections.defaultdict(list)
         self._delivery_callbacks_finalized: bool = False
         self._global_produce_sequence_nbr: int = 0
         self._cluster_metadata: Optional[confluent_kafka.admin.ClusterMetadata] = None
         self._last_full_flush_time: datetime.datetime = datetime.datetime.utcnow()
         self._disable_writing = disable_writing
+        self._creation_warned_topic_names: Set[str] = set()
 
         self._refresh_cluster_metadata()
 
@@ -109,12 +111,11 @@ class KafkaClient(object):
         return len(self._cluster_metadata.topics[topic_name].partitions)
 
     def produce(self, topic: str, key: Dict[str, Any], key_schema_id: int, value: Union[None, Dict[str, Any]],
-                value_schema_id: int, message_type: str) -> None:
+                value_schema_id: int, message_type: str, copy_to_unified_topics: List[str] = None) -> None:
         if self._disable_writing:
             return
 
         start_time = time.perf_counter()
-
         key_ser = self._avro_serializer.encode_record_with_schema_id(key_schema_id, key, True)
         if value is None:  # a deletion tombstone probably
             value_ser = None
@@ -126,9 +127,9 @@ class KafkaClient(object):
 
         while True:
             try:
-                # the callback function receives the binary-serialized payload, so instead of specifying it directly
-                # as the delivery callback we wrap it in a lambda that also captures and passes the original not-yet-
-                # serialized key and value so that we don't have to re-deserialize it later:
+                # the callback function receives the binary-serialized payload, so instead of specifying it
+                # directly as the delivery callback we wrap it in a lambda that also captures and passes the
+                # original not-yet-serialized key and value so that we don't have to re-deserialize it later:
                 self._producer.produce(
                     topic=topic, value=value_ser, key=key_ser,
                     on_delivery=lambda err, msg: self._delivery_callback(message_type, err, msg, key, value, seq),
@@ -137,7 +138,7 @@ class KafkaClient(object):
                 break
             except BufferError:
                 time.sleep(1)
-                logger.debug('Sleeping due to Kafka producer buffer being full...')
+                logger.warning('Sleeping due to Kafka producer buffer being full...')
                 self.flush()  # clear some space before retrying
             except Exception:
                 logger.error('The following exception occurred producing to topic %s', topic)
@@ -145,6 +146,32 @@ class KafkaClient(object):
 
         elapsed = (time.perf_counter() - start_time)
         self._metrics_accumulator.register_kafka_produce(elapsed, value, message_type)
+
+        if copy_to_unified_topics:
+            for topic in copy_to_unified_topics:
+                start_time = time.perf_counter()
+                seq = self._global_produce_sequence_nbr + 1
+                self._global_produce_sequence_nbr = seq
+
+                while True:
+                    try:
+                        self._producer.produce(
+                            topic=topic, value=value_ser, key=key_ser,
+                            on_delivery=lambda err, msg: self._delivery_callback(
+                                constants.UNIFIED_TOPIC_CHANGE_MESSAGE, err, msg, key, value, seq),
+                            headers={'cdc_to_kafka_message_type': constants.UNIFIED_TOPIC_CHANGE_MESSAGE}
+                        )
+                        break
+                    except BufferError:
+                        time.sleep(1)
+                        logger.warning('Sleeping due to Kafka producer buffer being full...')
+                        self.flush()  # clear some space before retrying
+                    except Exception:
+                        logger.error('The following exception occurred producing to topic %s', topic)
+                        raise
+
+                elapsed = (time.perf_counter() - start_time)
+                self._metrics_accumulator.register_kafka_produce(elapsed, value, constants.UNIFIED_TOPIC_CHANGE_MESSAGE)
 
     def flush(self, final: bool = False) -> bool:
         if self._disable_writing:
@@ -219,13 +246,17 @@ class KafkaClient(object):
                     if schema_id not in self._avro_decoders:
                         self._set_decoder(schema_id)
                     decoder = self._avro_decoders[schema_id]
-                    setter(decoder(payload))
+                    to_set = decoder(payload)
+                    to_set['__avro_schema_name'] = self._schema_ids_to_names[schema_id]
+                    setter(to_set)
                     payload.close()
 
             yield msg
 
     def _set_decoder(self, schema_id):
-        schema = fastavro.parse_schema(self._schema_registry.get_by_id(schema_id).to_json())
+        reg_schema = self._schema_registry.get_by_id(schema_id)
+        schema = fastavro.parse_schema(reg_schema.to_json())
+        self._schema_ids_to_names[schema_id] = reg_schema.name
         self._avro_decoders[schema_id] = lambda p: fastavro.schemaless_reader(p, schema)
 
     def create_topic(self, topic_name: str, partition_count: int, replication_factor: int = None,
@@ -253,8 +284,10 @@ class KafkaClient(object):
             part_count = self.get_topic_partition_count(topic_name)
 
             if part_count is None:
-                logger.warning('Topic name %s was not found in Kafka. This process will create it if corresponding '
-                               'CDC entries are found.', topic_name)
+                if topic_name not in self._creation_warned_topic_names:
+                    logger.warning('Topic name %s was not found in Kafka. This process will create it if corresponding '
+                                   'CDC entries are found.', topic_name)
+                    self._creation_warned_topic_names.add(topic_name)
                 continue
 
             for part_id in range(part_count):

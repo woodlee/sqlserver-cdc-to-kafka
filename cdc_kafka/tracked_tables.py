@@ -1,8 +1,10 @@
 import hashlib
+import itertools
 import logging
 import uuid
 from typing import Tuple, Dict, List, Any, Callable, Optional, Generator, TYPE_CHECKING
 
+import bitarray
 import pyodbc
 
 from . import avro_from_sql, constants, change_index, options, sql_queries, sql_query_subprocess, parsed_row
@@ -352,24 +354,27 @@ class TrackedTable(object):
     def _parse_db_row(self, db_row: Tuple) -> parsed_row.ParsedRow:
         operation_id, event_db_time, lsn, seqval, update_mask, *table_cols = db_row
         operation_name = constants.CDC_OPERATION_ID_TO_NAME[operation_id]
+
+        value_dict = {fld.name: fld.transform_fn(table_cols[ix]) if fld.transform_fn else table_cols[ix]
+                      for ix, fld in enumerate(self.value_fields)}
+
         if operation_id == constants.SNAPSHOT_OPERATION_ID:
             row_kind = constants.SNAPSHOT_ROWS_KIND
             change_idx = None
-            value_dict: Dict[str, Any] = {
-                constants.OPERATION_NAME: constants.SNAPSHOT_OPERATION_NAME,
-                constants.LSN_NAME: None,
-                constants.SEQVAL_NAME: None,
-                constants.UPDATED_FIELDS_NAME: self._value_field_names
-            }
+            value_dict[constants.OPERATION_NAME] = constants.SNAPSHOT_OPERATION_NAME
+            value_dict[constants.LSN_NAME] = None
+            value_dict[constants.SEQVAL_NAME] = None
         else:
             row_kind = constants.CHANGE_ROWS_KIND
             change_idx = change_index.ChangeIndex(lsn, seqval, operation_id)
-            value_dict: Dict[str, Any] = change_idx.to_avro_ready_dict()
-            value_dict[constants.UPDATED_FIELDS_NAME] = list(self._updated_col_names_from_mask(update_mask))
+            value_dict.update(change_idx.to_avro_ready_dict())
+
+        if operation_id in (constants.PRE_UPDATE_OPERATION_ID, constants.POST_UPDATE_OPERATION_ID):
+            value_dict[constants.UPDATED_FIELDS_NAME] = self._updated_col_names_from_mask(update_mask)
+        else:
+            value_dict[constants.UPDATED_FIELDS_NAME] = self._value_field_names
 
         value_dict[constants.EVENT_TIME_NAME] = event_db_time.isoformat()
-        value_dict.update({fld.name: fld.transform_fn(table_cols[ix]) if fld.transform_fn else table_cols[ix]
-                           for ix, fld in enumerate(self.value_fields)})
 
         if self._has_pk:
             ordered_key_field_values: List[Any] = [table_cols[kfo - 1] for kfo in self._key_field_source_table_ordinals]
@@ -378,7 +383,7 @@ class TrackedTable(object):
             # capture instance in the future, the key value computed for the same source table row will change:
             m = hashlib.md5()
             m.update(str(zip(self._value_field_names, table_cols)).encode('utf8'))
-            row_hash = uuid.uuid5(uuid.UUID(bytes=m.digest()), self.fq_name)
+            row_hash = str(uuid.uuid5(uuid.UUID(bytes=m.digest()), self.fq_name))
             ordered_key_field_values: List[Any] = [row_hash]
 
         key_dict: Dict[str, Any] = dict(zip(self._key_field_names, ordered_key_field_values))
@@ -388,12 +393,10 @@ class TrackedTable(object):
                                     self.value_schema_id, key_dict, value_dict)
 
     def _updated_col_names_from_mask(self, cdc_update_mask: bytes) -> List[str]:
-        pos = 0
-        for byte in reversed(cdc_update_mask):
-            for j in range(8):
-                if (byte & (1 << j)) >> j:
-                    yield self._value_field_names[pos]
-                pos += 1
+        arr = bitarray.bitarray()
+        arr.frombytes(cdc_update_mask)
+        arr.reverse()
+        return list(itertools.compress(self._value_field_names, arr))
 
     def _get_max_key_value(self) -> Optional[Tuple[Any]]:
         with self._db_conn.cursor() as cursor:

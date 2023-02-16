@@ -136,28 +136,18 @@ def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List]:
 
     p.add_argument('--unified-topics',
                    default=os.environ.get('UNIFIED_TOPICS', {}), type=json.loads,
-                   help=f'A string that is a JSON object of {{"<topic_name>": "<included_tables_regex>"}} pairs. If '
-                        f'specified, all change data entries for source tables that match the regex will be produced '
-                        f'to the specified topic in globally-consistent LSN order. This means the topic will contain '
-                        f'messages with multiple Avro schemas, AND IDEALLY should be a single-partition topic to '
-                        f'simplify in-order consumption of the messages. Snapshot entries will not be included, and '
-                        f'messages will be keyed by their LSN alone, so topic compaction should not be used.')
-
-    p.add_argument('--unified-topics-partition-count',
-                   type=int,
-                   default=os.environ.get('UNIFIED_TOPICS_PARTITION_COUNT'),
-                   help="Number of partitions to specify when auto-creating a new unified-messages topic (cf. the "
-                        "--partition-count setting, which is for single-table topics). If left empty, defaults to 1. "
-                        "WARNING: the default value of 1 greatly simplifies consumers' ability to handle messages in "
-                        "the correct transactional order. Messages in these topics are keyed only by the change "
-                        "entry's LSN, so if more than one partition is used and ordering guarantees are needed, "
-                        "you'll need special logic to restore ordering in your consumers. Tread cautiously!")
-
-    p.add_argument('--unified-topics-extra-config',
-                   default=os.environ.get('UNIFIED_TOPICS_EXTRA_CONFIG', {}), type=json.loads,
-                   help="JSON object of additional configuration to pass to Kafka when a unified-messages "
-                        "topic is being auto-created. Empty by default. You might use this to, e.g., specify "
-                        "retention settings like {\"retention.ms\": 604800000, \"cleanup.policy\": \"delete\"}")
+                   help=f'A string that is a JSON object mapping topic names to various configuration parameters as '
+                        f'follows: {{"<string: topic name>": {{"included_tables": "<string: a regex, required>", '
+                        f'"partition_count": <int: optional, defaults to 1>, "extra_topic_config": {{<JSON object, '
+                        f'optional>}}}}, ... }}. For each specified topic name, all change data entries for source '
+                        f'tables that match the `included_tables` regex will be produced to the specified topic in '
+                        f'globally-consistent LSN order. This means the topic may contain messages with varying '
+                        f'schemas, and ideally should be a single-partition topic to simplify in-order consumption of '
+                        f'the messages, though if desired this can be overridden via `partition_count` when this '
+                        f'process is creating the topic. Similarly `extra_topic_config` can be used to specify '
+                        f'additional parameters passed directly to librdkafka at topic creation time (e.g. to specify '
+                        f'`retention.ms`). For these topics, snapshot entries will not be included, and since the '
+                        f'messages may have varying key schemas, use of topic compaction is not recommended.')
 
     p.add_argument('--new-capture-instance-snapshot-handling',
                    choices=(NEW_CAPTURE_INSTANCE_SNAPSHOT_HANDLING_BEGIN_NEW,
@@ -215,7 +205,7 @@ def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List]:
                    default=os.environ.get('PARTITION_COUNT'),
                    help="Number of partitions to specify when creating new topics. If left empty, defaults to 1 or "
                         "the average number of rows per second in the corresponding change table divided by 10, "
-                        "whichever is larger. (cf. --unified-topics-partition-count)")
+                        "whichever is larger.")
 
     p.add_argument('--replication-factor',
                    type=int,
