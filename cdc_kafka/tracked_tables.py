@@ -132,7 +132,8 @@ class TrackedTable(object):
         self, start_after_change_table_index: change_index.ChangeIndex,
         start_from_key_for_snapshot: Optional[Dict[str, Any]], lsn_gap_handling: str,
         schema_id_getter: Callable[[str, Dict[str, Any], Dict[str, Any]], Tuple[int, int]] = None,
-        progress_reset_fn: Callable[[str, str], None] = None
+        progress_reset_fn: Callable[[str, str], None] = None,
+        record_snapshot_completion_fn: Callable[[str], None] = None
     ) -> None:
         if self._finalized:
             raise Exception(f"Attempted to finalize table {self.fq_name} more than once")
@@ -233,12 +234,16 @@ class TrackedTable(object):
                     self.schema_name, self.table_name, self._value_field_names, columns_no_longer_on_base_table,
                     self._key_field_names, False, self._odbc_columns)
 
-                if start_from_key_for_snapshot:
+                if start_from_key_for_snapshot == constants.SNAPSHOT_COMPLETION_SENTINEL:
+                    self.snapshot_complete = True
+                elif start_from_key_for_snapshot:
                     key_min_tuple = tuple(self._get_min_key_value() or [])
                     start_key_tuple = tuple([start_from_key_for_snapshot[kfn] for kfn in self._key_field_names])
 
                     if key_min_tuple and key_min_tuple == start_key_tuple:
                         self.snapshot_complete = True
+                        if record_snapshot_completion_fn is not None:
+                            record_snapshot_completion_fn(self.topic_name)
                     else:
                         self._last_read_key_for_snapshot = start_key_tuple
                 else:
@@ -256,6 +261,8 @@ class TrackedTable(object):
                     else:
                         logger.warning('Snapshot was requested for table %s but it appears empty.', self.fq_name)
                         self.snapshot_complete = True
+                        if record_snapshot_completion_fn is not None:
+                            record_snapshot_completion_fn(self.topic_name)
             else:
                 raise Exception(
                     f"Snapshotting was requested for table {self.fq_name}, but it does not appear to have a primary "

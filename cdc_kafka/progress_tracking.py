@@ -232,6 +232,24 @@ class ProgressTracker(object):
                                    constants.HEARTBEAT_PROGRESS_MESSAGE)
         self._last_recorded_progress_by_topic[topic_name] = progress_entry
 
+    def record_snapshot_completion(self, topic_name: str) -> None:
+        self.commit_progress()
+
+        progress_entry = ProgressEntry(
+            progress_kind=constants.SNAPSHOT_ROWS_KIND,
+            topic_name=topic_name,
+            source_table_name=self._topic_to_source_table_map[topic_name],
+            change_table_name=self._topic_to_change_table_map[topic_name],
+            last_ack_partition=None,
+            last_ack_offset=None,
+            snapshot_index=constants.SNAPSHOT_COMPLETION_SENTINEL,
+            change_index=None
+        )
+
+        self._kafka_client.produce(self._progress_topic_name, progress_entry.key, self._progress_key_schema_id,
+                                   progress_entry.value, self._progress_value_schema_id,
+                                   constants.SNAPSHOT_PROGRESS_MESSAGE)
+
     def kafka_delivery_callback(self, message_type: str, message: 'confluent_kafka.Message',
                                 original_key: Dict[str, Any], original_value: Dict[str, Any],
                                 produce_sequence: int, **_) -> None:
