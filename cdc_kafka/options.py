@@ -231,6 +231,13 @@ def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List]:
                         "that will restart the process, to allow transparent migration to updated capture instances. "
                         "Defaults to False")
 
+    p.add_argument('--report-progress-only',
+                   type=str2bool, nargs='?', const=True,
+                   default=str2bool(os.environ.get('REPORT_PROGRESS_ONLY', False)),
+                   help="Prints the table of instances being captured and their change data / snapshot data progress, "
+                        "then exits without changing any state. Can be handy for validating other configuration such "
+                        "as the regexes used to control which tables are followed and/or snapshotted.")
+
     opts = p.parse_args()
 
     reporters = []

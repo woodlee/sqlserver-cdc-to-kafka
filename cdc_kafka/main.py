@@ -70,7 +70,8 @@ def run() -> None:
 
         with kafka.KafkaClient(
             metrics_accumulator, opts.kafka_bootstrap_servers, opts.schema_registry_url,
-            opts.extra_kafka_consumer_config, opts.extra_kafka_producer_config, disable_writing=opts.run_validations
+            opts.extra_kafka_consumer_config, opts.extra_kafka_producer_config,
+            disable_writing=opts.run_validations or opts.report_progress_only
         ) as kafka_client, progress_tracking.ProgressTracker(
             kafka_client, opts.progress_topic_name, topic_to_source_table_map, topic_to_change_table_map
         ) as progress_tracker:
@@ -86,7 +87,10 @@ def run() -> None:
             determine_start_points_and_finalize_tables(
                 kafka_client, tables, progress_tracker, opts.lsn_gap_handling, opts.partition_count,
                 opts.replication_factor, opts.extra_topic_config, opts.run_validations, redo_snapshot_for_new_instance,
-                publish_duplicate_changes_from_new_instance)
+                publish_duplicate_changes_from_new_instance, opts.report_progress_only)
+
+            if opts.report_progress_only:
+                exit(0)
 
             table_to_unified_topics_map: Dict[str, List[Tuple[str]]] = collections.defaultdict(list)
             unified_topic_to_tables_map: Dict[str, List[tracked_tables.TrackedTable]] = collections.defaultdict(list)
@@ -170,11 +174,14 @@ def run() -> None:
                 if opts.terminate_on_capture_instance_change and \
                         (datetime.datetime.utcnow() - last_capture_instance_check_time) > \
                         constants.CHANGED_CAPTURE_INSTANCES_CHECK_INTERVAL:
+                    topic_to_max_polled_index_map:  Dict[str, change_index.ChangeIndex] = {
+                        t.topic_name: t.max_polled_change_index for t in tables
+                    }
                     if should_terminate_due_to_capture_instance_change(
                             db_conn, progress_tracker, opts.capture_instance_version_strategy,
                             opts.capture_instance_version_regex, capture_instance_to_topic_map,
                             capture_instances_by_fq_name, opts.table_whitelist_regex,
-                            opts.table_blacklist_regex):
+                            opts.table_blacklist_regex, topic_to_max_polled_index_map):
                         return True
                     last_capture_instance_check_time = datetime.datetime.utcnow()
                 return False
@@ -200,6 +207,8 @@ def run() -> None:
                                                              row.avro_key_schema_id, row.value_dict,
                                                              row.avro_value_schema_id,
                                                              constants.SINGLE_TABLE_SNAPSHOT_MESSAGE)
+                                    if t.snapshot_complete:
+                                        progress_tracker.record_snapshot_completion(row.destination_topic)
                                 t.enqueue_snapshot_query()   # NB: results may not be retrieved until next cycle
                                 if datetime.datetime.utcnow() > next_cdc_poll_due_time:
                                     break
@@ -402,7 +411,7 @@ def determine_start_points_and_finalize_tables(
         progress_tracker: progress_tracking.ProgressTracker, lsn_gap_handling: str,
         partition_count: int, replication_factor: int, extra_topic_config: Dict[str, Union[str, int]],
         validation_mode: bool = False, redo_snapshot_for_new_instance: bool = False,
-        publish_duplicate_changes_from_new_instance: bool = False
+        publish_duplicate_changes_from_new_instance: bool = False, report_progress_only: bool = False
 ) -> None:
     topic_names: List[str] = [t.topic_name for t in tables]
 
@@ -412,20 +421,23 @@ def determine_start_points_and_finalize_tables(
             table.finalize_table(change_index.LOWEST_CHANGE_INDEX, {}, lsn_gap_handling, kafka_client.register_schemas)
         return
 
-    watermarks_by_topic = kafka_client.get_topic_watermarks(topic_names)
-    first_check_watermarks_json = json.dumps(watermarks_by_topic)
+    if report_progress_only:
+        watermarks_by_topic = []
+    else:
+        watermarks_by_topic = kafka_client.get_topic_watermarks(topic_names)
+        first_check_watermarks_json = json.dumps(watermarks_by_topic)
 
-    logger.info('Pausing briefly to ensure target topics are not receiving new messages from elsewhere...')
-    time.sleep(constants.WATERMARK_STABILITY_CHECK_DELAY_SECS)
+        logger.info('Pausing briefly to ensure target topics are not receiving new messages from elsewhere...')
+        time.sleep(constants.WATERMARK_STABILITY_CHECK_DELAY_SECS)
 
-    watermarks_by_topic = kafka_client.get_topic_watermarks(topic_names)
-    second_check_watermarks_json = json.dumps(watermarks_by_topic)
+        watermarks_by_topic = kafka_client.get_topic_watermarks(topic_names)
+        second_check_watermarks_json = json.dumps(watermarks_by_topic)
 
-    if first_check_watermarks_json != second_check_watermarks_json:
-        raise Exception(f'Watermarks for one or more target topics changed between successive checks. '
-                        f'Another process may be producing to the topic(s). Bailing.\nFirst check: '
-                        f'{first_check_watermarks_json}\nSecond check: {second_check_watermarks_json}')
-    logger.debug('Topic watermarks: %s', second_check_watermarks_json)
+        if first_check_watermarks_json != second_check_watermarks_json:
+            raise Exception(f'Watermarks for one or more target topics changed between successive checks. '
+                            f'Another process may be producing to the topic(s). Bailing.\nFirst check: '
+                            f'{first_check_watermarks_json}\nSecond check: {second_check_watermarks_json}')
+        logger.debug('Topic watermarks: %s', second_check_watermarks_json)
 
     prior_progress_log_table_data = []
     prior_progress = progress_tracker.get_prior_progress_or_create_progress_topic()
@@ -433,7 +445,7 @@ def determine_start_points_and_finalize_tables(
     for table in tables:
         snapshot_progress, changes_progress = None, None
 
-        if table.topic_name not in watermarks_by_topic:  # new topic; create it
+        if not report_progress_only and table.topic_name not in watermarks_by_topic:  # new topic; create it
             if partition_count:
                 this_topic_partition_count = partition_count
             else:
@@ -461,7 +473,10 @@ def determine_start_points_and_finalize_tables(
                             '(prior progress instance: %s; current instance: %s)', table.topic_name,
                             snapshot_progress.change_table_name, fq_change_table_name)
                 if redo_snapshot_for_new_instance:
-                    logger.info('Will start new snapshot.')
+                    if ddl_change_requires_new_snapshot(snapshot_progress.change_table_name, fq_change_table_name):
+                        logger.info('Will start new snapshot.')
+                    else:
+                        logger.info('New snapshot does not appear to be required.')
                     snapshot_progress = None
                 else:
                     logger.info('Will NOT start new snapshot.')
@@ -480,8 +495,12 @@ def determine_start_points_and_finalize_tables(
             or change_index.LOWEST_CHANGE_INDEX
         starting_snapshot_index = snapshot_progress and snapshot_progress.snapshot_index
 
-        table.finalize_table(starting_change_index, starting_snapshot_index, lsn_gap_handling,
-                             kafka_client.register_schemas, progress_tracker.reset_progress)
+        if report_progress_only:  # elide schema registration
+            table.finalize_table(starting_change_index, starting_snapshot_index, options.LSN_GAP_HANDLING_IGNORE)
+        else:
+            table.finalize_table(starting_change_index, starting_snapshot_index, lsn_gap_handling,
+                                 kafka_client.register_schemas, progress_tracker.reset_progress,
+                                 progress_tracker.record_snapshot_completion)
 
         if not table.snapshot_allowed:
             snapshot_state = '<not doing>'
@@ -500,14 +519,20 @@ def determine_start_points_and_finalize_tables(
 
     logger.info('Processing will proceed from the following positions based on the last message from each topic '
                 'and/or the snapshot progress committed in Kafka (NB: snapshot reads occur BACKWARDS from high to '
-                'low key column values):\n%s', table)
+                'low key column values):\n%s\n%s tables total.', table, len(prior_progress_log_table_data))
 
+
+# noinspection PyUnusedLocal
+def ddl_change_requires_new_snapshot(old_ci_name: str, new_ci_name: str) -> bool:
+    return True  # TODO: this is a stub for a next-up planned feature
+    
 
 def should_terminate_due_to_capture_instance_change(
         db_conn: pyodbc.Connection, progress_tracker: progress_tracking.ProgressTracker,
         capture_instance_version_strategy: str, capture_instance_version_regex: str,
         capture_instance_to_topic_map: Dict[str, str], current_capture_instances: Dict[str, Dict[str, Any]],
-        table_whitelist_regex: str, table_blacklist_regex: str
+        table_whitelist_regex: str, table_blacklist_regex: str,
+        topic_to_max_polled_index_map: Dict[str, change_index.ChangeIndex]
 ) -> bool:
     new_capture_instances = get_latest_capture_instances_by_fq_name(
         db_conn, capture_instance_version_strategy, capture_instance_version_regex, table_whitelist_regex,
@@ -527,19 +552,21 @@ def should_terminate_due_to_capture_instance_change(
             return f'0x{obj.hex()}'
         raise TypeError("Type %s not serializable" % type(obj))
 
-    logger.info('Change detected in capture instances. Current: %s New: %s',
-                json.dumps(current_capture_instances, default=better_json_serialize),
-                json.dumps(new_capture_instances, default=better_json_serialize))
-
     for fq_name, current_ci in current_capture_instances.items():
         if fq_name in new_capture_instances:
             new_ci = new_capture_instances[fq_name]
-            last_recorded_progress = progress_tracker.get_last_recorded_progress_for_topic(
-                capture_instance_to_topic_map[current_ci['capture_instance_name']])
-            current_idx = last_recorded_progress and last_recorded_progress.change_index or \
-                change_index.LOWEST_CHANGE_INDEX
+            if current_ci['capture_instance_name'] == new_ci['capture_instance_name']:
+                continue
+            topic = capture_instance_to_topic_map[current_ci['capture_instance_name']]
+            current_idx = topic_to_max_polled_index_map.get(topic)
+            if current_idx is not None:
+                progress_tracker.emit_changes_progress_heartbeat(topic, current_idx)
+            current_idx = current_idx or change_index.LOWEST_CHANGE_INDEX
+            logger.info('Change detected in capture instance for %s.\nCurrent: %s\nNew: %s', fq_name,
+                        json.dumps(current_ci, default=better_json_serialize),
+                        json.dumps(new_ci, default=better_json_serialize))
             new_ci_min_index = change_index.ChangeIndex(new_ci['start_lsn'], b'\x00' * 10, 0)
-            if not last_recorded_progress or (last_recorded_progress.change_index < new_ci_min_index):
+            if current_idx < new_ci_min_index:
                 with db_conn.cursor() as cursor:
                     ci_table_name = f"[{constants.CDC_DB_SCHEMA_NAME}].[{current_ci['capture_instance_name']}_CT]"
                     cursor.execute(f"SELECT TOP 1 1 FROM {ci_table_name} WITH (NOLOCK)")

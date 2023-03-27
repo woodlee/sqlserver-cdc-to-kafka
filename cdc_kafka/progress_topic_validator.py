@@ -123,6 +123,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # importing this file to pick up the logging config in __init__; is there a better way??
     # noinspection PyUnresolvedReferences
-    from cdc_kafka import progress_topic_validator  # so we pick up the logging config in __init__; better way??
+    from cdc_kafka import progress_topic_validator
     progress_topic_validator.main()
