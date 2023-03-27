@@ -208,7 +208,7 @@ def run() -> None:
                                                              row.avro_value_schema_id,
                                                              constants.SINGLE_TABLE_SNAPSHOT_MESSAGE)
                                     if t.snapshot_complete:
-                                        progress_tracker.record_snapshot_completion(row.destination_topic)
+                                        progress_tracker.record_snapshot_completion(t.topic_name)
                                 t.enqueue_snapshot_query()   # NB: results may not be retrieved until next cycle
                                 if datetime.datetime.utcnow() > next_cdc_poll_due_time:
                                     break
