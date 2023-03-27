@@ -7,10 +7,9 @@ from typing import Tuple, Dict, List, Any, Callable, Optional, Generator, TYPE_C
 import bitarray
 import pyodbc
 
-from . import avro_from_sql, constants, change_index, options, sql_queries, sql_query_subprocess, parsed_row
+from . import avro_from_sql, constants, change_index, options, sql_queries, sql_query_subprocess, parsed_row, helpers
 
 if TYPE_CHECKING:
-    from . import clock_sync
     from .metric_reporting import accumulator
 
 logger = logging.getLogger(__name__)
@@ -20,17 +19,16 @@ NEW_SNAPSHOT = object()
 
 class TrackedField(object):
     def __init__(self, name: str, sql_type_name: str, change_table_ordinal: int, primary_key_ordinal: int,
-                 decimal_precision: int, decimal_scale: int, is_identity: bool,
+                 decimal_precision: int, decimal_scale: int, force_avro_long: bool,
                  truncate_after: Optional[int] = None) -> None:
         self.name: str = name
         self.sql_type_name: str = sql_type_name
         self.change_table_ordinal: int = change_table_ordinal
-        self.is_identity: bool = is_identity
         self.primary_key_ordinal: int = primary_key_ordinal
         self.avro_schema: Dict[str, Any] = avro_from_sql.avro_schema_from_sql_type(
-            name, sql_type_name, decimal_precision, decimal_scale, False)
+            name, sql_type_name, decimal_precision, decimal_scale, False, force_avro_long)
         self.nullable_avro_schema: Dict[str, Any] = avro_from_sql.avro_schema_from_sql_type(
-            name, sql_type_name, decimal_precision, decimal_scale, True)
+            name, sql_type_name, decimal_precision, decimal_scale, True, force_avro_long)
         self.transform_fn: Optional[Callable[[Any], Any]] = avro_from_sql.avro_transform_fn_from_sql_type(sql_type_name)
 
         if truncate_after is not None:
@@ -46,13 +44,11 @@ class TrackedField(object):
 
 
 class TrackedTable(object):
-    def __init__(self, db_conn: pyodbc.Connection, clock_syncer: 'clock_sync.ClockSync',
-                 metrics_accumulator: 'accumulator.Accumulator',
+    def __init__(self, db_conn: pyodbc.Connection, metrics_accumulator: 'accumulator.Accumulator',
                  sql_query_processor: sql_query_subprocess.SQLQueryProcessor, schema_name: str, table_name: str,
                  capture_instance_name: str, topic_name: str, min_lsn: bytes, snapshot_allowed: bool,
                  db_row_batch_size: int) -> None:
         self._db_conn: pyodbc.Connection = db_conn
-        self._clock_syncer: clock_sync.ClockSync = clock_syncer
         self._metrics_accumulator: 'accumulator.Accumulator' = metrics_accumulator
         self._sql_query_processor: sql_query_subprocess.SQLQueryProcessor = sql_query_processor
 
@@ -62,7 +58,6 @@ class TrackedTable(object):
         self.topic_name: str = topic_name
         self.snapshot_allowed: bool = snapshot_allowed
         self.fq_name: str = f'{schema_name}.{table_name}'
-        self.change_table_name: str = f'{capture_instance_name}_CT'
         self.db_row_batch_size: int = db_row_batch_size
 
         # Most of the below properties are not set until sometime after `finalize_table` is called:
@@ -82,7 +77,7 @@ class TrackedTable(object):
         self._key_field_source_table_ordinals: Tuple[int] = tuple()
         self._value_field_names: List[str] = []
         self._last_read_key_for_snapshot: Optional[Tuple] = None
-        self._odbc_columns: Tuple[Tuple] = tuple()
+        self._odbc_columns: Tuple[pyodbc.Row, ...] = tuple()
         self._change_rows_query: Optional[str] = None
         self._change_rows_query_param_types: List[Tuple[int, int, int]] = []
         self._snapshot_rows_query: Optional[str] = None
@@ -116,7 +111,8 @@ class TrackedTable(object):
     def get_change_table_counts(self, highest_change_index: change_index.ChangeIndex) -> Tuple[int, int, int]:
         with self._db_conn.cursor() as cursor:
             deletes, inserts, updates = 0, 0, 0
-            q, p = sql_queries.get_change_table_count_by_operation(self.change_table_name)
+            q, p = sql_queries.get_change_table_count_by_operation(
+                helpers.get_fq_change_table_name(self.capture_instance_name))
             cursor.setinputsizes(p)
             cursor.execute(q, (highest_change_index.lsn, highest_change_index.seqval, highest_change_index.operation))
             for row in cursor.fetchall():
@@ -134,6 +130,7 @@ class TrackedTable(object):
     # 'Finalizing' mostly means doing the things we can't do until we know all the table's fields have been added
     def finalize_table(
         self, start_after_change_table_index: change_index.ChangeIndex,
+        prior_change_table_max_index: Optional[change_index.ChangeIndex],
         start_from_key_for_snapshot: Optional[Dict[str, Any]], lsn_gap_handling: str,
         schema_id_getter: Callable[[str, Dict[str, Any], Dict[str, Any]], Tuple[int, int]] = None,
         progress_reset_fn: Callable[[str, str], None] = None,
@@ -149,7 +146,10 @@ class TrackedTable(object):
                    f'(0x{self.min_lsn.hex()}) is later than the log position we need to start from based on the prior '
                    f'progress LSN stored in Kafka (0x{start_after_change_table_index.lsn.hex()}).')
 
-            if lsn_gap_handling == options.LSN_GAP_HANDLING_IGNORE:
+            if prior_change_table_max_index and prior_change_table_max_index <= start_after_change_table_index:
+                logger.info('%s Proceeding anyway, because it appears that no new entries are present in the prior '
+                            'capture instance with an LSN higher than the last changes sent to Kafka.', msg)
+            elif lsn_gap_handling == options.LSN_GAP_HANDLING_IGNORE:
                 logger.warning('%s Proceeding anyway since lsn_gap_handling is set to "%s"!',
                                msg, options.LSN_GAP_HANDLING_IGNORE)
             elif lsn_gap_handling == options.LSN_GAP_HANDLING_BEGIN_NEW_SNAPSHOT:
@@ -204,8 +204,9 @@ class TrackedTable(object):
                                                                         self.value_schema)
 
         with self._db_conn.cursor() as cursor:
-            q, p = sql_queries.get_change_table_index_cols(self.change_table_name)
-            cursor.execute(q)
+            q, p = sql_queries.get_change_table_index_cols()
+            cursor.setinputsizes(p)
+            cursor.execute(q, helpers.get_fq_change_table_name(self.capture_instance_name))
             change_table_clustered_idx_cols = [r[0] for r in cursor.fetchall()]
 
             self._odbc_columns = tuple(cursor.columns(schema=self.schema_name, table=self.table_name).fetchall())
@@ -215,12 +216,13 @@ class TrackedTable(object):
         found_metadata_cols = [c for c in change_table_clustered_idx_cols if c in required_metadata_cols_ordered]
 
         if found_metadata_cols != required_metadata_cols_ordered:
-            raise Exception(f'The index for change table {self.change_table_name} did not contain the expected '
-                            f'CDC metadata columns, or contained them in the wrong order. Index columns found '
-                            f'were: {change_table_clustered_idx_cols}')
+            raise Exception(f'The index for change table {helpers.get_fq_change_table_name(self.capture_instance_name)} '
+                            f'did not contain the expected CDC metadata columns, or contained them in the wrong order. '
+                            f'Index columns found were: {change_table_clustered_idx_cols}')
 
         self._change_rows_query, self._change_rows_query_param_types = sql_queries.get_change_rows(
-            self.db_row_batch_size, self.change_table_name, self._value_field_names, change_table_clustered_idx_cols)
+            self.db_row_batch_size, helpers.get_fq_change_table_name(self.capture_instance_name),
+            self._value_field_names, change_table_clustered_idx_cols)
 
         if not self.snapshot_allowed:
             self.snapshot_complete = True
@@ -358,11 +360,11 @@ class TrackedTable(object):
 
     def get_change_rows_per_second(self) -> int:
         with self._db_conn.cursor() as cursor:
-            q, p = sql_queries.get_change_rows_per_second(self.change_table_name)
+            q, p = sql_queries.get_change_rows_per_second(helpers.get_fq_change_table_name(self.capture_instance_name))
             cursor.execute(q)
             return cursor.fetchval() or 0
 
-    def _parse_db_row(self, db_row: Tuple) -> parsed_row.ParsedRow:
+    def _parse_db_row(self, db_row: pyodbc.Row) -> parsed_row.ParsedRow:
         operation_id, event_db_time, lsn, seqval, update_mask, *table_cols = db_row
         operation_name = constants.CDC_OPERATION_ID_TO_NAME[operation_id]
 

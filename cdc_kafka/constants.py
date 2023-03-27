@@ -10,6 +10,9 @@ CHANGED_CAPTURE_INSTANCES_CHECK_INTERVAL = datetime.timedelta(seconds=60)
 SLOW_TABLE_PROGRESS_HEARTBEAT_INTERVAL = datetime.timedelta(minutes=3)
 DB_CLOCK_SYNC_INTERVAL = datetime.timedelta(minutes=5)
 
+SMALL_TABLE_THRESHOLD = 5_000_000
+MAX_AGE_TO_PRESUME_ADDED_COL_IS_NULL_SECONDS = 3600
+
 SQL_QUERY_TIMEOUT_SECONDS = 30
 SQL_QUERY_INTER_RETRY_INTERVAL_SECONDS = 1
 SQL_QUERY_RETRIES = 2
@@ -69,19 +72,10 @@ CDC_OPERATION_NAME_TO_ID = {
 
 # Metadata column names and positions
 
-OPERATION_POS = 0
 OPERATION_NAME = '__operation'
-
-EVENT_TIME_POS = 1
 EVENT_TIME_NAME = '__event_time'
-
-LSN_POS = 2
 LSN_NAME = '__log_lsn'
-
-SEQVAL_POS = 3
 SEQVAL_NAME = '__log_seqval'
-
-UPDATED_FIELDS_POS = 4
 UPDATED_FIELDS_NAME = '__updated_fields'
 
 DB_LSN_COL_NAME = '__$start_lsn'

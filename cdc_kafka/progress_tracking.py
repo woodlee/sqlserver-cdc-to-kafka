@@ -206,7 +206,7 @@ class ProgressTracker(object):
     def __enter__(self) -> 'ProgressTracker':
         return self
 
-    def __exit__(self, exc_type, value, traceback) -> None:
+    def __exit__(self, *args) -> None:
         logger.info("Committing final progress...")
         self.commit_progress(final=True)
         logger.info("Done.")
@@ -242,10 +242,11 @@ class ProgressTracker(object):
     def record_snapshot_completion(self, topic_name: str) -> None:
         self.commit_progress(final=True)
 
+        source_table_name = self._topic_to_source_table_map[topic_name]
         progress_entry = ProgressEntry(
             progress_kind=constants.SNAPSHOT_ROWS_KIND,
             topic_name=topic_name,
-            source_table_name=self._topic_to_source_table_map[topic_name],
+            source_table_name=source_table_name,
             change_table_name=self._topic_to_change_table_map[topic_name],
             last_ack_partition=None,
             last_ack_offset=None,
@@ -253,6 +254,7 @@ class ProgressTracker(object):
             change_index=None
         )
 
+        logger.info('Recording snapshot completion for table %s into topic %s', source_table_name, topic_name)
         self._kafka_client.produce(self._progress_topic_name, progress_entry.key, self._progress_key_schema_id,
                                    progress_entry.value, self._progress_value_schema_id,
                                    constants.SNAPSHOT_PROGRESS_MESSAGE)

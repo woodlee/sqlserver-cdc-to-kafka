@@ -78,7 +78,6 @@ class KafkaClient(object):
         self._avro_decoders: Dict[int, Callable] = dict()
         self._schema_ids_to_names: Dict[int, str] = dict()
         self._delivery_callbacks: Dict[str, List[Callable]] = collections.defaultdict(list)
-        self._delivery_callbacks_finalized: bool = False
         self._global_produce_sequence_nbr: int = 0
         self._cluster_metadata: Optional[confluent_kafka.admin.ClusterMetadata] = None
         self._last_full_flush_time: datetime.datetime = datetime.datetime.utcnow()
@@ -92,7 +91,7 @@ class KafkaClient(object):
     def __enter__(self) -> 'KafkaClient':
         return self
 
-    def __exit__(self, exc_type, value, traceback) -> None:
+    def __exit__(self, *args) -> None:
         logger.info("Cleaning up Kafka resources...")
         self._consumer.close()
         self.flush(final=True)

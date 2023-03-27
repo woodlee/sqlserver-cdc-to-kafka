@@ -6,7 +6,7 @@ import queue
 import re
 import struct
 import time
-from typing import Any, Tuple, Dict, Optional, Iterable, NamedTuple
+from typing import Any, Tuple, Dict, Optional, Iterable, NamedTuple, List
 
 import pyodbc
 
@@ -28,7 +28,7 @@ class SQLQueryResult(NamedTuple):
     reflected_query_request_metadata: Any
     query_executed_utc: datetime.datetime
     query_took_sec: float
-    result_rows: Tuple[Tuple]
+    result_rows: List[pyodbc.Row]
     query_params: Optional[Tuple[Any]]
 
 
@@ -58,7 +58,7 @@ class SQLQueryProcessor(object):
         logger.debug("SQL query subprocess started.")
         return self
 
-    def __exit__(self, exc_type, value, traceback) -> None:
+    def __exit__(self, *args) -> None:
         if not self._ended:
             self._stop_event.set()
             self._check_if_ended()

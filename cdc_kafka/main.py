@@ -6,13 +6,14 @@ import json
 import logging
 import re
 import time
-from typing import Dict, Optional, List, Any, Iterable, Union, Tuple
+from typing import Dict, Optional, List, Any, Tuple
 
 import pyodbc
-from tabulate import tabulate
 
 from . import clock_sync, kafka, tracked_tables, constants, options, validation, change_index, progress_tracking, \
-    sql_query_subprocess, sql_queries
+    sql_query_subprocess, sql_queries, helpers
+from .build_startup_state import build_tracked_tables_from_cdc_metadata, determine_start_points_and_finalize_tables, \
+    get_latest_capture_instances_by_fq_name
 from .metric_reporting import accumulator
 
 from typing import TYPE_CHECKING
@@ -59,14 +60,14 @@ def run() -> None:
                                              for ci in capture_instances_by_fq_name.values()]
 
         tables: List[tracked_tables.TrackedTable] = build_tracked_tables_from_cdc_metadata(
-            db_conn, clock_syncer, metrics_accumulator, opts.topic_name_template, opts.snapshot_table_whitelist_regex,
+            db_conn, metrics_accumulator, opts.topic_name_template, opts.snapshot_table_whitelist_regex,
             opts.snapshot_table_blacklist_regex, opts.truncate_fields, capture_instance_names, opts.db_row_batch_size,
-            sql_query_processor)
+            opts.always_use_avro_longs, sql_query_processor)
 
         topic_to_source_table_map: Dict[str, str] = {
             t.topic_name: t.fq_name for t in tables}
         topic_to_change_table_map: Dict[str, str] = {
-            t.topic_name: f'{constants.CDC_DB_SCHEMA_NAME}.{t.change_table_name}' for t in tables}
+            t.topic_name: helpers.get_fq_change_table_name(t.capture_instance_name) for t in tables}
         capture_instance_to_topic_map: Dict[str, str] = {
             t.capture_instance_name: t.topic_name for t in tables}
 
@@ -87,9 +88,9 @@ def run() -> None:
             ), metrics_accumulator.kafka_delivery_callback)
 
             determine_start_points_and_finalize_tables(
-                kafka_client, tables, progress_tracker, opts.lsn_gap_handling, opts.partition_count,
-                opts.replication_factor, opts.extra_topic_config, opts.run_validations, redo_snapshot_for_new_instance,
-                publish_duplicate_changes_from_new_instance, opts.report_progress_only)
+                kafka_client, db_conn, tables, progress_tracker, opts.lsn_gap_handling, opts.partition_count,
+                opts.replication_factor, opts.extra_topic_config, opts.always_use_avro_longs, opts.run_validations,
+                redo_snapshot_for_new_instance, publish_duplicate_changes_from_new_instance, opts.report_progress_only)
 
             if opts.report_progress_only:
                 exit(0)
@@ -292,243 +293,6 @@ def run() -> None:
                 logger.info('Exiting due to external interrupt.')
 
 
-# This pulls the "greatest" capture instance running for each source table, in the event there is more than one.
-def get_latest_capture_instances_by_fq_name(
-        db_conn: pyodbc.Connection, capture_instance_version_strategy: str, capture_instance_version_regex: str,
-        table_whitelist_regex: str, table_blacklist_regex: str
-) -> Dict[str, Dict[str, Any]]:
-    if capture_instance_version_strategy == options.CAPTURE_INSTANCE_VERSION_STRATEGY_REGEX \
-            and not capture_instance_version_regex:
-        raise Exception('Please provide a capture_instance_version_regex when specifying the `regex` '
-                        'capture_instance_version_strategy.')
-    result: Dict[str, Dict[str, Any]] = {}
-    fq_name_to_capture_instances: Dict[str, List[Dict[str, Any]]] = collections.defaultdict(list)
-    capture_instance_version_regex = capture_instance_version_regex and re.compile(capture_instance_version_regex)
-    table_whitelist_regex = table_whitelist_regex and re.compile(table_whitelist_regex, re.IGNORECASE)
-    table_blacklist_regex = table_blacklist_regex and re.compile(table_blacklist_regex, re.IGNORECASE)
-
-    with db_conn.cursor() as cursor:
-        q, p = sql_queries.get_cdc_capture_instances_metadata()
-        cursor.execute(q)
-        for row in cursor.fetchall():
-            fq_table_name = f'{row[0]}.{row[1]}'
-
-            if table_whitelist_regex and not table_whitelist_regex.match(fq_table_name):
-                logger.debug('Table %s excluded by whitelist', fq_table_name)
-                continue
-
-            if table_blacklist_regex and table_blacklist_regex.match(fq_table_name):
-                logger.debug('Table %s excluded by blacklist', fq_table_name)
-                continue
-
-            if row[3] is None or row[4] is None:
-                logger.debug('Capture instance for %s appears to be brand-new; will evaluate again on '
-                             'next pass', fq_table_name)
-                continue
-
-            as_dict = {
-                'fq_name': fq_table_name,
-                'capture_instance_name': row[2],
-                'start_lsn': row[3],
-                'create_date': row[4],
-            }
-            if capture_instance_version_regex:
-                match = capture_instance_version_regex.match(row[1])
-                as_dict['regex_matched_group'] = match and match.group(1) or ''
-            fq_name_to_capture_instances[as_dict['fq_name']].append(as_dict)
-
-    for fq_name, capture_instances in fq_name_to_capture_instances.items():
-        if capture_instance_version_strategy == options.CAPTURE_INSTANCE_VERSION_STRATEGY_CREATE_DATE:
-            latest_instance = sorted(capture_instances, key=lambda x: x['create_date'])[-1]
-        elif capture_instance_version_strategy == options.CAPTURE_INSTANCE_VERSION_STRATEGY_REGEX:
-            latest_instance = sorted(capture_instances, key=lambda x: x['regex_matched_group'])[-1]
-        else:
-            raise Exception(f'Capture instance version strategy "{capture_instance_version_strategy}" not recognized.')
-        result[fq_name] = latest_instance
-
-    logger.debug('Latest capture instance names determined by "%s" strategy: %s', capture_instance_version_strategy,
-                 sorted([v['capture_instance_name'] for v in result.values()]))
-
-    return result
-
-
-def build_tracked_tables_from_cdc_metadata(
-    db_conn: pyodbc.Connection, clock_syncer: 'clock_sync.ClockSync', metrics_accumulator: 'accumulator.Accumulator',
-    topic_name_template: str, snapshot_table_whitelist_regex: str, snapshot_table_blacklist_regex: str,
-    truncate_fields: Dict[str, int], capture_instance_names: List[str], db_row_batch_size: int,
-    sql_query_processor: 'sql_query_subprocess.SQLQueryProcessor'
-) -> List[tracked_tables.TrackedTable]:
-    result: List[tracked_tables.TrackedTable] = []
-
-    truncate_fields = {k.lower(): v for k, v in truncate_fields.items()}
-
-    snapshot_table_whitelist_regex = snapshot_table_whitelist_regex and re.compile(
-        snapshot_table_whitelist_regex, re.IGNORECASE)
-    snapshot_table_blacklist_regex = snapshot_table_blacklist_regex and re.compile(
-        snapshot_table_blacklist_regex, re.IGNORECASE)
-
-    name_to_meta_fields: Dict[Tuple, List[Tuple]] = collections.defaultdict(list)
-
-    with db_conn.cursor() as cursor:
-        q, p = sql_queries.get_cdc_tracked_tables_metadata(capture_instance_names)
-        cursor.execute(q)
-        for row in cursor.fetchall():
-            # 0:4 gets schema name, table name, capture instance name, min captured LSN:
-            name_to_meta_fields[tuple(row[0:4])].append(row[4:])
-
-    for (schema_name, table_name, capture_instance_name, min_lsn), fields in name_to_meta_fields.items():
-        fq_table_name = f'{schema_name}.{table_name}'
-
-        can_snapshot = False
-
-        if snapshot_table_whitelist_regex and snapshot_table_whitelist_regex.match(fq_table_name):
-            logger.debug('Table %s matched snapshotting whitelist', fq_table_name)
-            can_snapshot = True
-
-        if snapshot_table_blacklist_regex and snapshot_table_blacklist_regex.match(fq_table_name):
-            logger.debug('Table %s matched snapshotting blacklist and will NOT be snapshotted', fq_table_name)
-            can_snapshot = False
-
-        topic_name = topic_name_template.format(
-            schema_name=schema_name, table_name=table_name, capture_instance_name=capture_instance_name)
-
-        tracked_table = tracked_tables.TrackedTable(
-            db_conn, clock_syncer, metrics_accumulator, sql_query_processor, schema_name, table_name,
-            capture_instance_name, topic_name, min_lsn, can_snapshot, db_row_batch_size)
-
-        for (change_table_ordinal, column_name, sql_type_name, primary_key_ordinal, decimal_precision,
-             decimal_scale, is_identity) in fields:
-            truncate_after = truncate_fields.get(f'{schema_name}.{table_name}.{column_name}'.lower())
-            tracked_table.append_field(tracked_tables.TrackedField(
-                column_name, sql_type_name, change_table_ordinal, primary_key_ordinal, decimal_precision,
-                decimal_scale, is_identity, truncate_after))
-
-        result.append(tracked_table)
-
-    return result
-
-
-def determine_start_points_and_finalize_tables(
-        kafka_client: kafka.KafkaClient, tables: Iterable[tracked_tables.TrackedTable],
-        progress_tracker: progress_tracking.ProgressTracker, lsn_gap_handling: str,
-        partition_count: int, replication_factor: int, extra_topic_config: Dict[str, Union[str, int]],
-        validation_mode: bool = False, redo_snapshot_for_new_instance: bool = False,
-        publish_duplicate_changes_from_new_instance: bool = False, report_progress_only: bool = False
-) -> None:
-    topic_names: List[str] = [t.topic_name for t in tables]
-
-    if validation_mode:
-        for table in tables:
-            table.snapshot_allowed = False
-            table.finalize_table(change_index.LOWEST_CHANGE_INDEX, {}, lsn_gap_handling)
-        return
-
-    if report_progress_only:
-        watermarks_by_topic = []
-    else:
-        watermarks_by_topic = kafka_client.get_topic_watermarks(topic_names)
-        first_check_watermarks_json = json.dumps(watermarks_by_topic)
-
-        logger.info('Pausing briefly to ensure target topics are not receiving new messages from elsewhere...')
-        time.sleep(constants.WATERMARK_STABILITY_CHECK_DELAY_SECS)
-
-        watermarks_by_topic = kafka_client.get_topic_watermarks(topic_names)
-        second_check_watermarks_json = json.dumps(watermarks_by_topic)
-
-        if first_check_watermarks_json != second_check_watermarks_json:
-            raise Exception(f'Watermarks for one or more target topics changed between successive checks. '
-                            f'Another process may be producing to the topic(s). Bailing.\nFirst check: '
-                            f'{first_check_watermarks_json}\nSecond check: {second_check_watermarks_json}')
-        logger.debug('Topic watermarks: %s', second_check_watermarks_json)
-
-    prior_progress_log_table_data = []
-    prior_progress = progress_tracker.get_prior_progress_or_create_progress_topic()
-
-    for table in tables:
-        snapshot_progress, changes_progress = None, None
-
-        if not report_progress_only and table.topic_name not in watermarks_by_topic:  # new topic; create it
-            if partition_count:
-                this_topic_partition_count = partition_count
-            else:
-                per_second = table.get_change_rows_per_second()
-                # one partition for each 10 rows/sec on average in the change table:
-                this_topic_partition_count = max(1, int(per_second / 10))
-                if this_topic_partition_count > 100:
-                    raise Exception(
-                        f'Automatic topic creation would create %{this_topic_partition_count} partitions for topic '
-                        f'{table.topic_name} based on a change table rows per second rate of {per_second}. This '
-                        f'seems excessive, so the program is exiting to prevent overwhelming your Kafka cluster. '
-                        f'Look at setting PARTITION_COUNT to take manual control of this.')
-            logger.info('Creating topic %s with %s partition(s)', table.topic_name, this_topic_partition_count)
-            kafka_client.create_topic(table.topic_name, this_topic_partition_count, replication_factor,
-                                      extra_topic_config)
-        else:
-            snapshot_progress: Union[None, progress_tracking.ProgressEntry] = prior_progress.get(
-                (table.topic_name, constants.SNAPSHOT_ROWS_KIND))
-            changes_progress: Union[None, progress_tracking.ProgressEntry] = prior_progress.get(
-                (table.topic_name, constants.CHANGE_ROWS_KIND))
-
-            fq_change_table_name = f'{constants.CDC_DB_SCHEMA_NAME}.{table.change_table_name}'
-            if snapshot_progress and (snapshot_progress.change_table_name != fq_change_table_name):
-                logger.info('Found prior snapshot progress into topic %s, but from an older capture instance '
-                            '(prior progress instance: %s; current instance: %s)', table.topic_name,
-                            snapshot_progress.change_table_name, fq_change_table_name)
-                if redo_snapshot_for_new_instance:
-                    if ddl_change_requires_new_snapshot(snapshot_progress.change_table_name, fq_change_table_name):
-                        logger.info('Will start new snapshot.')
-                    else:
-                        logger.info('New snapshot does not appear to be required.')
-                    snapshot_progress = None
-                else:
-                    logger.info('Will NOT start new snapshot.')
-
-            if changes_progress and (changes_progress.change_table_name != fq_change_table_name):
-                logger.info('Found prior change data progress into topic %s, but from an older capture instance '
-                            '(prior progress instance: %s; current instance: %s)', table.topic_name,
-                            changes_progress.change_table_name, fq_change_table_name)
-                if publish_duplicate_changes_from_new_instance:
-                    logger.info('Will republish any change rows duplicated by the new capture instance.')
-                    changes_progress = None
-                else:
-                    logger.info('Will NOT republish any change rows duplicated by the new capture instance.')
-
-        starting_change_index = (changes_progress and changes_progress.change_index) \
-            or change_index.LOWEST_CHANGE_INDEX
-        starting_snapshot_index = snapshot_progress and snapshot_progress.snapshot_index
-
-        if report_progress_only:  # elide schema registration
-            table.finalize_table(starting_change_index, starting_snapshot_index, options.LSN_GAP_HANDLING_IGNORE)
-        else:
-            table.finalize_table(starting_change_index, starting_snapshot_index, lsn_gap_handling,
-                                 kafka_client.register_schemas, progress_tracker.reset_progress,
-                                 progress_tracker.record_snapshot_completion)
-
-        if not table.snapshot_allowed:
-            snapshot_state = '<not doing>'
-        elif table.snapshot_complete:
-            snapshot_state = '<already complete>'
-        elif table.last_read_key_for_snapshot_display is None:
-            snapshot_state = '<from beginning>'
-        else:
-            snapshot_state = f'From {table.last_read_key_for_snapshot_display}'
-
-        prior_progress_log_table_data.append((table.capture_instance_name, table.fq_name, table.topic_name,
-                                              starting_change_index or '<from beginning>', snapshot_state))
-
-    headers = ('Capture instance name', 'Source table name', 'Topic name', 'From change table index', 'Snapshots')
-    table = tabulate(sorted(prior_progress_log_table_data), headers, tablefmt='fancy_grid')
-
-    logger.info('Processing will proceed from the following positions based on the last message from each topic '
-                'and/or the snapshot progress committed in Kafka (NB: snapshot reads occur BACKWARDS from high to '
-                'low key column values):\n%s\n%s tables total.', table, len(prior_progress_log_table_data))
-
-
-# noinspection PyUnusedLocal
-def ddl_change_requires_new_snapshot(old_ci_name: str, new_ci_name: str) -> bool:
-    return True  # TODO: this is a stub for a next-up planned feature
-    
-
 def should_terminate_due_to_capture_instance_change(
         db_conn: pyodbc.Connection, progress_tracker: progress_tracking.ProgressTracker,
         capture_instance_version_strategy: str, capture_instance_version_regex: str,
@@ -571,8 +335,8 @@ def should_terminate_due_to_capture_instance_change(
             new_ci_min_index = change_index.ChangeIndex(new_ci['start_lsn'], b'\x00' * 10, 0)
             if current_idx < new_ci_min_index:
                 with db_conn.cursor() as cursor:
-                    ci_table_name = f"[{constants.CDC_DB_SCHEMA_NAME}].[{current_ci['capture_instance_name']}_CT]"
-                    cursor.execute(f"SELECT TOP 1 1 FROM {ci_table_name} WITH (NOLOCK)")
+                    change_table_name = helpers.get_fq_change_table_name(current_ci['capture_instance_name'])
+                    cursor.execute(f"SELECT TOP 1 1 FROM {change_table_name} WITH (NOLOCK)")
                     has_rows = cursor.fetchval() is not None
                 if has_rows:
                     logger.info('Progress against existing capture instance ("%s") for table "%s" has reached index '

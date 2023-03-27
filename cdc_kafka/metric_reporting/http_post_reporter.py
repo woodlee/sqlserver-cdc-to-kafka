@@ -34,8 +34,8 @@ class HttpPostReporter(reporter_base.ReporterBase):
         else:
             body = json.dumps(metrics_dict, default=HttpPostReporter.json_serialize_datetimes)
 
-        resp = requests.post(self._url, data=body, headers=self._headers, timeout=10.0)
         try:
+            resp = requests.post(self._url, data=body, headers=self._headers, timeout=10.0)
             resp.raise_for_status()
             logger.debug('Posted metrics to %s with code %s and response: %s', self._url, resp.status_code, resp.text)
         except requests.exceptions.RequestException as e:
