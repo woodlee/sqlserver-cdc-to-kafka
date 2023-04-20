@@ -10,6 +10,8 @@ from typing import Any, Tuple, Dict, Optional, Iterable, NamedTuple
 
 import pyodbc
 
+from . import constants
+
 logger = logging.getLogger(__name__)
 
 
@@ -43,6 +45,10 @@ class SQLQueryProcessor(object):
         self._output_queues: Dict[str, 'collections.deque[SQLQueryResult]'] = {}
         self._subprocess: mp.Process = mp.Process(target=query_processor, args=(
             odbc_conn_string, self._stop_event, self._subprocess_request_queue, self._subprocess_result_queue))
+        self._results_wait_time: datetime.timedelta = datetime.timedelta(
+            seconds=constants.SQL_QUERY_RETRIES *
+            (constants.SQL_QUERY_TIMEOUT_SECONDS + constants.SQL_QUERY_INTER_RETRY_INTERVAL_SECONDS)
+        )
         self._ended: bool = False
 
         SQLQueryProcessor._instance = self
@@ -60,18 +66,18 @@ class SQLQueryProcessor(object):
     def _check_if_ended(self) -> bool:
         exitcode = self._subprocess.exitcode
         if (self._stop_event.is_set() or exitcode is not None) and not self._ended:
+            self._ended = True
             if exitcode in (None, 0):
                 pass
             elif exitcode == -9:
                 logger.error('SQL query subprocess was killed by the OS! May need more memory...')
             else:
                 logger.error('SQL query subprocess exited with nonzero status: %s', exitcode)
-            logger.info("Stopping SQL query subprocess...")
-            self._ended = True
             self._stop_event.set()
             if self._subprocess.is_alive():
                 self._subprocess.join(timeout=3)
             if self._subprocess.is_alive():
+                logger.info('Forcing termination of SQL query subprocess.')
                 self._subprocess.terminate()
                 time.sleep(1)
             self._subprocess.close()
@@ -89,22 +95,20 @@ class SQLQueryProcessor(object):
             self._output_queues[request.queue_name] = collections.deque()
         self._subprocess_request_queue.put_nowait(request)
 
-    def get_result(self, queue_name: str, timeout: datetime.timedelta) -> Optional['SQLQueryResult']:
-        if self._check_if_ended():
-            return
+    def get_result(self, queue_name: str) -> Optional['SQLQueryResult']:
         if len(self._output_queues[queue_name]):
             return self._output_queues[queue_name].popleft()
-        deadline = datetime.datetime.utcnow() + timeout
-        q_timeout_remaining = timeout.total_seconds()
-        try:
-            while q_timeout_remaining >= 0:
-                res = self._subprocess_result_queue.get(timeout=q_timeout_remaining)
+        deadline = datetime.datetime.utcnow() + self._results_wait_time
+        while datetime.datetime.utcnow() < deadline:
+            try:
+                res = self._subprocess_result_queue.get(timeout=0.1)
                 if res.queue_name == queue_name:
                     return res
                 self._output_queues[res.queue_name].append(res)
-                q_timeout_remaining = (deadline - datetime.datetime.utcnow()).total_seconds()
-        except queue.Empty:
-            return None
+            except queue.Empty:
+                pass
+            if self._check_if_ended():
+                return
 
 
 # This runs in the separate process, and therefore uses its own DB connection:
@@ -114,8 +118,7 @@ def query_processor(odbc_conn_string: str, stop_event: mp.Event, request_queue: 
         with get_db_conn(odbc_conn_string) as db_conn:
             while not stop_event.is_set():
                 try:
-                    # 1-second timeout inside a loop so that we can check the stop_event that often:
-                    request = request_queue.get(block=True, timeout=1)
+                    request = request_queue.get(block=True, timeout=0.5)
                 except queue.Empty:
                     continue
 
@@ -123,21 +126,34 @@ def query_processor(odbc_conn_string: str, stop_event: mp.Event, request_queue: 
                 with db_conn.cursor() as cursor:
                     if request.query_param_types is not None:
                         cursor.setinputsizes(request.query_param_types)
-                    if request.query_params is None:
-                        cursor.execute(request.query_text)
-                    else:
-                        cursor.execute(request.query_text, request.query_params)
+                    retry_count = 0
+                    while True:
+                        try:
+                            if request.query_params is None:
+                                cursor.execute(request.query_text)
+                            else:
+                                cursor.execute(request.query_text, request.query_params)
+                            break
+                        except pyodbc.OperationalError as exc:
+                            # HYT00 is the error code for "Timeout expired"
+                            if exc.args[0].startswith('HYT00') and retry_count < constants.SQL_QUERY_RETRIES:
+                                retry_count += 1
+                                logger.warning('SQL query timed out, retrying...')
+                                time.sleep(constants.SQL_QUERY_INTER_RETRY_INTERVAL_SECONDS)
+                                continue
+                            raise exc
                     query_executed_utc = datetime.datetime.utcnow()
                     result_rows = cursor.fetchall()
                 query_took_sec = (time.perf_counter() - start_time)
                 result_queue.put_nowait(SQLQueryResult(request.queue_name, request.query_metadata_to_reflect,
                                                        query_executed_utc, query_took_sec, result_rows,
                                                        request.query_params))
-    except KeyboardInterrupt:
-        logger.info('SQL query subprocess exiting due to external interrupt.')
+    except (KeyboardInterrupt, pyodbc.OperationalError) as exc:
+        # 08S01 is the error code for "Communication link failure" which may be raised in response to KeyboardInterrupt
+        if type(exc) == pyodbc.OperationalError and not exc.args[0].startswith('08S01'):
+            raise exc
     except Exception as exc:
         logger.exception('SQL query subprocess raised an exception and is terminating', exc_info=exc)
-        raise
     finally:
         stop_event.set()
 
@@ -149,11 +165,11 @@ def get_db_conn(odbc_conn_string: str) -> pyodbc.Connection:
     # THIS ASSUMES that you are using the exact keywords 'SERVER' and 'Failover_Partner' in your connection string!
     try:
         conn = pyodbc.connect(odbc_conn_string)
-    except pyodbc.ProgrammingError as e:
+    except pyodbc.DatabaseError as e:
         server = re.match(r".*SERVER=(?P<hostname>.*?);", odbc_conn_string)
         failover_partner = re.match(r".*Failover_Partner=(?P<hostname>.*?);", odbc_conn_string)
 
-        if failover_partner is None or server is None or e.args[0] != '42000':
+        if failover_partner is None or server is None or e.args[0] not in ('42000', 'HYT00'):
             raise
 
         failover_partner = failover_partner.groups('hostname')[0]
@@ -183,5 +199,6 @@ def get_db_conn(odbc_conn_string: str) -> pyodbc.Connection:
     conn.add_output_converter(pyodbc.SQL_WVARCHAR, decode_truncated_utf16)
     conn.add_output_converter(pyodbc.SQL_WCHAR, decode_truncated_utf16)
     conn.add_output_converter(-155, decode_datetimeoffset)
+    conn.timeout = constants.SQL_QUERY_TIMEOUT_SECONDS
 
     return conn

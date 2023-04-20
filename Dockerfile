@@ -1,4 +1,7 @@
-FROM python:3.11-bullseye
+# WARNING: This codebase may have trouble running on Python versions higher than 3.8, because of new behavior introduced
+# by the "fix" in https://github.com/python/cpython/pull/31913. Attempts to run on later Python versions may suffer
+# from unpredictable hangs on process exit when the SQLQueryProcessor tries to close/join its multiprocessing.Queues.
+FROM python:3.8-bullseye
 
 WORKDIR /srv
 

@@ -20,10 +20,12 @@ NEW_SNAPSHOT = object()
 
 class TrackedField(object):
     def __init__(self, name: str, sql_type_name: str, change_table_ordinal: int, primary_key_ordinal: int,
-                 decimal_precision: int, decimal_scale: int, truncate_after: Optional[int] = None) -> None:
+                 decimal_precision: int, decimal_scale: int, is_identity: bool,
+                 truncate_after: Optional[int] = None) -> None:
         self.name: str = name
         self.sql_type_name: str = sql_type_name
         self.change_table_ordinal: int = change_table_ordinal
+        self.is_identity: bool = is_identity
         self.primary_key_ordinal: int = primary_key_ordinal
         self.avro_schema: Dict[str, Any] = avro_from_sql.avro_schema_from_sql_type(
             name, sql_type_name, decimal_precision, decimal_scale, False)
@@ -47,7 +49,8 @@ class TrackedTable(object):
     def __init__(self, db_conn: pyodbc.Connection, clock_syncer: 'clock_sync.ClockSync',
                  metrics_accumulator: 'accumulator.Accumulator',
                  sql_query_processor: sql_query_subprocess.SQLQueryProcessor, schema_name: str, table_name: str,
-                 capture_instance_name: str, topic_name: str, min_lsn: bytes, snapshot_allowed: bool):
+                 capture_instance_name: str, topic_name: str, min_lsn: bytes, snapshot_allowed: bool,
+                 db_row_batch_size: int) -> None:
         self._db_conn: pyodbc.Connection = db_conn
         self._clock_syncer: clock_sync.ClockSync = clock_syncer
         self._metrics_accumulator: 'accumulator.Accumulator' = metrics_accumulator
@@ -60,6 +63,7 @@ class TrackedTable(object):
         self.snapshot_allowed: bool = snapshot_allowed
         self.fq_name: str = f'{schema_name}.{table_name}'
         self.change_table_name: str = f'{capture_instance_name}_CT'
+        self.db_row_batch_size: int = db_row_batch_size
 
         # Most of the below properties are not set until sometime after `finalize_table` is called:
 
@@ -169,7 +173,7 @@ class TrackedTable(object):
         if not key_fields:
             self._has_pk = False
             key_fields = [TrackedField(
-                constants.MESSAGE_KEY_FIELD_NAME_WHEN_PK_ABSENT, 'varchar', 0, 0, 0, 0)]
+                constants.MESSAGE_KEY_FIELD_NAME_WHEN_PK_ABSENT, 'varchar', 0, 0, 0, 0, False)]
         else:
             self._has_pk = True
 
@@ -216,7 +220,7 @@ class TrackedTable(object):
                             f'were: {change_table_clustered_idx_cols}')
 
         self._change_rows_query, self._change_rows_query_param_types = sql_queries.get_change_rows(
-            self.change_table_name, self._value_field_names, change_table_clustered_idx_cols)
+            self.db_row_batch_size, self.change_table_name, self._value_field_names, change_table_clustered_idx_cols)
 
         if not self.snapshot_allowed:
             self.snapshot_complete = True
@@ -231,8 +235,8 @@ class TrackedTable(object):
                                ', '.join(columns_no_longer_on_base_table))
             if self._has_pk:
                 self._snapshot_rows_query, self._snapshot_rows_query_param_types = sql_queries.get_snapshot_rows(
-                    self.schema_name, self.table_name, self._value_field_names, columns_no_longer_on_base_table,
-                    self._key_field_names, False, self._odbc_columns)
+                    self.db_row_batch_size, self.schema_name, self.table_name, self._value_field_names,
+                    columns_no_longer_on_base_table, self._key_field_names, False, self._odbc_columns)
 
                 if start_from_key_for_snapshot == constants.SNAPSHOT_COMPLETION_SENTINEL:
                     self.snapshot_complete = True
@@ -254,7 +258,7 @@ class TrackedTable(object):
                                     ', '.join([f'{k}: {v}' for k, v in zip(self._key_field_names, key_max)]))
 
                         self._initial_snapshot_rows_query, _ = sql_queries.get_snapshot_rows(
-                            self.schema_name, self.table_name, self._value_field_names,
+                            self.db_row_batch_size, self.schema_name, self.table_name, self._value_field_names,
                             columns_no_longer_on_base_table, self._key_field_names, True, self._odbc_columns)
 
                         self._last_read_key_for_snapshot = NEW_SNAPSHOT
@@ -298,7 +302,7 @@ class TrackedTable(object):
 
     def retrieve_snapshot_query_results(self) -> Generator[parsed_row.ParsedRow, None, None]:
         if self._snapshot_query_pending:
-            res = self._sql_query_processor.get_result(self._snapshot_query_queue_name, constants.SQL_QUERY_TIMEOUT)
+            res = self._sql_query_processor.get_result(self._snapshot_query_queue_name)
             if res:
                 self._snapshot_query_pending = False
                 row_ctr = 0
@@ -325,7 +329,7 @@ class TrackedTable(object):
 
     def retrieve_changes_query_results(self) -> Generator[parsed_row.ParsedRow, None, None]:
         if self._changes_query_pending:
-            res = self._sql_query_processor.get_result(self._changes_query_queue_name, constants.SQL_QUERY_TIMEOUT)
+            res = self._sql_query_processor.get_result(self._changes_query_queue_name)
             if res:
                 self._changes_query_pending = False
                 row_ctr = 0
@@ -341,7 +345,7 @@ class TrackedTable(object):
                              constants.CHANGE_ROWS_KIND.ljust(14),
                              str(row_ctr).rjust(5), str(int(res.query_took_sec * 1000)).rjust(5),
                              self.fq_name, f'0x{lsn[:8]} {lsn[8:16]} {lsn[16:]}')
-                if row_ctr == constants.DB_ROW_BATCH_SIZE:
+                if row_ctr == self.db_row_batch_size:
                     self.change_reads_are_lagging = True
                     self.max_polled_change_index = last_row_read.change_idx
                 else:

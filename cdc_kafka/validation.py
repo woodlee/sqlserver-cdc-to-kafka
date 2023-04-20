@@ -8,10 +8,10 @@ from uuid import UUID
 
 import confluent_kafka
 
-from . import constants, change_index, avro_from_sql
+from . import constants, change_index, avro_from_sql, kafka, helpers
 
 if TYPE_CHECKING:
-    from . import tracked_tables, progress_tracking, kafka
+    from . import tracked_tables, progress_tracking
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,7 @@ class TableMessagesSummary(object):
         self.keys_seen_in_changes: Set[Tuple] = set()
         self.min_change_index_seen: Optional[change_index.ChangeIndex] = None
         self.max_change_index_seen: Optional[change_index.ChangeIndex] = None
+        self.max_change_index_seen_coordinates: Optional[str] = None
         self.latest_change_seen: Optional[datetime.datetime] = None
         self.change_index_order_regressions_count: int = 0
         self.min_snapshot_key_seen: Optional[Tuple] = None
@@ -78,6 +79,7 @@ class TableMessagesSummary(object):
         self._last_processed_offset_by_partition: Dict[int, int] = {}
         self._last_change_index_seen_for_partition: Dict[int, change_index.ChangeIndex] = {}
         self._last_snapshot_key_seen_for_partition: Dict[int, Tuple] = {}
+        self._last_snapshot_coordinates_seen_for_partition: Dict[int, str] = {}
 
     def __repr__(self) -> str:
         return json.dumps({
@@ -112,12 +114,15 @@ class TableMessagesSummary(object):
         self.missing_offsets += (message.offset() - self._last_processed_offset_by_partition[message.partition()] - 1)
         self._last_processed_offset_by_partition[message.partition()] = message.offset()
 
+        # noinspection PyArgumentList
         if message.value() is None:
             self.tombstone_count += 1
             return
 
+        # noinspection PyTypeChecker,PyArgumentList
         message_body = dict(message.value())
         key = extract_key_tuple(self.table, message_body)
+        coordinates = helpers.format_coordinates(message)
         operation_name = message_body[constants.OPERATION_NAME]
 
         if operation_name == constants.SNAPSHOT_OPERATION_NAME:
@@ -130,12 +135,23 @@ class TableMessagesSummary(object):
             if message.partition() in self._last_snapshot_key_seen_for_partition and \
                     self._last_snapshot_key_seen_for_partition[message.partition()] < key:
                 self.snapshot_key_order_regressions_count += 1
+                logger.debug(
+                    "Snapshot key order regression for %s: value %s at coordinates %s --> value %s at coordinates %s",
+                    self.table.fq_name,
+                    self._last_snapshot_key_seen_for_partition[message.partition()],
+                    self._last_snapshot_coordinates_seen_for_partition[message.partition()],
+                    key,
+                    coordinates
+                )
+            self._last_snapshot_coordinates_seen_for_partition[message.partition()] = coordinates
             self._last_snapshot_key_seen_for_partition[message.partition()] = key
             return
 
         if operation_name == constants.DELETE_OPERATION_NAME:
             self.all_deletes_in_topic += 1
             self.deleted_keys.add(key)
+
+        self.keys_seen_in_changes.add(key)
 
         msg_change_index = change_index.ChangeIndex.from_avro_ready_dict(message_body)
         if msg_change_index.lsn < self.table.min_lsn:
@@ -153,11 +169,11 @@ class TableMessagesSummary(object):
             return
 
         change_idx = change_index.ChangeIndex.from_avro_ready_dict(message_body)
-        self.keys_seen_in_changes.add(key)
         if self.min_change_index_seen is None or change_idx < self.min_change_index_seen:
             self.min_change_index_seen = change_idx
         if self.max_change_index_seen is None or change_idx > self.max_change_index_seen:
             self.max_change_index_seen = change_idx
+            self.max_change_index_seen_coordinates = helpers.format_coordinates(message)
         if message.partition() in self._last_change_index_seen_for_partition and \
                 self._last_change_index_seen_for_partition[message.partition()] > change_idx:
             self.change_index_order_regressions_count += 1
@@ -178,6 +194,10 @@ class Validator(object):
         self._unified_topic_to_tables_map: Dict[str, List['tracked_tables.TrackedTable']] = unified_topic_to_tables_map
 
     def run(self) -> None:
+        watermarks_by_topic = self._kafka_client.get_topic_watermarks(
+            [t.topic_name for t in self._tables_by_name.values()] +
+            [t for t in self._unified_topic_to_tables_map.keys()]
+        )
         progress = self._progress_tracker.get_prior_progress_or_create_progress_topic()
         summaries_by_unified_topic: Dict[str, Dict[str, Any]] = {}
         summaries_by_single_table: Dict[str, TableMessagesSummary] = {}
@@ -189,17 +209,25 @@ class Validator(object):
                              'topic %s.', unified_topic_name)
                 continue
             summaries_by_unified_topic[unified_topic_name] = self._process_unified_topic(
-                unified_topic_name, unified_topic_tables)
+                unified_topic_name, unified_topic_tables, watermarks_by_topic[unified_topic_name])
 
+        total_tables = len(self._tables_by_name)
         for table_name, table in self._tables_by_name.items():
-            summaries_by_single_table[table_name] = self._process_single_table_topic(table)
+            logger.info('Processing table %s (%d/%d)', table_name, len(summaries_by_single_table) + 1, total_tables)
+            summaries_by_single_table[table_name] = self._process_single_table_topic(
+                table, watermarks_by_topic[table.topic_name])
 
         for table_name, summary in summaries_by_single_table.items():
             table = self._tables_by_name[table_name]
-            failures, warnings = [], []
+            failures, warnings, infos = [], [], []
 
             snap_progress = progress.get((table.topic_name, constants.SNAPSHOT_ROWS_KIND))
-            snap_progress = snap_progress and extract_key_tuple(table, snap_progress.snapshot_index)
+
+            if snap_progress:
+                if snap_progress.snapshot_index == constants.SNAPSHOT_COMPLETION_SENTINEL:
+                    snap_progress = constants.SNAPSHOT_COMPLETION_SENTINEL
+                else:
+                    snap_progress = extract_key_tuple(table, snap_progress.snapshot_index)
             changes_progress = progress.get((table.topic_name, constants.CHANGE_ROWS_KIND))
             changes_progress_index = changes_progress and changes_progress.change_index
 
@@ -222,45 +250,50 @@ class Validator(object):
                     else:
                         high_raw_key.append(k)
                 db_source_row_counts = table.get_source_table_count(tuple(low_raw_key), tuple(high_raw_key))
-                probably_monotonic = len(table.key_fields) == 1 and table.key_fields[0].sql_type_name in (
-                    'int', 'bigint')
-                if db_source_row_counts != topic_snapshot_key_count:
-                    if probably_monotonic:
-                        failures.append(f'DB source table has {db_source_row_counts} rows between keys {low_raw_key} '
-                                        f'and {high_raw_key}, while Kafka topic contains {topic_snapshot_key_count} '
-                                        f'unique, undeleted snapshot entry keys.')
-                    else:
-                        warnings.append(f'DB source table has {db_source_row_counts} rows between keys {low_raw_key} '
-                                        f'and {high_raw_key}, while Kafka topic contains {topic_snapshot_key_count} '
-                                        f'unique snapshot entry keys. HOWEVER, this table likely has a primary key '
-                                        f'that is not monotonically increasing so this is probably OK.')
+                change_keys_in_snapshot_range = {
+                    x for x in summary.keys_seen_in_changes
+                    if summary.min_snapshot_key_seen <= x <= summary.max_snapshot_key_seen
+                }
+                deleted_keys_in_snapshot_range = {
+                    x for x in summary.deleted_keys
+                    if summary.min_snapshot_key_seen <= x <= summary.max_snapshot_key_seen
+                }
+                expected = len(summary.keys_seen_in_snapshots.union(change_keys_in_snapshot_range) -
+                               deleted_keys_in_snapshot_range)
+                if db_source_row_counts != expected:
+                    failures.append(f'DB source table has {db_source_row_counts} rows between keys {low_raw_key} '
+                                    f'and {high_raw_key}, while {expected} messages were expected for that range '
+                                    f'in the Kafka topic.')
                 if len(summary.keys_seen_in_snapshots) != summary.snapshot_count:
                     warnings.append(
                         f'Count of unique keys in snapshot records ({len(summary.keys_seen_in_snapshots)}) not '
                         f'equal to total number of snapshot records ({summary.snapshot_count}). (This may be '
                         f'okay if more than one snapshot has been taken.)')
             else:
-                warnings.append(f'Skipping snapshot evaluations for sample lacking snapshot entries.')
+                infos.append(f'Skipping snapshot evaluations for sample lacking snapshot entries.')
 
             if summary.latest_change_seen is None:
-                warnings.append('No change entries found!')
+                if db_delete_rows or db_insert_rows or db_update_rows:
+                    failures.append('No change entries found!')
             elif (datetime.datetime.utcnow() - summary.latest_change_seen) > datetime.timedelta(days=1):
-                warnings.append(f'Last change entry seen in Kafka was dated {summary.latest_change_seen}.')
+                infos.append(f'Last change entry seen in Kafka was dated {summary.latest_change_seen}.')
 
             if changes_progress is None:
                 failures.append(f'No changes progress found. Last key found in topic was '
-                                f'{summary.max_change_index_seen}')
+                                f'{summary.max_change_index_seen} @ {summary.max_change_index_seen_coordinates}')
             elif changes_progress.is_heartbeat:
                 if summary.max_change_index_seen and summary.max_change_index_seen > changes_progress_index:
                     failures.append(f'Changes progress mismatch. Last recorded heartbeat progress was '
                                     f'{changes_progress_index} but last key found in topic was '
-                                    f'{summary.max_change_index_seen}')
+                                    f'{summary.max_change_index_seen} @ {summary.max_change_index_seen_coordinates}')
             else:
                 if summary.max_change_index_seen != changes_progress_index:
                     failures.append(f'Changes progress mismatch. Recorded progress index was {changes_progress_index} '
-                                    f'but last key found in topic was {summary.max_change_index_seen}')
+                                    f'but last key found in topic was {summary.max_change_index_seen} @ '
+                                    f'{summary.max_change_index_seen_coordinates}')
 
-            if summary.min_snapshot_key_seen != snap_progress:
+            if snap_progress != constants.SNAPSHOT_COMPLETION_SENTINEL and \
+                    summary.min_snapshot_key_seen != snap_progress:
                 failures.append(f'Snapshot progress mismatch. Recorded progress key was {snap_progress} but last key '
                                 f'found in topic was {summary.min_snapshot_key_seen}')
 
@@ -278,9 +311,9 @@ class Validator(object):
             if summary.unknown_operation_count:
                 failures.append(f'Topic contained {summary.unknown_operation_count} messages with an unknown operation '
                                 f'type.')
-            if summary.tombstone_count and summary.tombstone_count != summary.all_deletes_in_topic:
-                failures.append(f'Tombstone record count in topic ({summary.tombstone_count}) does not equal number of '
-                                f'deletes ({summary.all_deletes_in_topic}).')
+            if summary.tombstone_count and summary.tombstone_count < summary.all_deletes_in_topic:
+                failures.append(f'Tombstone record count in topic ({summary.tombstone_count}) is less than the number '
+                                f'of deletes ({summary.all_deletes_in_topic}).')
             if summary.delete_count != db_delete_rows:
                 failures.append(f'Found {db_delete_rows} delete entries in DB change table but {summary.delete_count} '
                                 f'in Kafka topic')
@@ -292,13 +325,16 @@ class Validator(object):
                                 f'in Kafka topic')
 
             print(f'\nSummary for table {table_name} in single-table topic {table.topic_name}:')
+            for info in infos:
+                print(f'    INFO: {info} ({table_name})')
             if not (warnings or failures):
-                print('    OK: No problems!')
+                print(f'    OK: No problems! ({table_name})')
             else:
                 for warning in warnings:
-                    print(f'    WARN: {warning}')
+                    print(f'    WARN: {warning} ({table_name})')
                 for failure in failures:
-                    print(f'    FAIL: {failure}')
+                    print(f'    FAIL: {failure} ({table_name})')
+
             if failures:
                 db_data = json.dumps({
                     'db_source_rows': db_source_row_counts,
@@ -339,19 +375,19 @@ class Validator(object):
             for failure in failures:
                 print(f'    FAIL: {failure}')
 
-    def _process_single_table_topic(self, table: 'tracked_tables.TrackedTable') -> TableMessagesSummary:
+    def _process_single_table_topic(self, table: 'tracked_tables.TrackedTable',
+                                    captured_watermarks: List[Tuple[int, int]]) -> TableMessagesSummary:
         table_summary = TableMessagesSummary(table)
-        logger.info('Validation: consuming records from topic %s...', table.topic_name)
         msg_count = 0
-        for msg in self._kafka_client.consume_all(table.topic_name, constants.VALIDATION_MAXIMUM_SAMPLE_SIZE_PER_TOPIC):
+        for msg in self._kafka_client.consume_bounded(
+                table.topic_name, constants.VALIDATION_MAXIMUM_SAMPLE_SIZE_PER_TOPIC, captured_watermarks):
             msg_count += 1
             table_summary.process_message(msg)
         logger.info('Validation: consumed %s records from topic %s', msg_count, table.topic_name)
-        print(table_summary)
         return table_summary
 
-    def _process_unified_topic(self, topic_name: str, expected_tables: Iterable['tracked_tables.TrackedTable']) -> \
-            Dict[str, Any]:
+    def _process_unified_topic(self, topic_name: str, expected_tables: Iterable['tracked_tables.TrackedTable'],
+                               captured_watermarks: List[Tuple[int, int]]) -> Dict[str, Any]:
         logger.info('Validation: consuming records from unified topic %s', topic_name)
 
         table_summaries: Dict[str, TableMessagesSummary] = {t.fq_name: TableMessagesSummary(t) for t in expected_tables}
@@ -366,13 +402,16 @@ class Validator(object):
         prior_read_partition: int = 0
         prior_read_offset: int = 0
 
-        for msg in self._kafka_client.consume_all(topic_name, constants.VALIDATION_MAXIMUM_SAMPLE_SIZE_PER_TOPIC):
+        for msg in self._kafka_client.consume_bounded(
+                topic_name, constants.VALIDATION_MAXIMUM_SAMPLE_SIZE_PER_TOPIC, captured_watermarks):
             total_messages_read += 1
 
+            # noinspection PyArgumentList
             if msg.value() is None:
                 tombstones_count += 1
                 continue
 
+            # noinspection PyTypeChecker,PyArgumentList
             msg_val = dict(msg.value())
             msg_table = msg_val.pop('__avro_schema_name').replace('_cdc__value', '').replace('_', '.', 1)
             msg_change_index = change_index.ChangeIndex.from_avro_ready_dict(msg_val)

@@ -238,6 +238,11 @@ def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List]:
                         "then exits without changing any state. Can be handy for validating other configuration such "
                         "as the regexes used to control which tables are followed and/or snapshotted.")
 
+    p.add_argument('--db-row-batch-size',
+                   type=int,
+                   default=os.environ.get('DB_ROW_BATCH_SIZE', 2000),
+                   help="Maximum number of rows to retrieve in a single change data or snapshot query. Default 2000.")
+
     opts = p.parse_args()
 
     reporters = []

@@ -38,6 +38,7 @@ SELECT
     , ic.index_ordinal AS primary_key_ordinal
     , sc.precision AS decimal_precision
     , sc.scale AS decimal_scale
+    , sc.is_identity AS is_identity
 FROM
     [{constants.CDC_DB_SCHEMA_NAME}].[change_tables] AS ct
     INNER JOIN [{constants.CDC_DB_SCHEMA_NAME}].[captured_columns] AS cc ON (ct.object_id = cc.object_id)
@@ -147,7 +148,7 @@ def get_max_lsn() -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
     return 'SELECT sys.fn_cdc_get_max_lsn()', []
 
 
-def get_change_rows(change_table_name: str, field_names: Iterable[str],
+def get_change_rows(batch_size: int, change_table_name: str, field_names: Iterable[str],
                     ct_index_cols: Iterable[str]) -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
     # You may feel tempted to change or simplify this query. TREAD CAREFULLY. There was a lot of iterating here to
     # craft something that would not induce SQL Server to resort to a full index scan. If you change it, run some
@@ -177,7 +178,7 @@ WITH ct AS (
     FROM [{constants.CDC_DB_SCHEMA_NAME}].[{change_table_name}] AS ct WITH (NOLOCK)
     WHERE ct.__$start_lsn > @LSN AND ct.__$start_lsn <= @MAX_LSN
 )
-SELECT TOP ({constants.DB_ROW_BATCH_SIZE})
+SELECT TOP ({batch_size})
     ct.__$operation AS {constants.OPERATION_NAME}
     , ltm.tran_end_time AS {constants.EVENT_TIME_NAME}
     , ct.__$start_lsn AS {constants.LSN_NAME}
@@ -192,9 +193,9 @@ ORDER BY {order_spec}
 
 
 def get_snapshot_rows(
-        schema_name: str, table_name: str, field_names: Collection[str], removed_field_names: Collection[str],
-        pk_cols: Collection[str], first_read: bool, odbc_columns: Collection[Tuple]) \
-        -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
+        batch_size: int, schema_name: str, table_name: str, field_names: Collection[str],
+        removed_field_names: Collection[str], pk_cols: Collection[str], first_read: bool,
+        odbc_columns: Collection[Tuple]) -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
     select_cols = []
     for fn in field_names:
         if fn in removed_field_names:
@@ -217,7 +218,7 @@ DECLARE
     {declarations}
 ;
 
-SELECT TOP ({constants.DB_ROW_BATCH_SIZE})
+SELECT TOP ({batch_size})
     {constants.SNAPSHOT_OPERATION_ID} AS {constants.OPERATION_NAME}
     , GETDATE() AS {constants.EVENT_TIME_NAME}
     , NULL AS {constants.LSN_NAME}
