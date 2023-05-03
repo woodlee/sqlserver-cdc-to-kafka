@@ -197,8 +197,7 @@ class KafkaClient(object):
         self._metrics_accumulator.register_kafka_commit(elapsed)
         return flushed_all
 
-    def consume_all(self, topic_name: str, approx_max_recs: Optional[int] = None) -> \
-            Generator[confluent_kafka.Message, None, None]:
+    def consume_all(self, topic_name: str) -> Generator[confluent_kafka.Message, None, None]:
         part_count = self.get_topic_partition_count(topic_name)
 
         if part_count is None:
@@ -206,15 +205,8 @@ class KafkaClient(object):
                 'consume_all: Requested topic %s does not appear to exist. Returning nothing.', topic_name)
             return
 
-        if approx_max_recs is None:
-            self._consumer.assign([confluent_kafka.TopicPartition(topic_name, part_id, confluent_kafka.OFFSET_BEGINNING)
-                                   for part_id in range(part_count)])
-        else:
-            rewind_per_part = int(approx_max_recs / part_count)
-            watermarks = self.get_topic_watermarks([topic_name])[topic_name]
-            offsets = [max(lo, hi - rewind_per_part) for lo, hi in watermarks]
-            self._consumer.assign([confluent_kafka.TopicPartition(topic_name, part_id, offset)
-                                   for part_id, offset in enumerate(offsets)])
+        self._consumer.assign([confluent_kafka.TopicPartition(topic_name, part_id, confluent_kafka.OFFSET_BEGINNING)
+                               for part_id in range(part_count)])
 
         finished_parts = [False] * part_count
         ctr = 0
@@ -223,7 +215,7 @@ class KafkaClient(object):
             msg = self._consumer.poll(constants.KAFKA_REQUEST_TIMEOUT_SECS)
 
             if msg is None:
-                time.sleep(1)
+                time.sleep(0.2)
                 continue
             if msg.error():
                 # noinspection PyProtectedMember
@@ -239,19 +231,71 @@ class KafkaClient(object):
             if ctr % 100000 == 0:
                 logger.debug('consume_all has yielded %s messages so far from topic %s', ctr, topic_name)
 
-            for msg_part, setter in ((msg.key(), msg.set_key), (msg.value(), msg.set_value)):
-                if msg_part is not None:
-                    payload = io.BytesIO(msg_part)
-                    _, schema_id = struct.unpack('>bI', payload.read(5))
-                    if schema_id not in self._avro_decoders:
-                        self._set_decoder(schema_id)
-                    decoder = self._avro_decoders[schema_id]
-                    to_set = decoder(payload)
-                    to_set['__avro_schema_name'] = self._schema_ids_to_names[schema_id]
-                    setter(to_set)
-                    payload.close()
-
+            self._set_decoded_msg(msg)
             yield msg
+
+    def consume_bounded(self, topic_name: str, approx_max_recs: int,
+                        boundary_watermarks: List[Tuple[int, int]]) -> Generator[confluent_kafka.Message, None, None]:
+        part_count = self.get_topic_partition_count(topic_name)
+
+        if part_count is None:
+            logger.warning(
+                'consume_bounded: Requested topic %s does not appear to exist. Returning nothing.', topic_name)
+            return
+
+        if part_count != len(boundary_watermarks):
+            raise ValueError('consume_bounded: The number of captured watermarks does not match the number of '
+                             'partitions for topic %s', topic_name)
+
+        rewind_per_part = int(approx_max_recs / part_count)
+        start_offsets = [max(lo, hi - rewind_per_part) for lo, hi in boundary_watermarks]
+        self._consumer.assign([confluent_kafka.TopicPartition(topic_name, part_id, offset)
+                               for part_id, offset in enumerate(start_offsets)])
+
+        finished_parts = [False] * part_count
+        ctr = 0
+
+        while True:
+            msg = self._consumer.poll(constants.KAFKA_REQUEST_TIMEOUT_SECS)
+
+            if msg is None:
+                time.sleep(0.2)
+                continue
+            if msg.error():
+                # noinspection PyProtectedMember
+                if msg.error().code() == confluent_kafka.KafkaError._PARTITION_EOF:
+                    finished_parts[msg.partition()] = True
+                    if all(finished_parts):
+                        break
+                    continue
+                else:
+                    raise confluent_kafka.KafkaException(msg.error())
+            if msg.offset() > boundary_watermarks[msg.partition()][1]:
+                finished_parts[msg.partition()] = True
+                if all(finished_parts):
+                    break
+                continue
+
+            ctr += 1
+            if ctr % 100000 == 0:
+                logger.debug('consume_bounded has yielded %s messages so far from topic %s', ctr, topic_name)
+
+            self._set_decoded_msg(msg)
+            yield msg
+
+    def _set_decoded_msg(self, msg: confluent_kafka.Message) -> None:
+        # noinspection PyArgumentList
+        for msg_part, setter in ((msg.key(), msg.set_key), (msg.value(), msg.set_value)):
+            if msg_part is not None:
+                payload = io.BytesIO(msg_part)
+                _, schema_id = struct.unpack('>bI', payload.read(5))
+                if schema_id not in self._avro_decoders:
+                    self._set_decoder(schema_id)
+                decoder = self._avro_decoders[schema_id]
+                to_set = decoder(payload)
+                to_set['__avro_schema_name'] = self._schema_ids_to_names[schema_id]
+                setter(to_set)
+                payload.close()
 
     def _set_decoder(self, schema_id):
         reg_schema = self._schema_registry.get_by_id(schema_id)

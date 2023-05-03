@@ -112,11 +112,13 @@ class ProgressEntry(object):
         have_separate_params: bool = all((progress_kind, topic_name, source_table_name, change_table_name,
                                          (snapshot_index or change_index)))
 
+        # noinspection PyArgumentList
         if bool(message and message.value()) == have_separate_params:
             raise Exception('Please pass either the `message` parameter OR the other parameters when initializing '
-                            'a Progress object.')
+                            'a ProgressEntry object.')
 
         if message:
+            # noinspection PyTypeChecker,PyArgumentList
             k, v = dict(message.key()), dict(message.value())
 
             if k['progress_kind'] not in (constants.CHANGE_ROWS_KIND, constants.SNAPSHOT_ROWS_KIND):
@@ -217,6 +219,11 @@ class ProgressTracker(object):
     # while has passed since the last change row was seen. This helps avoid warnings/halts due to LSN gaps seen at
     # startup if a change table is empty, e.g. due to CDC log truncation.
     def emit_changes_progress_heartbeat(self, topic_name: str, index: ChangeIndex) -> None:
+        if (topic_name, constants.CHANGE_ROWS_KIND) in self._progress_messages_awaiting_commit:
+            logger.info('Skipping emit_changes_progress_heartbeat for %s because a progress message is already '
+                        'awaiting commit.', topic_name)
+            return
+
         progress_entry = ProgressEntry(
             progress_kind=constants.CHANGE_ROWS_KIND,
             topic_name=topic_name,
@@ -233,7 +240,7 @@ class ProgressTracker(object):
         self._last_recorded_progress_by_topic[topic_name] = progress_entry
 
     def record_snapshot_completion(self, topic_name: str) -> None:
-        self.commit_progress()
+        self.commit_progress(final=True)
 
         progress_entry = ProgressEntry(
             progress_kind=constants.SNAPSHOT_ROWS_KIND,
@@ -279,12 +286,7 @@ class ProgressTracker(object):
         key = (message.topic(), progress_entry.progress_kind)
         self._progress_messages_awaiting_commit[key][message.partition()] = (produce_sequence, progress_entry)
 
-    # the keys in the returned dictionary are tuples of (topic_name, progress_kind)
-    def get_prior_progress_or_create_progress_topic(self) -> \
-            Dict[Tuple[str, str], ProgressEntry]:
-        result: Dict[Tuple[str, str], ProgressEntry] = {}
-        messages: Dict[Tuple[str, str], confluent_kafka.Message] = {}
-
+    def get_prior_progress_or_create_progress_topic(self) -> Dict[Tuple[str, str], ProgressEntry]:
         if self._kafka_client.get_topic_partition_count(self._progress_topic_name) is None:
             logger.warning('No existing progress storage topic found; creating topic %s', self._progress_topic_name)
 
@@ -292,13 +294,21 @@ class ProgressTracker(object):
             # a bit low (the default is 1 GB!) to prevent having to read too much from the topic on process startup:
             self._kafka_client.create_topic(self._progress_topic_name, 1, extra_config={"segment.bytes": 16777216})
             return {}
+        return self.get_prior_progress()
+
+    # the keys in the returned dictionary are tuples of (topic_name, progress_kind)
+    def get_prior_progress(self) -> Dict[Tuple[str, str], ProgressEntry]:
+        result: Dict[Tuple[str, str], ProgressEntry] = {}
+        messages: Dict[Tuple[str, str], confluent_kafka.Message] = {}
 
         progress_msg_ctr = 0
         for progress_msg in self._kafka_client.consume_all(self._progress_topic_name):
             progress_msg_ctr += 1
+            # noinspection PyTypeChecker
             msg_key = dict(progress_msg.key())
             result_key = (msg_key['topic_name'], msg_key['progress_kind'])
 
+            # noinspection PyArgumentList
             if progress_msg.value() is None:
                 if result_key in result:
                     del result[result_key]

@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 def run() -> None:
+    logger.info('Starting...')
     opts: argparse.Namespace
     opts, reporters = options.get_options_and_metrics_reporters()
 
@@ -59,7 +60,8 @@ def run() -> None:
 
         tables: List[tracked_tables.TrackedTable] = build_tracked_tables_from_cdc_metadata(
             db_conn, clock_syncer, metrics_accumulator, opts.topic_name_template, opts.snapshot_table_whitelist_regex,
-            opts.snapshot_table_blacklist_regex, opts.truncate_fields, capture_instance_names, sql_query_processor)
+            opts.snapshot_table_blacklist_regex, opts.truncate_fields, capture_instance_names, opts.db_row_batch_size,
+            sql_query_processor)
 
         topic_to_source_table_map: Dict[str, str] = {
             t.topic_name: t.fq_name for t in tables}
@@ -151,7 +153,7 @@ def run() -> None:
                     metrics = metrics_accumulator.end_and_get_values()
                     for reporter in reporters:
                         try:
-                            reporter.emit(metrics)  # TODO: async this
+                            reporter.emit(metrics)
                         except Exception as e:
                             logger.exception('Caught exception while reporting metrics', exc_info=e)
                     elapsed = (time.perf_counter() - start_time)
@@ -237,7 +239,7 @@ def run() -> None:
                     # ----- Query for change rows ----
 
                     for t in tables:
-                        if queued_change_row_counts[t.topic_name] < constants.DB_ROW_BATCH_SIZE + 1:
+                        if queued_change_row_counts[t.topic_name] < opts.db_row_batch_size + 1:
                             t.enqueue_changes_query(lsn_limit)
 
                     common_lsn_limit: change_index.ChangeIndex = change_index.HIGHEST_CHANGE_INDEX
@@ -353,7 +355,7 @@ def get_latest_capture_instances_by_fq_name(
 def build_tracked_tables_from_cdc_metadata(
     db_conn: pyodbc.Connection, clock_syncer: 'clock_sync.ClockSync', metrics_accumulator: 'accumulator.Accumulator',
     topic_name_template: str, snapshot_table_whitelist_regex: str, snapshot_table_blacklist_regex: str,
-    truncate_fields: Dict[str, int], capture_instance_names: List[str],
+    truncate_fields: Dict[str, int], capture_instance_names: List[str], db_row_batch_size: int,
     sql_query_processor: 'sql_query_subprocess.SQLQueryProcessor'
 ) -> List[tracked_tables.TrackedTable]:
     result: List[tracked_tables.TrackedTable] = []
@@ -392,14 +394,14 @@ def build_tracked_tables_from_cdc_metadata(
 
         tracked_table = tracked_tables.TrackedTable(
             db_conn, clock_syncer, metrics_accumulator, sql_query_processor, schema_name, table_name,
-            capture_instance_name, topic_name, min_lsn, can_snapshot)
+            capture_instance_name, topic_name, min_lsn, can_snapshot, db_row_batch_size)
 
         for (change_table_ordinal, column_name, sql_type_name, primary_key_ordinal, decimal_precision,
-             decimal_scale) in fields:
+             decimal_scale, is_identity) in fields:
             truncate_after = truncate_fields.get(f'{schema_name}.{table_name}.{column_name}'.lower())
             tracked_table.append_field(tracked_tables.TrackedField(
                 column_name, sql_type_name, change_table_ordinal, primary_key_ordinal, decimal_precision,
-                decimal_scale, truncate_after))
+                decimal_scale, is_identity, truncate_after))
 
         result.append(tracked_table)
 
@@ -418,7 +420,7 @@ def determine_start_points_and_finalize_tables(
     if validation_mode:
         for table in tables:
             table.snapshot_allowed = False
-            table.finalize_table(change_index.LOWEST_CHANGE_INDEX, {}, lsn_gap_handling, kafka_client.register_schemas)
+            table.finalize_table(change_index.LOWEST_CHANGE_INDEX, {}, lsn_gap_handling)
         return
 
     if report_progress_only:
@@ -515,7 +517,7 @@ def determine_start_points_and_finalize_tables(
                                               starting_change_index or '<from beginning>', snapshot_state))
 
     headers = ('Capture instance name', 'Source table name', 'Topic name', 'From change table index', 'Snapshots')
-    table = tabulate(prior_progress_log_table_data, headers, tablefmt='fancy_grid')
+    table = tabulate(sorted(prior_progress_log_table_data), headers, tablefmt='fancy_grid')
 
     logger.info('Processing will proceed from the following positions based on the last message from each topic '
                 'and/or the snapshot progress committed in Kafka (NB: snapshot reads occur BACKWARDS from high to '
@@ -558,10 +560,11 @@ def should_terminate_due_to_capture_instance_change(
             if current_ci['capture_instance_name'] == new_ci['capture_instance_name']:
                 continue
             topic = capture_instance_to_topic_map[current_ci['capture_instance_name']]
-            current_idx = topic_to_max_polled_index_map.get(topic)
-            if current_idx is not None:
-                progress_tracker.emit_changes_progress_heartbeat(topic, current_idx)
-            current_idx = current_idx or change_index.LOWEST_CHANGE_INDEX
+            if topic in topic_to_max_polled_index_map:
+                progress_tracker.emit_changes_progress_heartbeat(topic, topic_to_max_polled_index_map[topic])
+            last_recorded_progress = progress_tracker.get_last_recorded_progress_for_topic(topic)
+            current_idx = last_recorded_progress and last_recorded_progress.change_index or \
+                change_index.LOWEST_CHANGE_INDEX
             logger.info('Change detected in capture instance for %s.\nCurrent: %s\nNew: %s', fq_name,
                         json.dumps(current_ci, default=better_json_serialize),
                         json.dumps(new_ci, default=better_json_serialize))

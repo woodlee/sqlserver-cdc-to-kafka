@@ -2,13 +2,14 @@ import argparse
 import json
 import logging
 import os
+import threading
 
 from jinja2 import Template
 import requests
 
 from . import reporter_base
 
-from typing import TYPE_CHECKING, Optional, Dict
+from typing import TYPE_CHECKING, Optional, Dict, Any
 
 if TYPE_CHECKING:
     from .metrics import Metrics
@@ -23,15 +24,22 @@ class HttpPostReporter(reporter_base.ReporterBase):
         self._headers: Dict[str, str] = {}
 
     def emit(self, metrics: 'Metrics') -> None:
+        t = threading.Thread(target=self._post, args=(metrics.as_dict(),), name='HttpPostReporter')
+        t.daemon = True
+        t.start()
+
+    def _post(self, metrics_dict: Dict[str, Any]) -> None:
         if self._template:
-            body = self._template.render(metrics=metrics.as_dict())
+            body = self._template.render(metrics=metrics_dict)
         else:
-            body = json.dumps(metrics.as_dict(), default=HttpPostReporter.json_serialize_datetimes)
+            body = json.dumps(metrics_dict, default=HttpPostReporter.json_serialize_datetimes)
 
-        resp = requests.post(self._url, data=body, headers=self._headers, timeout=5.0)
-        resp.raise_for_status()
-
-        logger.debug('Posted metrics to %s with code %s and response: %s', self._url, resp.status_code, resp.text)
+        resp = requests.post(self._url, data=body, headers=self._headers, timeout=10.0)
+        try:
+            resp.raise_for_status()
+            logger.debug('Posted metrics to %s with code %s and response: %s', self._url, resp.status_code, resp.text)
+        except requests.exceptions.RequestException as e:
+            logger.warning('Failed to post metrics to %s: %s', self._url, e)
 
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument('--http-metrics-url', default=os.environ.get('HTTP_METRICS_URL'),
