@@ -272,9 +272,8 @@ def ddl_change_requires_new_snapshot(db_conn: pyodbc.Connection, old_capture_ins
                             source_table_fq_name, added_col_name)
                 return True
 
-        q, p = sql_queries.get_table_rowcount_estimate()
-        cursor.setinputsizes(p)
-        cursor.execute(q, source_table_fq_name)
+        q, p = sql_queries.get_table_rowcount_bounded(source_table_fq_name, constants.SMALL_TABLE_THRESHOLD)
+        cursor.execute(q)
         table_is_small = cursor.fetchval() < constants.SMALL_TABLE_THRESHOLD
 
         # Gets the names of columns that appear in the first position of one or more unfiltered, non-disabled indexes:

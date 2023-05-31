@@ -128,13 +128,16 @@ WHERE {where_spec}
     ''', params
 
 
-def get_table_rowcount_estimate() -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
+def get_table_rowcount_bounded(table_fq_name: str, max_count: int) -> \
+        Tuple[str, List[Tuple[int, int, Optional[int]]]]:
+    assert max_count > 0
     return f'''
--- cdc-to-kafka: get_table_rowcount_estimate
-SELECT SUM(row_count) AS [total_rows_est]
-FROM sys.dm_db_partition_stats
-WHERE object_id = OBJECT_ID(?) AND index_id < 2
-    ''', [(pyodbc.SQL_VARCHAR, 255, None)]
+-- cdc-to-kafka: get_table_rowcount_bounded
+SELECT COUNT(*) FROM (
+    SELECT TOP {max_count} 1 AS nbr
+    FROM {table_fq_name} WITH (NOLOCK)
+) AS ctr
+    ''', []
 
 
 def get_max_key_value(schema_name: str, table_name: str, pk_cols: Tuple[str]) -> \
