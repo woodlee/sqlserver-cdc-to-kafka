@@ -358,6 +358,7 @@ class KafkaClient(object):
         if (current_key_schema is None or current_key_schema != key_schema) and not self._disable_writing:
             logger.info('Key schema for subject %s does not exist or is outdated; registering now.', key_subject)
             key_schema_id = self._schema_registry.register(key_subject, key_schema)
+            logger.debug('Schema registered for subject %s: %s', key_subject, key_schema)
             if current_key_schema is None:
                 time.sleep(constants.KAFKA_CONFIG_RELOAD_DELAY_SECS)
                 self._schema_registry.update_compatibility(key_schema_compatibility_level, key_subject)
@@ -367,6 +368,7 @@ class KafkaClient(object):
         if (current_value_schema is None or current_value_schema != value_schema) and not self._disable_writing:
             logger.info('Value schema for subject %s does not exist or is outdated; registering now.', value_subject)
             value_schema_id = self._schema_registry.register(value_subject, value_schema)
+            logger.debug('Schema registered for subject %s: %s', value_subject, value_schema)
             if current_value_schema is None:
                 time.sleep(constants.KAFKA_CONFIG_RELOAD_DELAY_SECS)
                 self._schema_registry.update_compatibility(value_schema_compatibility_level, value_subject)

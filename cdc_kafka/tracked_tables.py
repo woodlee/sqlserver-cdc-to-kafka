@@ -272,7 +272,7 @@ class TrackedTable(object):
             else:
                 raise Exception(
                     f"Snapshotting was requested for table {self.fq_name}, but it does not appear to have a primary "
-                    f"key (which is required for snapshotting at this time). You can get past this error by adding"
+                    f"key (which is required for snapshotting at this time). You can get past this error by adding "
                     f"the table to the snapshot blacklist")
 
     def enqueue_snapshot_query(self) -> None:

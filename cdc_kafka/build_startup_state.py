@@ -92,7 +92,8 @@ def determine_start_points_and_finalize_tables(
         watermarks_by_topic = kafka_client.get_topic_watermarks(topic_names)
         first_check_watermarks_json = json.dumps(watermarks_by_topic)
 
-        logger.info('Pausing briefly to ensure target topics are not receiving new messages from elsewhere...')
+        logger.info(f'Pausing for {constants.WATERMARK_STABILITY_CHECK_DELAY_SECS} seconds to ensure target topics are '
+                    f'not receiving new messages from elsewhere...')
         time.sleep(constants.WATERMARK_STABILITY_CHECK_DELAY_SECS)
 
         watermarks_by_topic = kafka_client.get_topic_watermarks(topic_names)
@@ -109,6 +110,7 @@ def determine_start_points_and_finalize_tables(
 
     for table in tables:
         snapshot_progress, changes_progress = None, None
+        prior_change_table_max_index: Optional[change_index.ChangeIndex] = None
 
         if not report_progress_only and table.topic_name not in watermarks_by_topic:  # new topic; create it
             if partition_count:
@@ -149,8 +151,6 @@ def determine_start_points_and_finalize_tables(
                 else:
                     progress_tracker.record_snapshot_completion(table.topic_name)
                     logger.info('Will NOT start new snapshot.')
-
-            prior_change_table_max_index: Optional[change_index.ChangeIndex] = None
 
             if changes_progress and (changes_progress.change_table_name != fq_change_table_name):
                 logger.info('Found prior change data progress into topic %s, but from an older capture instance '
@@ -274,7 +274,9 @@ def ddl_change_requires_new_snapshot(db_conn: pyodbc.Connection, old_capture_ins
 
         q, p = sql_queries.get_table_rowcount_bounded(source_table_fq_name, constants.SMALL_TABLE_THRESHOLD)
         cursor.execute(q)
-        table_is_small = cursor.fetchval() < constants.SMALL_TABLE_THRESHOLD
+        bounded_row_count = cursor.fetchval()
+        logger.debug('Bounded row count for %s was: %s', source_table_fq_name, bounded_row_count)
+        table_is_small = bounded_row_count < constants.SMALL_TABLE_THRESHOLD
 
         # Gets the names of columns that appear in the first position of one or more unfiltered, non-disabled indexes:
         q, p = sql_queries.get_indexed_cols()
