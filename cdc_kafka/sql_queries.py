@@ -290,7 +290,7 @@ def _get_snapshot_query_bits(pk_cols: Collection[str], odbc_columns: Tuple[pyodb
     #    OR (field_a = @K0 AND field_b < @K1)
     #    OR (field_a = @K0 AND field_b = @K1 AND field_c < @K2)
 
-    # You may find it odd that this query (as well as the change data query) has DECLARE statements in it.
+    # You may find it odd that this query (as well as the change data query) has `DECLARE` statements in it.
     # Why not just pass the parameters with the query like usual? We found that in composite-key cases,
     # the need to pass the parameter for the bounding value of the non-last column(s) more than once caused
     # SQL Server to treat those as different values (even though they were actually the same), and this

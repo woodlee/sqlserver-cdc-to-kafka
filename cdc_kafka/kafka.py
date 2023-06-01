@@ -348,6 +348,16 @@ class KafkaClient(object):
                          key_schema_compatibility_level: str = constants.DEFAULT_KEY_SCHEMA_COMPATIBILITY_LEVEL,
                          value_schema_compatibility_level: str = constants.DEFAULT_VALUE_SCHEMA_COMPATIBILITY_LEVEL) \
             -> Tuple[int, int]:
+        # TODO: it turns out that if you try to re-register a schema that was previously registered but later superseded
+        # (e.g. in the case of adding and then later deleting a column), the schema registry will accept that and return
+        # you the previously-registered schema ID without updating the `latest` version associated with the registry
+        # subject, or verifying that the change is Avro-compatible. It seems like the way to handle this, per
+        # https://github.com/confluentinc/schema-registry/issues/1685, would be to detect the condition and delete the
+        # subject-version-number of that schema before re-registering it. Since subject-version deletion is not
+        # available in the `CachedSchemaRegistryClient` we use here--and since this is a rare case--I'm explicitly
+        # choosing to punt on it for the moment. The Confluent lib does now have a newer `SchemaRegistryClient` class
+        # which supports subject-version deletion, but changing this code to use it appears to be a non-trivial task.
+
         key_schema = confluent_kafka.avro.loads(json.dumps(key_schema))
         value_schema = confluent_kafka.avro.loads(json.dumps(value_schema))
 

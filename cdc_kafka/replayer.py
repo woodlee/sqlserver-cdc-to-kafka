@@ -6,8 +6,8 @@ produced by CDC-to-Kafka.
 
 One example use case would be to create a copy of an existing table (initially with a different name of course) on the
 same DB from which a CDC-to-Kafka topic is produced, in order to rearrange indexes, types, etc. on the new copy of the
-table. We're using this now to upgrade some INT columns to BIGINTs on a few tables that are nearing the 2^31 row count.
-When the copy is ready, tables can be renamed so that applications begin using the new table.
+table. We're using this now to upgrade some INT columns to `BIGINT`s on a few tables that are nearing the 2^31 row
+count. When the copy is ready, tables can be renamed so that applications begin using the new table.
 
 An example invocation follows. This assumes you have already created the Orders_copy table, with changes as desired,
 in the DB, and that you have created the CdcTableCopier DB user there as well, presumably with limited permissions
