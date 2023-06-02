@@ -335,7 +335,8 @@ def should_terminate_due_to_capture_instance_change(
             new_ci_min_index = change_index.ChangeIndex(new_ci['start_lsn'], b'\x00' * 10, 0)
             if current_idx < new_ci_min_index:
                 with db_conn.cursor() as cursor:
-                    change_table_name = helpers.get_fq_change_table_name(current_ci['capture_instance_name'])
+                    change_table_name = helpers.quote_name(
+                        helpers.get_fq_change_table_name(current_ci['capture_instance_name']))
                     cursor.execute(f"SELECT TOP 1 1 FROM {change_table_name} WITH (NOLOCK)")
                     has_rows = cursor.fetchval() is not None
                 if has_rows:
