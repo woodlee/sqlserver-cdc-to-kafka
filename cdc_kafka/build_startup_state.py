@@ -160,7 +160,8 @@ def determine_start_points_and_finalize_tables(
                     cursor.execute("SELECT 1 FROM sys.tables WHERE object_id = OBJECT_ID(?)",
                                    changes_progress.change_table_name)
                     if cursor.fetchval() is not None:
-                        q, p = sql_queries.get_max_lsn_for_change_table(changes_progress.change_table_name)
+                        q, p = sql_queries.get_max_lsn_for_change_table(
+                            helpers.quote_name(changes_progress.change_table_name))
                         cursor.execute(q)
                         res = cursor.fetchone()
                         if res:
@@ -272,7 +273,8 @@ def ddl_change_requires_new_snapshot(db_conn: pyodbc.Connection, old_capture_ins
                             source_table_fq_name, added_col_name)
                 return True
 
-        q, p = sql_queries.get_table_rowcount_bounded(source_table_fq_name, constants.SMALL_TABLE_THRESHOLD)
+        quoted_fq_name = helpers.quote_name(source_table_fq_name)
+        q, p = sql_queries.get_table_rowcount_bounded(quoted_fq_name, constants.SMALL_TABLE_THRESHOLD)
         cursor.execute(q)
         bounded_row_count = cursor.fetchval()
         logger.debug('Bounded row count for %s was: %s', source_table_fq_name, bounded_row_count)
@@ -287,7 +289,7 @@ def ddl_change_requires_new_snapshot(db_conn: pyodbc.Connection, old_capture_ins
 
         for added_col_name in added_col_names:
             if table_is_small or added_col_name in indexed_cols:
-                cursor.execute(f"SELECT TOP 1 1 FROM {source_table_fq_name} WITH (NOLOCK) "
+                cursor.execute(f"SELECT TOP 1 1 FROM {quoted_fq_name} WITH (NOLOCK) "
                                f"WHERE [{added_col_name}] IS NOT NULL")
                 if cursor.fetchval() is not None:
                     logger.info('Requiring re-snapshot for %s because a direct scan of newly-tracked column %s '

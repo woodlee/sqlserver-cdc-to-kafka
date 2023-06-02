@@ -112,7 +112,7 @@ class TrackedTable(object):
         with self._db_conn.cursor() as cursor:
             deletes, inserts, updates = 0, 0, 0
             q, p = sql_queries.get_change_table_count_by_operation(
-                helpers.get_fq_change_table_name(self.capture_instance_name))
+                helpers.quote_name(helpers.get_fq_change_table_name(self.capture_instance_name)))
             cursor.setinputsizes(p)
             cursor.execute(q, (highest_change_index.lsn, highest_change_index.seqval, highest_change_index.operation))
             for row in cursor.fetchall():
@@ -221,7 +221,7 @@ class TrackedTable(object):
                             f'Index columns found were: {change_table_clustered_idx_cols}')
 
         self._change_rows_query, self._change_rows_query_param_types = sql_queries.get_change_rows(
-            self.db_row_batch_size, helpers.get_fq_change_table_name(self.capture_instance_name),
+            self.db_row_batch_size, helpers.quote_name(helpers.get_fq_change_table_name(self.capture_instance_name)),
             self._value_field_names, change_table_clustered_idx_cols)
 
         if not self.snapshot_allowed:
@@ -360,7 +360,8 @@ class TrackedTable(object):
 
     def get_change_rows_per_second(self) -> int:
         with self._db_conn.cursor() as cursor:
-            q, p = sql_queries.get_change_rows_per_second(helpers.get_fq_change_table_name(self.capture_instance_name))
+            q, p = sql_queries.get_change_rows_per_second(
+                helpers.quote_name(helpers.get_fq_change_table_name(self.capture_instance_name)))
             cursor.execute(q)
             return cursor.fetchval() or 0
 

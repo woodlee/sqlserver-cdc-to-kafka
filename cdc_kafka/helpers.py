@@ -24,3 +24,10 @@ def get_capture_instance_name(change_table_name: str) -> str:
         change_table_name = change_table_name.replace(constants.CDC_DB_SCHEMA_NAME + '.', '')
     assert change_table_name.endswith('_CT')
     return change_table_name[:-3]
+
+
+def quote_name(name: str) -> str:
+    name = name.replace('[', '')
+    name = name.replace(']', '')
+    parts = name.split('.')
+    return '.'.join([f"[{p}]" for p in parts])
