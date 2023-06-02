@@ -35,10 +35,11 @@ SELECT
     , cc.column_ordinal AS change_table_ordinal
     , cc.column_name AS column_name
     , cc.column_type AS sql_type_name
+    , cc.is_computed AS is_computed
     , ic.index_ordinal AS primary_key_ordinal
     , sc.precision AS decimal_precision
     , sc.scale AS decimal_scale
-    , sc.is_identity AS is_identity
+    , sc.is_nullable AS is_nullable
 FROM
     [{constants.CDC_DB_SCHEMA_NAME}].[change_tables] AS ct
     INNER JOIN [{constants.CDC_DB_SCHEMA_NAME}].[captured_columns] AS cc ON (ct.object_id = cc.object_id)
@@ -59,32 +60,60 @@ ORDER BY tran_end_time DESC
     ''', []
 
 
-def get_change_rows_per_second(change_table_name: str) -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
+def get_change_rows_per_second(fq_change_table_name: str) -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
     return f'''
 -- cdc-to-kafka: get_change_rows_per_second    
 SELECT ISNULL(COUNT(*) / NULLIF(DATEDIFF(second, MIN(ltm.tran_end_time), MAX(ltm.tran_end_time)), 0), 0)
-FROM [{constants.CDC_DB_SCHEMA_NAME}].[{change_table_name}] AS ct WITH (NOLOCK)
+FROM {fq_change_table_name} AS ct WITH (NOLOCK)
 INNER JOIN [{constants.CDC_DB_SCHEMA_NAME}].[lsn_time_mapping] AS ltm WITH (NOLOCK) ON ct.__$start_lsn = ltm.start_lsn
     ''', []
 
 
-def get_change_table_index_cols(change_table_name: str) -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
+def get_change_table_index_cols() -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
     return f'''
 -- cdc-to-kafka: get_change_table_index_cols
 SELECT COL_NAME(ic.object_id, ic.column_id)
 FROM sys.indexes AS i
 INNER JOIN sys.index_columns AS ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
-WHERE i.object_id = OBJECT_ID('{constants.CDC_DB_SCHEMA_NAME}.{change_table_name}') AND type_desc = 'CLUSTERED'
+WHERE i.object_id = OBJECT_ID(?) AND type_desc = 'CLUSTERED'
 ORDER BY key_ordinal
-    ''', []
+    ''', [(pyodbc.SQL_VARCHAR, 255, None)]
 
 
 def get_date() -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
     return 'SELECT GETDATE()', []
 
 
+def get_indexed_cols() -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
+    return f'''
+-- cdc-to-kafka: get_indexed_cols
+SELECT DISTINCT c.[name]
+FROM sys.index_columns AS ic
+INNER JOIN sys.indexes AS i
+    ON ic.[object_id] = i.[object_id]
+    AND ic.[index_id] = i.[index_id]
+INNER JOIN sys.columns AS c
+    ON ic.[object_id] = c.[object_id]
+    AND ic.[column_id] = c.[column_id]
+WHERE ic.[object_id] = OBJECT_ID(?)
+    AND ic.[key_ordinal] = 1
+    AND i.[is_disabled] = 0
+    AND i.[type] != 0
+    AND i.has_filter = 0
+   ''', [(pyodbc.SQL_VARCHAR, 255, None)]
+
+
+def get_ddl_history_for_capture_table() -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
+    return f'''
+-- cdc-to-kafka: get_ddl_history_for_capture_table
+SELECT ddl_command, DATEDIFF(second, ddl_time, GETDATE()) AS age_seconds
+FROM [{constants.CDC_DB_SCHEMA_NAME}].[ddl_history]
+WHERE object_id = OBJECT_ID(?) AND required_column_update = 0
+    ''', [(pyodbc.SQL_VARCHAR, 255, None)]
+
+
 def get_table_count(schema_name: str, table_name: str, pk_cols: Tuple[str],
-                    odbc_columns: Tuple[Tuple]) -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
+                    odbc_columns: Tuple[pyodbc.Row, ...]) -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
     declarations, where_spec, params = _get_snapshot_query_bits(pk_cols, odbc_columns, ('>=', '<='))
 
     return f'''
@@ -94,9 +123,21 @@ DECLARE
 ;
 
 SELECT COUNT(*)
-FROM [{schema_name}].[{table_name}]
+FROM [{schema_name}].[{table_name}] WITH (NOLOCK)
 WHERE {where_spec}
     ''', params
+
+
+def get_table_rowcount_bounded(table_fq_name: str, max_count: int) -> \
+        Tuple[str, List[Tuple[int, int, Optional[int]]]]:
+    assert max_count > 0
+    return f'''
+-- cdc-to-kafka: get_table_rowcount_bounded
+SELECT COUNT(*) FROM (
+    SELECT TOP {max_count} 1 AS nbr
+    FROM {table_fq_name} WITH (NOLOCK)
+) AS ctr
+    ''', []
 
 
 def get_max_key_value(schema_name: str, table_name: str, pk_cols: Tuple[str]) -> \
@@ -121,7 +162,7 @@ FROM [{schema_name}].[{table_name}] ORDER BY {order_by_spec}
     ''', []
 
 
-def get_change_table_count_by_operation(change_table_name: str) -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
+def get_change_table_count_by_operation(fq_change_table_name: str) -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
     return f'''
 -- cdc-to-kafka: get_change_table_count_by_operation
 DECLARE 
@@ -133,7 +174,7 @@ DECLARE
 SELECT 
     COUNT(*)
     , __$operation AS op
-FROM [{constants.CDC_DB_SCHEMA_NAME}].[{change_table_name}] WITH (NOLOCK)
+FROM {fq_change_table_name} WITH (NOLOCK)
 WHERE __$operation != 3 
     AND (
         __$start_lsn < @LSN
@@ -148,7 +189,16 @@ def get_max_lsn() -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
     return 'SELECT sys.fn_cdc_get_max_lsn()', []
 
 
-def get_change_rows(batch_size: int, change_table_name: str, field_names: Iterable[str],
+def get_max_lsn_for_change_table(fq_change_table_name: str) -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
+    return f'''
+-- cdc-to-kafka: get_max_lsn_for_change_table
+SELECT TOP 1 __$start_lsn, __$command_id, __$seqval, __$operation 
+FROM {fq_change_table_name} 
+ORDER BY __$start_lsn DESC, __$command_id DESC, __$seqval DESC, __$operation DESC
+    ''', []
+
+
+def get_change_rows(batch_size: int, fq_change_table_name: str, field_names: Iterable[str],
                     ct_index_cols: Iterable[str]) -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
     # You may feel tempted to change or simplify this query. TREAD CAREFULLY. There was a lot of iterating here to
     # craft something that would not induce SQL Server to resort to a full index scan. If you change it, run some
@@ -169,13 +219,13 @@ DECLARE
 
 WITH ct AS (
     SELECT *
-    FROM [{constants.CDC_DB_SCHEMA_NAME}].[{change_table_name}] AS ct WITH (NOLOCK)
+    FROM {fq_change_table_name} AS ct WITH (NOLOCK)
     WHERE ct.__$start_lsn = @LSN AND ct.__$seqval > @SEQ AND ct.__$start_lsn <= @MAX_LSN
 
     UNION ALL
 
     SELECT *
-    FROM [{constants.CDC_DB_SCHEMA_NAME}].[{change_table_name}] AS ct WITH (NOLOCK)
+    FROM {fq_change_table_name} AS ct WITH (NOLOCK)
     WHERE ct.__$start_lsn > @LSN AND ct.__$start_lsn <= @MAX_LSN
 )
 SELECT TOP ({batch_size})
@@ -195,7 +245,7 @@ ORDER BY {order_spec}
 def get_snapshot_rows(
         batch_size: int, schema_name: str, table_name: str, field_names: Collection[str],
         removed_field_names: Collection[str], pk_cols: Collection[str], first_read: bool,
-        odbc_columns: Collection[Tuple]) -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
+        odbc_columns: Tuple[pyodbc.Row, ...]) -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
     select_cols = []
     for fn in field_names:
         if fn in removed_field_names:
@@ -232,15 +282,15 @@ ORDER BY {order_spec}
     ''', params
 
 
-def _get_snapshot_query_bits(pk_cols: Collection[str], odbc_columns: Iterable[Tuple], comparators: Iterable[str]) \
-        -> Tuple[str, str, List[Tuple[int, int, Optional[int]]]]:
+def _get_snapshot_query_bits(pk_cols: Collection[str], odbc_columns: Tuple[pyodbc.Row, ...],
+                             comparators: Iterable[str]) -> Tuple[str, str, List[Tuple[int, int, Optional[int]]]]:
     # For multi-column primary keys, this builds a WHERE clause of the following form, assuming
     # for example a PK on (field_a, field_b, field_c):
     #   WHERE (field_a < @K0)
     #    OR (field_a = @K0 AND field_b < @K1)
     #    OR (field_a = @K0 AND field_b = @K1 AND field_c < @K2)
 
-    # You may find it odd that this query (as well as the change data query) has DECLARE statements in it.
+    # You may find it odd that this query (as well as the change data query) has `DECLARE` statements in it.
     # Why not just pass the parameters with the query like usual? We found that in composite-key cases,
     # the need to pass the parameter for the bounding value of the non-last column(s) more than once caused
     # SQL Server to treat those as different values (even though they were actually the same), and this

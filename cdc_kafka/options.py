@@ -238,6 +238,18 @@ def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List]:
                         "then exits without changing any state. Can be handy for validating other configuration such "
                         "as the regexes used to control which tables are followed and/or snapshotted.")
 
+    p.add_argument('--always-use-avro-longs',
+                   type=str2bool, nargs='?', const=True,
+                   default=str2bool(os.environ.get('ALWAYS_USE_AVRO_LONGS', False)),
+                   help="Defaults to False. If set to True, Avro schemas produced/registered by this process will "
+                        "use the Avro `long` type instead of the `int` type for fields corresponding to SQL Server "
+                        "INT, SMALLINT, or TINYINT columns. This can be used to future-proof in cases where the column "
+                        "size may need to be upgraded in the future, at the potential cost of increased storage or "
+                        "memory space needs in consuming processes. Note that if this change is made for existing "
+                        "topics, the schema registration attempt will violate Avro FORWARD compatibility checks (the "
+                        "default used by this process), meaning that you may need to manually override the schema "
+                        "registry compatibility level for any such topics first.")
+
     p.add_argument('--db-row-batch-size',
                    type=int,
                    default=os.environ.get('DB_ROW_BATCH_SIZE', 2000),

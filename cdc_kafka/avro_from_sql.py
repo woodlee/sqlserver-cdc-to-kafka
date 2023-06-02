@@ -51,7 +51,7 @@ def get_cdc_metadata_fields_avro_schemas(table_fq_name: str, source_field_names:
 # need not be updated. We align with that by making the Avro value schema for all captured fields nullable (which also
 # helps with maintaining future Avro schema compatibility).
 def avro_schema_from_sql_type(source_field_name: str, sql_type_name: str, decimal_precision: int,
-                              decimal_scale: int, make_nullable: bool) -> Dict[str, Any]:
+                              decimal_scale: int, make_nullable: bool, force_avro_long: bool) -> Dict[str, Any]:
     if sql_type_name in ('decimal', 'numeric', 'money', 'smallmoney'):
         if (not decimal_precision) or decimal_scale is None:
             raise Exception(f"Field '{source_field_name}': For SQL decimal, money, or numeric types, the scale and "
@@ -70,14 +70,16 @@ def avro_schema_from_sql_type(source_field_name: str, sql_type_name: str, decima
         avro_type = "double"
     elif sql_type_name == 'real':
         avro_type = "float"
+    elif sql_type_name in ('int', 'smallint', 'tinyint'):
+        avro_type = "long" if force_avro_long else "int"
+    # For date and time we don't respect force_avro_long since the underlying type being `int` for these logical
+    # types is spelled out in the Avro spec:
     elif sql_type_name == 'date':
         avro_type = {"type": "int", "logicalType": "date"}
-    elif sql_type_name in ('int', 'smallint', 'tinyint'):
-        avro_type = "int"
-    elif sql_type_name in ('datetime', 'datetime2', 'datetimeoffset', 'smalldatetime', 'xml') + SQL_STRING_TYPES:
-        avro_type = "string"
     elif sql_type_name == 'time':
         avro_type = {"type": "int", "logicalType": "time-millis"}
+    elif sql_type_name in ('datetime', 'datetime2', 'datetimeoffset', 'smalldatetime', 'xml') + SQL_STRING_TYPES:
+        avro_type = "string"
     elif sql_type_name == 'uniqueidentifier':
         avro_type = {"type": "string", "logicalType": "uuid"}
     elif sql_type_name in ('binary', 'image', 'varbinary', 'rowversion'):

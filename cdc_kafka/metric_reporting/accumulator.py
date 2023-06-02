@@ -18,7 +18,7 @@ class AccumulatorAbstract(ABC):
     def end_and_get_values(self) -> metrics.Metrics: pass
     def register_sleep(self, sleep_time_seconds: float) -> None: pass
     def register_db_query(self, seconds_elapsed: float, db_query_kind: str, retrieved_row_count: int) -> None: pass
-    def register_kafka_produce(self, secs_elapsed: float, orig_value: Dict[str, Any], message_type: str) -> None: pass
+    def register_kafka_produce(self, seconds_elapsed: float, original_value: Dict[str, Any], message_type: str) -> None: pass
     def register_kafka_commit(self, seconds_elapsed: float) -> None: pass
     def kafka_delivery_callback(self, message_type: str, original_value: Dict[str, Any],
                                 produce_datetime: datetime.datetime, **_) -> None: pass
