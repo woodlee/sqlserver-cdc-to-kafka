@@ -11,7 +11,7 @@ from typing import Dict, Optional, List, Any, Tuple
 import pyodbc
 
 from . import clock_sync, kafka, tracked_tables, constants, options, validation, change_index, progress_tracking, \
-    sql_query_subprocess, sql_queries, helpers
+    sql_query_subprocess, sql_queries, helpers, avro
 from .build_startup_state import build_tracked_tables_from_cdc_metadata, determine_start_points_and_finalize_tables, \
     get_latest_capture_instances_by_fq_name
 from .metric_reporting import accumulator
@@ -48,6 +48,9 @@ def run() -> None:
         metrics_accumulator: accumulator.Accumulator = accumulator.Accumulator(
             db_conn, clock_syncer, opts.metrics_namespace, opts.process_hostname)
 
+        schema_generator: avro.AvroSchemaGenerator = avro.AvroSchemaGenerator(
+            opts.always_use_avro_longs, opts.avro_type_spec_overrides)
+
         capture_instances_by_fq_name: Dict[str, Dict[str, Any]] = get_latest_capture_instances_by_fq_name(
             db_conn, opts.capture_instance_version_strategy, opts.capture_instance_version_regex,
             opts.table_whitelist_regex, opts.table_blacklist_regex)
@@ -62,7 +65,7 @@ def run() -> None:
         tables: List[tracked_tables.TrackedTable] = build_tracked_tables_from_cdc_metadata(
             db_conn, metrics_accumulator, opts.topic_name_template, opts.snapshot_table_whitelist_regex,
             opts.snapshot_table_blacklist_regex, opts.truncate_fields, capture_instance_names, opts.db_row_batch_size,
-            opts.always_use_avro_longs, sql_query_processor)
+            sql_query_processor, schema_generator)
 
         topic_to_source_table_map: Dict[str, str] = {
             t.topic_name: t.fq_name for t in tables}
@@ -88,8 +91,8 @@ def run() -> None:
             ), metrics_accumulator.kafka_delivery_callback)
 
             determine_start_points_and_finalize_tables(
-                kafka_client, db_conn, tables, progress_tracker, opts.lsn_gap_handling, opts.partition_count,
-                opts.replication_factor, opts.extra_topic_config, opts.always_use_avro_longs, opts.run_validations,
+                kafka_client, db_conn, tables, schema_generator, progress_tracker, opts.lsn_gap_handling,
+                opts.partition_count, opts.replication_factor, opts.extra_topic_config, opts.run_validations,
                 redo_snapshot_for_new_instance, publish_duplicate_changes_from_new_instance, opts.report_progress_only)
 
             if opts.report_progress_only:
@@ -165,7 +168,7 @@ def run() -> None:
                 if (datetime.datetime.utcnow() - last_slow_table_heartbeat_time) > \
                         constants.SLOW_TABLE_PROGRESS_HEARTBEAT_INTERVAL:
                     for t in tables:
-                        if queued_change_row_counts[t.topic_name] == 0:
+                        if not queued_change_row_counts[t.topic_name]:
                             last_topic_produce = last_topic_produces.get(t.topic_name)
                             if not last_topic_produce or (datetime.datetime.utcnow() - last_topic_produce) > \
                                     2 * constants.SLOW_TABLE_PROGRESS_HEARTBEAT_INTERVAL:

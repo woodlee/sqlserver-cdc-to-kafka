@@ -4,10 +4,13 @@ import logging
 import uuid
 from typing import Tuple, Dict, List, Any, Callable, Optional, Generator, TYPE_CHECKING
 
+from avro.schema import Schema
 import bitarray
 import pyodbc
 
-from . import avro_from_sql, constants, change_index, options, sql_queries, sql_query_subprocess, parsed_row, helpers
+from .avro import avro_transform_fn_from_sql_type
+from . import constants, change_index, options, sql_queries, sql_query_subprocess, parsed_row, \
+    helpers, avro
 
 if TYPE_CHECKING:
     from .metric_reporting import accumulator
@@ -18,21 +21,21 @@ NEW_SNAPSHOT = object()
 
 
 class TrackedField(object):
+    __slots__ = 'name', 'sql_type_name', 'change_table_ordinal', 'primary_key_ordinal', 'decimal_precision', \
+        'decimal_scale', 'transform_fn'
+
     def __init__(self, name: str, sql_type_name: str, change_table_ordinal: int, primary_key_ordinal: int,
-                 decimal_precision: int, decimal_scale: int, force_avro_long: bool,
-                 truncate_after: Optional[int] = None) -> None:
+                 decimal_precision: int, decimal_scale: int, truncate_after: Optional[int] = None) -> None:
         self.name: str = name
         self.sql_type_name: str = sql_type_name
         self.change_table_ordinal: int = change_table_ordinal
         self.primary_key_ordinal: int = primary_key_ordinal
-        self.avro_schema: Dict[str, Any] = avro_from_sql.avro_schema_from_sql_type(
-            name, sql_type_name, decimal_precision, decimal_scale, False, force_avro_long)
-        self.nullable_avro_schema: Dict[str, Any] = avro_from_sql.avro_schema_from_sql_type(
-            name, sql_type_name, decimal_precision, decimal_scale, True, force_avro_long)
-        self.transform_fn: Optional[Callable[[Any], Any]] = avro_from_sql.avro_transform_fn_from_sql_type(sql_type_name)
+        self.decimal_precision: int = decimal_precision
+        self.decimal_scale: int = decimal_scale
+        self.transform_fn: Optional[Callable[[Any], Any]] = avro_transform_fn_from_sql_type(sql_type_name)
 
         if truncate_after is not None:
-            if self.sql_type_name not in avro_from_sql.SQL_STRING_TYPES:
+            if self.sql_type_name not in constants.SQL_STRING_TYPES:
                 raise Exception(f'A truncation length was specified for field {name} but it does not appear to be a '
                                 f'string field (SQL type is {sql_type_name}).')
             orig_transform = self.transform_fn
@@ -45,13 +48,14 @@ class TrackedField(object):
 
 class TrackedTable(object):
     def __init__(self, db_conn: pyodbc.Connection, metrics_accumulator: 'accumulator.Accumulator',
-                 sql_query_processor: sql_query_subprocess.SQLQueryProcessor, schema_name: str, table_name: str,
+                 sql_query_processor: sql_query_subprocess.SQLQueryProcessor,
+                 schema_generator: avro.AvroSchemaGenerator, schema_name: str, table_name: str,
                  capture_instance_name: str, topic_name: str, min_lsn: bytes, snapshot_allowed: bool,
                  db_row_batch_size: int) -> None:
         self._db_conn: pyodbc.Connection = db_conn
         self._metrics_accumulator: 'accumulator.Accumulator' = metrics_accumulator
         self._sql_query_processor: sql_query_subprocess.SQLQueryProcessor = sql_query_processor
-
+        self._schema_generator: avro.AvroSchemaGenerator = schema_generator
         self.schema_name: str = schema_name
         self.table_name: str = table_name
         self.capture_instance_name: str = capture_instance_name
@@ -64,8 +68,8 @@ class TrackedTable(object):
 
         self.key_schema_id: int = -1
         self.value_schema_id: int = -1
-        self.key_schema: Dict[str, Any] = {}
-        self.value_schema: Dict[str, Any] = {}
+        self.key_schema: Optional[Schema] = None
+        self.value_schema: Optional[Schema] = None
         self.key_fields: Tuple[TrackedField] = tuple()
         self.value_fields: Tuple[TrackedField] = tuple()
         self.max_polled_change_index: change_index.ChangeIndex = change_index.LOWEST_CHANGE_INDEX
@@ -132,7 +136,7 @@ class TrackedTable(object):
         self, start_after_change_table_index: change_index.ChangeIndex,
         prior_change_table_max_index: Optional[change_index.ChangeIndex],
         start_from_key_for_snapshot: Optional[Dict[str, Any]], lsn_gap_handling: str,
-        schema_id_getter: Callable[[str, Dict[str, Any], Dict[str, Any]], Tuple[int, int]] = None,
+        schema_id_getter: Callable[[str, Schema, Schema], Tuple[int, int]] = None,
         progress_reset_fn: Callable[[str, str], None] = None,
         record_snapshot_completion_fn: Callable[[str], None] = None
     ) -> None:
@@ -180,24 +184,10 @@ class TrackedTable(object):
         self.key_fields = tuple(sorted(key_fields, key=lambda f: f.primary_key_ordinal))
         self._key_field_names = tuple([kf.name for kf in self.key_fields])
         self._key_field_source_table_ordinals = tuple([kf.change_table_ordinal for kf in self.key_fields])
-        key_schema_fields = [kf.avro_schema for kf in self.key_fields]
-
-        self.key_schema = {
-            "name": f"{self.schema_name}_{self.table_name}_cdc__key",
-            "namespace": constants.AVRO_SCHEMA_NAMESPACE,
-            "type": "record",
-            "fields": key_schema_fields
-        }
-
-        value_fields_plus_metadata_fields = avro_from_sql.get_cdc_metadata_fields_avro_schemas(
-            self.fq_name, self._value_field_names) + [f.nullable_avro_schema for f in self.value_fields]
-
-        self.value_schema = {
-            "name": f"{self.schema_name}_{self.table_name}_cdc__value",
-            "namespace": constants.AVRO_SCHEMA_NAMESPACE,
-            "type": "record",
-            "fields": value_fields_plus_metadata_fields
-        }
+        self.key_schema = self._schema_generator.generate_key_schema(self.schema_name, self.table_name,
+                                                                     self.key_fields)
+        self.value_schema = self._schema_generator.generate_value_schema(self.schema_name, self.table_name,
+                                                                         self.value_fields)
 
         if schema_id_getter:
             self.key_schema_id, self.value_schema_id = schema_id_getter(self.topic_name, self.key_schema,
@@ -360,7 +350,7 @@ class TrackedTable(object):
 
     def get_change_rows_per_second(self) -> int:
         with self._db_conn.cursor() as cursor:
-            q, p = sql_queries.get_change_rows_per_second(
+            q, _ = sql_queries.get_change_rows_per_second(
                 helpers.quote_name(helpers.get_fq_change_table_name(self.capture_instance_name)))
             cursor.execute(q)
             return cursor.fetchval() or 0
@@ -414,12 +404,12 @@ class TrackedTable(object):
 
     def _get_max_key_value(self) -> Optional[Tuple[Any]]:
         with self._db_conn.cursor() as cursor:
-            q, p = sql_queries.get_max_key_value(self.schema_name, self.table_name, self._key_field_names)
+            q, _ = sql_queries.get_max_key_value(self.schema_name, self.table_name, self._key_field_names)
             cursor.execute(q)
             return cursor.fetchone()
 
     def _get_min_key_value(self) -> Optional[Tuple[Any]]:
         with self._db_conn.cursor() as cursor:
-            q, p = sql_queries.get_min_key_value(self.schema_name, self.table_name, self._key_field_names)
+            q, _ = sql_queries.get_min_key_value(self.schema_name, self.table_name, self._key_field_names)
             cursor.execute(q)
             return cursor.fetchone()

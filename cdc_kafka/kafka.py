@@ -8,6 +8,7 @@ import struct
 import time
 from typing import List, Dict, Tuple, Any, Callable, Union, Generator, Optional, Iterable, Set
 
+from avro.schema import Schema
 import confluent_kafka.admin
 import confluent_kafka.avro
 import fastavro
@@ -344,7 +345,7 @@ class KafkaClient(object):
         return result
 
     # returns (key schema ID, value schema ID)
-    def register_schemas(self, topic_name: str, key_schema: Dict[str, Any], value_schema: Dict[str, Any],
+    def register_schemas(self, topic_name: str, key_schema: Schema, value_schema: Schema,
                          key_schema_compatibility_level: str = constants.DEFAULT_KEY_SCHEMA_COMPATIBILITY_LEVEL,
                          value_schema_compatibility_level: str = constants.DEFAULT_VALUE_SCHEMA_COMPATIBILITY_LEVEL) \
             -> Tuple[int, int]:
@@ -357,9 +358,6 @@ class KafkaClient(object):
         # available in the `CachedSchemaRegistryClient` we use here--and since this is a rare case--I'm explicitly
         # choosing to punt on it for the moment. The Confluent lib does now have a newer `SchemaRegistryClient` class
         # which supports subject-version deletion, but changing this code to use it appears to be a non-trivial task.
-
-        key_schema = confluent_kafka.avro.loads(json.dumps(key_schema))
-        value_schema = confluent_kafka.avro.loads(json.dumps(value_schema))
 
         key_subject, value_subject = topic_name + '-key', topic_name + '-value'
         registered = False

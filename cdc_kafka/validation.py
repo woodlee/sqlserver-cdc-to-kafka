@@ -8,7 +8,7 @@ from uuid import UUID
 
 import confluent_kafka
 
-from . import constants, change_index, avro_from_sql, kafka, helpers
+from . import constants, change_index, kafka, helpers
 
 if TYPE_CHECKING:
     from . import tracked_tables, progress_tracking
@@ -45,7 +45,7 @@ def extract_key_tuple(table: 'tracked_tables.TrackedTable', message: Dict[str, A
     for kf in table.key_fields:
         if kf.sql_type_name == 'uniqueidentifier':
             key_bits.append(SQLServerUUID(message[kf.name]))
-        elif kf.sql_type_name in avro_from_sql.SQL_STRING_TYPES:
+        elif kf.sql_type_name in constants.SQL_STRING_TYPES:
             key_bits.append(message[kf.name].casefold())
         else:
             key_bits.append(message[kf.name])
