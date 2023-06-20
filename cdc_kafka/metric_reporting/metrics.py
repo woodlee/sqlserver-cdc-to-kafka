@@ -1,4 +1,7 @@
+import json
 from typing import Any, Dict
+
+import confluent_kafka.avro
 
 from .. import constants
 
@@ -61,7 +64,7 @@ class Metrics(object):
     FIELD_NAMES = {ft[0] for ft in FIELDS_AND_TYPES}
     METRICS_SCHEMA_VERSION = '2'
 
-    METRICS_AVRO_KEY_SCHEMA = {
+    METRICS_AVRO_KEY_SCHEMA = confluent_kafka.avro.loads(json.dumps({
         "name": f"{constants.AVRO_SCHEMA_NAMESPACE}__metrics_v{METRICS_SCHEMA_VERSION}__key",
         "namespace": constants.AVRO_SCHEMA_NAMESPACE,
         "type": "record",
@@ -71,9 +74,9 @@ class Metrics(object):
                 "type": "string"
             }
         ]
-    }
+    }))
 
-    METRICS_AVRO_VALUE_SCHEMA = {
+    METRICS_AVRO_VALUE_SCHEMA = confluent_kafka.avro.loads(json.dumps({
         "name": f"{constants.AVRO_SCHEMA_NAMESPACE}__metrics_v{METRICS_SCHEMA_VERSION}__value",
         "namespace": constants.AVRO_SCHEMA_NAMESPACE,
         "type": "record",
@@ -83,7 +86,7 @@ class Metrics(object):
                 "type": v
             } for (k, v) in FIELDS_AND_TYPES
         ]
-    }
+    }))
 
     def __setattr__(self, attr: str, value) -> None:
         if attr not in Metrics.FIELD_NAMES:
