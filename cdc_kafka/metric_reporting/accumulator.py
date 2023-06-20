@@ -78,7 +78,7 @@ class Accumulator(AccumulatorAbstract):
             self._messages_copied_to_unified_topics
 
         with self._db_conn.cursor() as cursor:
-            q, p = sql_queries.get_latest_cdc_entry_time()
+            q, _ = sql_queries.get_latest_cdc_entry_time()
             cursor.execute(q)
             cdc_lag = (datetime.datetime.utcnow() - self._clock_syncer.db_time_to_utc(cursor.fetchval())) \
                 .total_seconds()

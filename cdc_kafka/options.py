@@ -220,6 +220,17 @@ def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List]:
                         'table, and column names are case-insensitive. Example: `{"dbo.order.gift_note": 65536}`. '
                         'Note that this truncates based on _character_ length, not _byte_ length!')
 
+    p.add_argument('--avro-type-spec-overrides',
+                   default=os.environ.get('AVRO_TYPE_SPEC_OVERRIDES', {}), type=json.loads,
+                   help='Optional JSON object that maps schema.table.column names to a string or object indicating the '
+                        'Avro schema type specification you want to use for the field. This will override the default '
+                        'mapping of SQL types to Avro types otherwise used and found in avro.py. Note that setting '
+                        'this only changes the generated schema and will NOT affect the way values are passed to the '
+                        'Avro serialization library, so any overriding type specified should be compatible with the '
+                        'SQL/Python types of the actual data. Example: `{"dbo.order.orderid": "long"}` could be used '
+                        'to specify the use of an Avro `long` type for a source DB column that is only a 32-bit INT, '
+                        'perhaps in preparation for a future DB column change.')
+
     p.add_argument('--terminate-on-capture-instance-change',
                    type=str2bool, nargs='?', const=True,
                    default=str2bool(os.environ.get('TERMINATE_ON_CAPTURE_INSTANCE_CHANGE', False)),

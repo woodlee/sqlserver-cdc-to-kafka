@@ -32,6 +32,7 @@ CDC_DB_SCHEMA_NAME = 'cdc'
 UNRECOGNIZED_COLUMN_DEFAULT_NAME = 'UNKNOWN_COL'
 VALIDATION_MAXIMUM_SAMPLE_SIZE_PER_TOPIC = 1_000_000
 SNAPSHOT_COMPLETION_SENTINEL = {'<< completed snapshot >>': '<< completed >>'}
+SQL_STRING_TYPES = ('char', 'nchar', 'varchar', 'ntext', 'nvarchar', 'text')
 
 CHANGE_ROWS_KIND = "change_rows"
 SNAPSHOT_ROWS_KIND = "snapshot_rows"

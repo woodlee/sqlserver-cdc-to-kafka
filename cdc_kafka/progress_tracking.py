@@ -1,7 +1,10 @@
 import collections
 import datetime
+import json
 import logging
 from typing import Union, Dict, Tuple, Any, Optional
+
+import confluent_kafka.avro
 
 from . import constants
 from .change_index import ChangeIndex
@@ -14,7 +17,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 PROGRESS_TRACKING_SCHEMA_VERSION = '2'
-PROGRESS_TRACKING_AVRO_KEY_SCHEMA = {
+PROGRESS_TRACKING_AVRO_KEY_SCHEMA = confluent_kafka.avro.loads(json.dumps({
     "name": f"{constants.AVRO_SCHEMA_NAMESPACE}__progress_tracking_v{PROGRESS_TRACKING_SCHEMA_VERSION}__key",
     "namespace": constants.AVRO_SCHEMA_NAMESPACE,
     "type": "record",
@@ -35,8 +38,8 @@ PROGRESS_TRACKING_AVRO_KEY_SCHEMA = {
             }
         }
     ]
-}
-PROGRESS_TRACKING_AVRO_VALUE_SCHEMA = {
+}))
+PROGRESS_TRACKING_AVRO_VALUE_SCHEMA = confluent_kafka.avro.loads(json.dumps({
     "name": f"{constants.AVRO_SCHEMA_NAMESPACE}__progress_tracking_v{PROGRESS_TRACKING_SCHEMA_VERSION}__value",
     "namespace": constants.AVRO_SCHEMA_NAMESPACE,
     "type": "record",
@@ -101,7 +104,7 @@ PROGRESS_TRACKING_AVRO_VALUE_SCHEMA = {
             ]
         }
     ]
-}
+}))
 
 
 class ProgressEntry(object):

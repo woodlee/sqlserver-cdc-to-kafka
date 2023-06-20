@@ -68,7 +68,7 @@ def main() -> None:
         topic_info: Dict[str, TopicProgressInfo] = collections.defaultdict(TopicProgressInfo)
 
         for msg in kafka_client.consume_all(opts.progress_topic_name):
-            if msg_ctr == 0:
+            if not msg_ctr:
                 logger.info('Read first message: %s', helpers.format_coordinates(msg))
 
             msg_ctr += 1

@@ -6,14 +6,14 @@ import json
 import logging
 import re
 import time
-from typing import Dict, Optional, List, Any, Tuple
+from typing import Dict, Optional, List, Tuple
 
 import pyodbc
 
 from . import clock_sync, kafka, tracked_tables, constants, options, validation, change_index, progress_tracking, \
-    sql_query_subprocess, sql_queries, helpers
+    sql_query_subprocess, sql_queries, helpers, avro
 from .build_startup_state import build_tracked_tables_from_cdc_metadata, determine_start_points_and_finalize_tables, \
-    get_latest_capture_instances_by_fq_name
+    get_latest_capture_instances_by_fq_name, CaptureInstanceMetadata
 from .metric_reporting import accumulator
 
 from typing import TYPE_CHECKING
@@ -48,7 +48,10 @@ def run() -> None:
         metrics_accumulator: accumulator.Accumulator = accumulator.Accumulator(
             db_conn, clock_syncer, opts.metrics_namespace, opts.process_hostname)
 
-        capture_instances_by_fq_name: Dict[str, Dict[str, Any]] = get_latest_capture_instances_by_fq_name(
+        schema_generator: avro.AvroSchemaGenerator = avro.AvroSchemaGenerator(
+            opts.always_use_avro_longs, opts.avro_type_spec_overrides)
+
+        capture_instances_by_fq_name: Dict[str, CaptureInstanceMetadata] = get_latest_capture_instances_by_fq_name(
             db_conn, opts.capture_instance_version_strategy, opts.capture_instance_version_regex,
             opts.table_whitelist_regex, opts.table_blacklist_regex)
 
@@ -56,13 +59,13 @@ def run() -> None:
             logger.error('No capture instances could be found.')
             exit(1)
 
-        capture_instance_names: List[str] = [ci['capture_instance_name']
+        capture_instance_names: List[str] = [ci.capture_instance_name
                                              for ci in capture_instances_by_fq_name.values()]
 
         tables: List[tracked_tables.TrackedTable] = build_tracked_tables_from_cdc_metadata(
             db_conn, metrics_accumulator, opts.topic_name_template, opts.snapshot_table_whitelist_regex,
             opts.snapshot_table_blacklist_regex, opts.truncate_fields, capture_instance_names, opts.db_row_batch_size,
-            opts.always_use_avro_longs, sql_query_processor)
+            sql_query_processor, schema_generator)
 
         topic_to_source_table_map: Dict[str, str] = {
             t.topic_name: t.fq_name for t in tables}
@@ -88,8 +91,8 @@ def run() -> None:
             ), metrics_accumulator.kafka_delivery_callback)
 
             determine_start_points_and_finalize_tables(
-                kafka_client, db_conn, tables, progress_tracker, opts.lsn_gap_handling, opts.partition_count,
-                opts.replication_factor, opts.extra_topic_config, opts.always_use_avro_longs, opts.run_validations,
+                kafka_client, db_conn, tables, schema_generator, progress_tracker, opts.lsn_gap_handling,
+                opts.partition_count, opts.replication_factor, opts.extra_topic_config, opts.run_validations,
                 redo_snapshot_for_new_instance, publish_duplicate_changes_from_new_instance, opts.report_progress_only)
 
             if opts.report_progress_only:
@@ -165,7 +168,7 @@ def run() -> None:
                 if (datetime.datetime.utcnow() - last_slow_table_heartbeat_time) > \
                         constants.SLOW_TABLE_PROGRESS_HEARTBEAT_INTERVAL:
                     for t in tables:
-                        if queued_change_row_counts[t.topic_name] == 0:
+                        if not queued_change_row_counts[t.topic_name]:
                             last_topic_produce = last_topic_produces.get(t.topic_name)
                             if not last_topic_produce or (datetime.datetime.utcnow() - last_topic_produce) > \
                                     2 * constants.SLOW_TABLE_PROGRESS_HEARTBEAT_INTERVAL:
@@ -296,55 +299,50 @@ def run() -> None:
 def should_terminate_due_to_capture_instance_change(
         db_conn: pyodbc.Connection, progress_tracker: progress_tracking.ProgressTracker,
         capture_instance_version_strategy: str, capture_instance_version_regex: str,
-        capture_instance_to_topic_map: Dict[str, str], current_capture_instances: Dict[str, Dict[str, Any]],
+        capture_instance_to_topic_map: Dict[str, str], current_capture_instances: Dict[str, CaptureInstanceMetadata],
         table_whitelist_regex: str, table_blacklist_regex: str,
         topic_to_max_polled_index_map: Dict[str, change_index.ChangeIndex]
 ) -> bool:
-    new_capture_instances = get_latest_capture_instances_by_fq_name(
+    new_capture_instances: Dict[str, CaptureInstanceMetadata] = get_latest_capture_instances_by_fq_name(
         db_conn, capture_instance_version_strategy, capture_instance_version_regex, table_whitelist_regex,
         table_blacklist_regex)
 
-    current = {k: v['capture_instance_name'] for k, v in current_capture_instances.items()}
-    new = {k: v['capture_instance_name'] for k, v in new_capture_instances.items()}
+    current = {k: (v.capture_instance_name, v.types_checksum) for k, v in current_capture_instances.items()}
+    new = {k: (v.capture_instance_name, v.types_checksum) for k, v in new_capture_instances.items()}
 
     if new == current:
         logger.debug('Capture instances unchanged; continuing...')
         return False
 
-    def better_json_serialize(obj):
-        if isinstance(obj, (datetime.datetime, datetime.date)):
-            return obj.isoformat()
-        if isinstance(obj, (bytes,)):
-            return f'0x{obj.hex()}'
-        raise TypeError("Type %s not serializable" % type(obj))
-
     for fq_name, current_ci in current_capture_instances.items():
         if fq_name in new_capture_instances:
             new_ci = new_capture_instances[fq_name]
-            if current_ci['capture_instance_name'] == new_ci['capture_instance_name']:
+            if (current_ci.capture_instance_name == new_ci.capture_instance_name and
+                    current_ci.types_checksum == new_ci.types_checksum):
                 continue
-            topic = capture_instance_to_topic_map[current_ci['capture_instance_name']]
+            topic = capture_instance_to_topic_map[current_ci.capture_instance_name]
             if topic in topic_to_max_polled_index_map:
                 progress_tracker.emit_changes_progress_heartbeat(topic, topic_to_max_polled_index_map[topic])
             last_recorded_progress = progress_tracker.get_last_recorded_progress_for_topic(topic)
             current_idx = last_recorded_progress and last_recorded_progress.change_index or \
                 change_index.LOWEST_CHANGE_INDEX
-            logger.info('Change detected in capture instance for %s.\nCurrent: %s\nNew: %s', fq_name,
-                        json.dumps(current_ci, default=better_json_serialize),
-                        json.dumps(new_ci, default=better_json_serialize))
-            new_ci_min_index = change_index.ChangeIndex(new_ci['start_lsn'], b'\x00' * 10, 0)
+            logger.info('Change detected in capture instance for %s.\nCurrent: capture instance name "%s", column '
+                        'types checksum %s\nNew: capture instance name "%s", column types checksum %s',
+                        fq_name, current_ci.capture_instance_name, current_ci.types_checksum,
+                        new_ci.capture_instance_name, new_ci.types_checksum)
+            new_ci_min_index = change_index.ChangeIndex(new_ci.start_lsn, b'\x00' * 10, 0)
             if current_idx < new_ci_min_index:
                 with db_conn.cursor() as cursor:
                     change_table_name = helpers.quote_name(
-                        helpers.get_fq_change_table_name(current_ci['capture_instance_name']))
+                        helpers.get_fq_change_table_name(current_ci.capture_instance_name))
                     cursor.execute(f"SELECT TOP 1 1 FROM {change_table_name} WITH (NOLOCK)")
                     has_rows = cursor.fetchval() is not None
                 if has_rows:
                     logger.info('Progress against existing capture instance ("%s") for table "%s" has reached index '
                                 '%s, but the new capture instance ("%s") does not begin until index %s. Deferring '
                                 'termination to maintain data integrity and will try again on next capture instance '
-                                'evaluation iteration.', current_ci['capture_instance_name'], fq_name, current_idx,
-                                new_ci['capture_instance_name'], new_ci_min_index)
+                                'evaluation iteration.', current_ci.capture_instance_name, fq_name, current_idx,
+                                new_ci.capture_instance_name, new_ci_min_index)
                     return False
 
     logger.warning('Terminating process due to change in capture instances. This behavior can be controlled by '
