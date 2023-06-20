@@ -17,7 +17,12 @@ SELECT
     , capture_instance
     , start_lsn
     , create_date
-FROM [{constants.CDC_DB_SCHEMA_NAME}].[change_tables]
+    , COALESCE(CHECKSUM_AGG(CHECKSUM(
+        cc.column_name, cc.column_id, cc.column_type, cc.column_ordinal, cc.is_computed
+    )), -1) AS col_types_checksum
+FROM [{constants.CDC_DB_SCHEMA_NAME}].[change_tables] AS ct
+JOIN [{constants.CDC_DB_SCHEMA_NAME}].[captured_columns] AS cc on ct.object_id = cc.object_id
+GROUP BY source_object_id, capture_instance, start_lsn, create_date
 ORDER BY source_object_id
     ''', []
 

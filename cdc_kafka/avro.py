@@ -37,6 +37,9 @@ class AvroSchemaGenerator(object):
 
     def generate_value_schema(self, db_schema_name: str, db_table_name: str,
                               value_fields: Sequence['TrackedField']) -> Schema:
+        # In CDC tables, all columns are nullable so that if the column is dropped from the source table, the capture
+        # instance need not be updated. We align with that by making the Avro value schema for all captured fields
+        # nullable (which also helps with maintaining future Avro schema compatibility).
         value_schema_fields = [self.get_record_field_schema(
             db_schema_name, db_table_name, vf.name, vf.sql_type_name, vf.decimal_precision, vf.decimal_scale, True
         ) for vf in value_fields]
@@ -51,9 +54,6 @@ class AvroSchemaGenerator(object):
         }
         return confluent_kafka.avro.loads(json.dumps(schema_json))
 
-    # In CDC tables, all columns are nullable so that if the column is dropped from the source table, the capture
-    # instance need not be updated. We align with that by making the Avro value schema for all captured fields nullable
-    # (which also helps with maintaining future Avro schema compatibility).
     def get_record_field_schema(self, db_schema_name: str, db_table_name: str, field_name: str, sql_type_name: str,
                                 decimal_precision: int, decimal_scale: int, make_nullable: bool) -> Dict[str, Any]:
         override_type = self.normalized_avro_type_overrides.get(

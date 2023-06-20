@@ -1,9 +1,10 @@
 import collections
+import datetime
 import json
 import logging
 import re
 import time
-from typing import Dict, List, Tuple, Iterable, Union, Optional, Any, Set
+from typing import Dict, List, Tuple, Iterable, Union, Optional, Any, Set, NamedTuple
 
 import pyodbc
 from tabulate import tabulate
@@ -336,17 +337,26 @@ def ddl_change_requires_new_snapshot(db_conn: pyodbc.Connection, schema_generato
     return False
 
 
+class CaptureInstanceMetadata(NamedTuple):
+    fq_name: str
+    capture_instance_name: str
+    start_lsn: bytes
+    create_date: datetime.datetime
+    types_checksum: int
+    regex_matched_group: str
+
+
 # This pulls the "greatest" capture instance running for each source table, in the event there is more than one.
 def get_latest_capture_instances_by_fq_name(
         db_conn: pyodbc.Connection, capture_instance_version_strategy: str, capture_instance_version_regex: str,
         table_whitelist_regex: str, table_blacklist_regex: str
-) -> Dict[str, Dict[str, Any]]:
+) -> Dict[str, CaptureInstanceMetadata]:
     if capture_instance_version_strategy == options.CAPTURE_INSTANCE_VERSION_STRATEGY_REGEX \
             and not capture_instance_version_regex:
         raise Exception('Please provide a capture_instance_version_regex when specifying the `regex` '
                         'capture_instance_version_strategy.')
-    result: Dict[str, Dict[str, Any]] = {}
-    fq_name_to_capture_instances: Dict[str, List[Dict[str, Any]]] = collections.defaultdict(list)
+    result: Dict[str, CaptureInstanceMetadata] = {}
+    fq_name_to_capture_instances: Dict[str, List[CaptureInstanceMetadata]] = collections.defaultdict(list)
     capture_instance_version_regex = capture_instance_version_regex and re.compile(capture_instance_version_regex)
     table_whitelist_regex = table_whitelist_regex and re.compile(table_whitelist_regex, re.IGNORECASE)
     table_blacklist_regex = table_blacklist_regex and re.compile(table_blacklist_regex, re.IGNORECASE)
@@ -370,27 +380,25 @@ def get_latest_capture_instances_by_fq_name(
                              'next pass', fq_table_name)
                 continue
 
-            as_dict = {
-                'fq_name': fq_table_name,
-                'capture_instance_name': row[2],
-                'start_lsn': row[3],
-                'create_date': row[4],
-            }
             if capture_instance_version_regex:
                 match = capture_instance_version_regex.match(row[1])
-                as_dict['regex_matched_group'] = match and match.group(1) or ''
-            fq_name_to_capture_instances[as_dict['fq_name']].append(as_dict)
+                regex_matched_group = match and match.group(1) or ''
+            else:
+                regex_matched_group = None
+
+            ci_meta = CaptureInstanceMetadata(fq_table_name, row[2], row[3], row[4], row[5], regex_matched_group)
+            fq_name_to_capture_instances[ci_meta.fq_name].append(ci_meta)
 
     for fq_name, capture_instances in fq_name_to_capture_instances.items():
         if capture_instance_version_strategy == options.CAPTURE_INSTANCE_VERSION_STRATEGY_CREATE_DATE:
-            latest_instance = sorted(capture_instances, key=lambda x: x['create_date'])[-1]
+            latest_instance = sorted(capture_instances, key=lambda x: x.create_date)[-1]
         elif capture_instance_version_strategy == options.CAPTURE_INSTANCE_VERSION_STRATEGY_REGEX:
-            latest_instance = sorted(capture_instances, key=lambda x: x['regex_matched_group'])[-1]
+            latest_instance = sorted(capture_instances, key=lambda x: x.regex_matched_group)[-1]
         else:
             raise Exception(f'Capture instance version strategy "{capture_instance_version_strategy}" not recognized.')
         result[fq_name] = latest_instance
 
     logger.debug('Latest capture instance names determined by "%s" strategy: %s', capture_instance_version_strategy,
-                 sorted([v['capture_instance_name'] for v in result.values()]))
+                 sorted([v.capture_instance_name for v in result.values()]))
 
     return result
