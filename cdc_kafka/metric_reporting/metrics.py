@@ -46,10 +46,6 @@ class Metrics(object):
         ("kafka_produces_avg_time_per_record_ms", ["null", "float"]),
         ("kafka_delivery_acks_count", "int"),
 
-        ("kafka_progress_commit_and_flush_count", "int"),
-        ("kafka_progress_commit_and_flush_total_time_sec", "float"),
-        ("kafka_progress_commit_and_flush_avg_time_ms", ["null", "float"]),
-
         ("produced_delete_changes_count", "int"),
         ("produced_insert_changes_count", "int"),
         ("produced_update_changes_count", "int"),
@@ -88,7 +84,7 @@ class Metrics(object):
         ]
     }))
 
-    def __setattr__(self, attr: str, value) -> None:
+    def __setattr__(self, attr: str, value: Any) -> None:
         if attr not in Metrics.FIELD_NAMES:
             raise AttributeError(f'Metric name {attr} not recognized.')
         super(Metrics, self).__setattr__(attr, value)

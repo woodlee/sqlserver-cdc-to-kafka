@@ -1,5 +1,5 @@
 import datetime
-from typing import Tuple, Any, Dict, Optional
+from typing import Any, Dict, Sequence
 
 from . import change_index
 
@@ -10,15 +10,15 @@ class ParsedRow(object):
         'value_dict'
 
     def __init__(self, table_fq_name: str, row_kind: str, operation_name: str, event_db_time: datetime.datetime,
-                 change_idx: Optional[change_index.ChangeIndex], ordered_key_field_values: Tuple[Any],
-                 destination_topic: str, avro_key_schema_id: int, avro_value_schema_id: int,
-                 key_dict: Dict[str, Any], value_dict: Dict[str, Any]) -> None:
+                 change_idx: change_index.ChangeIndex, ordered_key_field_values: Sequence[Any], destination_topic: str,
+                 avro_key_schema_id: int, avro_value_schema_id: int, key_dict: Dict[str, Any],
+                 value_dict: Dict[str, Any]) -> None:
         self.table_fq_name: str = table_fq_name
         self.row_kind: str = row_kind
         self.operation_name: str = operation_name
         self.event_db_time: datetime.datetime = event_db_time
-        self.change_idx: Optional[change_index.ChangeIndex] = change_idx
-        self.ordered_key_field_values: Tuple = ordered_key_field_values
+        self.change_idx: change_index.ChangeIndex = change_idx
+        self.ordered_key_field_values: Sequence[Any] = ordered_key_field_values
         self.destination_topic: str = destination_topic
         self.avro_key_schema_id: int = avro_key_schema_id
         self.avro_value_schema_id: int = avro_value_schema_id

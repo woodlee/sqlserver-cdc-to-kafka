@@ -1,7 +1,8 @@
+import abc
 import datetime
-from abc import ABC
-from typing import List, Any, Dict
+from typing import List, Any, Dict, Optional
 
+import confluent_kafka
 import pyodbc
 import sortedcontainers
 
@@ -13,15 +14,38 @@ if TYPE_CHECKING:
     from .. import clock_sync
 
 
-class AccumulatorAbstract(ABC):
+class AccumulatorAbstract(abc.ABC):
+    @abc.abstractmethod
     def reset_and_start(self) -> None: pass
+
+    @abc.abstractmethod
     def end_and_get_values(self) -> metrics.Metrics: pass
+
+    @abc.abstractmethod
+    def register_sleep(self, sleep_time_seconds: float) -> None: pass
+
+    @abc.abstractmethod
+    def register_db_query(self, seconds_elapsed: float, db_query_kind: str, retrieved_row_count: int) -> None: pass
+
+    @abc.abstractmethod
+    def register_kafka_produce(self, seconds_elapsed: float, original_value: Optional[Dict[str, Any]],
+                               message_type: str) -> None: pass
+
+    @abc.abstractmethod
+    def kafka_delivery_callback(self, message_type: str, message: confluent_kafka.Message,
+                                original_key: Dict[str, Any], original_value: Optional[Dict[str, Any]]) -> None: pass
+
+
+class NoopAccumulator(AccumulatorAbstract):
+    def reset_and_start(self) -> None: pass
+    def end_and_get_values(self) -> metrics.Metrics: return metrics.Metrics()
     def register_sleep(self, sleep_time_seconds: float) -> None: pass
     def register_db_query(self, seconds_elapsed: float, db_query_kind: str, retrieved_row_count: int) -> None: pass
-    def register_kafka_produce(self, seconds_elapsed: float, original_value: Dict[str, Any], message_type: str) -> None: pass
-    def register_kafka_commit(self, seconds_elapsed: float) -> None: pass
-    def kafka_delivery_callback(self, message_type: str, original_value: Dict[str, Any],
-                                produce_datetime: datetime.datetime, **_) -> None: pass
+
+    def register_kafka_produce(self, seconds_elapsed: float, original_value: Optional[Dict[str, Any]],
+                               message_type: str) -> None: pass
+    def kafka_delivery_callback(self, message_type: str, message: confluent_kafka.Message,
+                                original_key: Dict[str, Any], original_value: Optional[Dict[str, Any]]) -> None: pass
 
 
 class Accumulator(AccumulatorAbstract):
@@ -55,8 +79,6 @@ class Accumulator(AccumulatorAbstract):
         self._change_db_tran_end_times_produced: sortedcontainers.SortedList = sortedcontainers.SortedList()
         self._e2e_latencies_sec: List[float] = []
         self._kafka_produces_total_time_sec: float = 0
-        self._kafka_progress_commit_and_flush_total_time_sec: float = 0
-        self._kafka_progress_commit_and_flush_count: int = 0
         self._kafka_delivery_acks_count: int = 0
         self._produced_delete_changes_count: int = 0
         self._produced_insert_changes_count: int = 0
@@ -105,8 +127,13 @@ class Accumulator(AccumulatorAbstract):
 
         m.e2e_latency_avg_sec = \
             (self._e2e_latencies_sec and sum(self._e2e_latencies_sec) / len(self._e2e_latencies_sec)) or None
-        m.e2e_latency_max_sec = (self._e2e_latencies_sec and max(self._e2e_latencies_sec)) or None
-        m.e2e_latency_min_sec = (self._e2e_latencies_sec and min(self._e2e_latencies_sec)) or None
+        e2e_max: Optional[float] = None
+        e2e_min: Optional[float] = None
+        if self._e2e_latencies_sec:
+            e2e_max = max(self._e2e_latencies_sec)
+            e2e_min = min(self._e2e_latencies_sec)
+        m.e2e_latency_max_sec = e2e_max
+        m.e2e_latency_min_sec = e2e_min
 
         m.sql_server_cdc_process_lag_sec = cdc_lag
 
@@ -139,13 +166,6 @@ class Accumulator(AccumulatorAbstract):
              self._kafka_produces_total_time_sec / kafka_produces_count * 1000) or None
         m.kafka_delivery_acks_count = self._kafka_delivery_acks_count
 
-        m.kafka_progress_commit_and_flush_count = self._kafka_progress_commit_and_flush_count
-        m.kafka_progress_commit_and_flush_total_time_sec = self._kafka_progress_commit_and_flush_total_time_sec
-        m.kafka_progress_commit_and_flush_avg_time_ms = \
-            (self._kafka_progress_commit_and_flush_count and
-             self._kafka_progress_commit_and_flush_total_time_sec / self._kafka_progress_commit_and_flush_count
-             * 1000) or None
-
         m.produced_delete_changes_count = self._produced_delete_changes_count
         m.produced_insert_changes_count = self._produced_insert_changes_count
         m.produced_update_changes_count = self._produced_update_changes_count
@@ -173,12 +193,12 @@ class Accumulator(AccumulatorAbstract):
         else:
             raise Exception(f'Accumulator.register_db_query does not recognize db_query_kind "{db_query_kind}".')
 
-    def register_kafka_produce(self, seconds_elapsed: float, original_value: Dict[str, Any], message_type: str) -> None:
+    def register_kafka_produce(self, seconds_elapsed: float, original_value: Optional[Dict[str, Any]],
+                               message_type: str) -> None:
         self._kafka_produces_total_time_sec += seconds_elapsed
 
         if message_type in (constants.CHANGE_PROGRESS_MESSAGE, constants.SNAPSHOT_PROGRESS_MESSAGE,
-                            constants.HEARTBEAT_PROGRESS_MESSAGE, constants.METRIC_REPORTING_MESSAGE,
-                            constants.PROGRESS_DELETION_TOMBSTONE_MESSAGE):
+                            constants.METRIC_REPORTING_MESSAGE, constants.PROGRESS_DELETION_TOMBSTONE_MESSAGE):
             self._produced_metadata_records_count += 1
         elif message_type == constants.DELETION_CHANGE_TOMBSTONE_MESSAGE:
             self._produced_deletion_tombstones_count += 1
@@ -186,7 +206,7 @@ class Accumulator(AccumulatorAbstract):
             self._messages_copied_to_unified_topics += 1
         elif message_type == constants.SINGLE_TABLE_SNAPSHOT_MESSAGE:
             self._produced_snapshot_records_count += 1
-        elif message_type == constants.SINGLE_TABLE_CHANGE_MESSAGE:
+        elif message_type == constants.SINGLE_TABLE_CHANGE_MESSAGE and original_value:
             self._change_lsns_produced.add(original_value[constants.LSN_NAME])
             self._change_db_tran_end_times_produced.add(original_value[constants.EVENT_TIME_NAME])
             operation_name = original_value[constants.OPERATION_NAME]
@@ -202,16 +222,21 @@ class Accumulator(AccumulatorAbstract):
         else:
             raise Exception(f'Accumulator.register_kafka_produce does not recognize message type: "{message_type}".')
 
-    def register_kafka_commit(self, seconds_elapsed: float) -> None:
-        self._kafka_progress_commit_and_flush_count += 1
-        self._kafka_progress_commit_and_flush_total_time_sec += seconds_elapsed
-
-    def kafka_delivery_callback(self, message_type: str, original_value: Dict[str, Any],
-                                produce_datetime: datetime.datetime, **_) -> None:
+    def kafka_delivery_callback(self, message_type: str, message: confluent_kafka.Message,
+                                original_key: Dict[str, Any], original_value: Optional[Dict[str, Any]]) -> None:
         self._kafka_delivery_acks_count += 1
 
         if message_type not in (constants.SINGLE_TABLE_CHANGE_MESSAGE, constants.UNIFIED_TOPIC_CHANGE_MESSAGE):
             return
+
+        if not original_value:
+            return
+
+        timestamp_type, timestamp = message.timestamp()
+        if timestamp_type != confluent_kafka.TIMESTAMP_CREATE_TIME:
+            produce_datetime = datetime.datetime.utcnow()
+        else:
+            produce_datetime = datetime.datetime.utcfromtimestamp(timestamp / 1000.0)
 
         event_time = datetime.datetime.fromisoformat(original_value[constants.EVENT_TIME_NAME])
         db_commit_time = self._clock_syncer.db_time_to_utc(event_time)

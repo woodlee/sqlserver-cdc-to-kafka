@@ -1,4 +1,4 @@
-from typing import List, Tuple, Iterable, Collection, Optional
+from typing import List, Tuple, Iterable, Collection, Optional, Sequence
 
 import pyodbc
 
@@ -117,7 +117,7 @@ WHERE object_id = OBJECT_ID(?) AND required_column_update = 0
     ''', [(pyodbc.SQL_VARCHAR, 255, None)]
 
 
-def get_table_count(schema_name: str, table_name: str, pk_cols: Tuple[str],
+def get_table_count(schema_name: str, table_name: str, pk_cols: Sequence[str],
                     odbc_columns: Tuple[pyodbc.Row, ...]) -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
     declarations, where_spec, params = _get_snapshot_query_bits(pk_cols, odbc_columns, ('>=', '<='))
 
@@ -145,7 +145,7 @@ SELECT COUNT(*) FROM (
     ''', []
 
 
-def get_max_key_value(schema_name: str, table_name: str, pk_cols: Tuple[str]) -> \
+def get_max_key_value(schema_name: str, table_name: str, pk_cols: Sequence[str]) -> \
         Tuple[str, List[Tuple[int, int, Optional[int]]]]:
     select_spec = ", ".join([f'[{x}]' for x in pk_cols])
     order_by_spec = ", ".join([f'[{x}] DESC' for x in pk_cols])
@@ -156,7 +156,7 @@ FROM [{schema_name}].[{table_name}] ORDER BY {order_by_spec}
     ''', []
 
 
-def get_min_key_value(schema_name: str, table_name: str, pk_cols: Tuple[str]) -> \
+def get_min_key_value(schema_name: str, table_name: str, pk_cols: Sequence[str]) -> \
         Tuple[str, List[Tuple[int, int, Optional[int]]]]:
     select_spec = ", ".join([f'[{x}]' for x in pk_cols])
     order_by_spec = ", ".join([f'[{x}] ASC' for x in pk_cols])
@@ -249,7 +249,7 @@ ORDER BY {order_spec}
 
 def get_snapshot_rows(
         batch_size: int, schema_name: str, table_name: str, field_names: Collection[str],
-        removed_field_names: Collection[str], pk_cols: Collection[str], first_read: bool,
+        removed_field_names: Collection[str], pk_cols: Sequence[str], first_read: bool,
         odbc_columns: Tuple[pyodbc.Row, ...]) -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
     select_cols = []
     for fn in field_names:
@@ -260,6 +260,7 @@ def get_snapshot_rows(
     select_column_specs = ', '.join(select_cols)
     order_spec = ', '.join([f'[{x}] DESC' for x in pk_cols])
 
+    params: List[Tuple[int, int, Optional[int]]]
     if first_read:
         declarations = '@K0 int = 0'
         where_spec = '1=1'
@@ -287,7 +288,7 @@ ORDER BY {order_spec}
     ''', params
 
 
-def _get_snapshot_query_bits(pk_cols: Collection[str], odbc_columns: Tuple[pyodbc.Row, ...],
+def _get_snapshot_query_bits(pk_cols: Sequence[str], odbc_columns: Tuple[pyodbc.Row, ...],
                              comparators: Iterable[str]) -> Tuple[str, str, List[Tuple[int, int, Optional[int]]]]:
     # For multi-column primary keys, this builds a WHERE clause of the following form, assuming
     # for example a PK on (field_a, field_b, field_c):

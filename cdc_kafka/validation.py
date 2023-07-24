@@ -3,7 +3,7 @@ import datetime
 import functools
 import json
 import logging
-from typing import List, Union, Iterable, Dict, Tuple, Any, Optional, TYPE_CHECKING, Set
+from typing import List, Iterable, Dict, Tuple, Any, Optional, TYPE_CHECKING, Set, Mapping, Sequence
 from uuid import UUID
 
 import confluent_kafka
@@ -20,14 +20,16 @@ logger = logging.getLogger(__name__)
 class SQLServerUUID(object):
     # implements UUID comparison the way SQL Server does it, so we can order them the same way
 
-    def __init__(self, uuid: Union[str, UUID]) -> None:
+    def __init__(self, uuid: str | UUID) -> None:
         self.uuid = UUID(uuid) if isinstance(uuid, str) else uuid
         b = bytearray(self.uuid.bytes)
         b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15] = \
-            b[10], b[11], b[12], b[13], b[14], b[15], b[8], b[9], b[6], b[7], b[4], b[5], b[0], b[1], b[2], b[3]
+            b[10], b[11], b[12], b[13], b[14], b[15], b[8], b[9], b[7], b[6], b[5], b[4], b[3], b[2], b[1], b[0]
         self.sql_ordered_bytes = bytes(b)
 
-    def __eq__(self, other: 'SQLServerUUID') -> bool:
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, SQLServerUUID):
+            return NotImplemented
         return self.sql_ordered_bytes == other.sql_ordered_bytes
 
     def __lt__(self, other: 'SQLServerUUID') -> bool:
@@ -40,13 +42,13 @@ class SQLServerUUID(object):
         return str(self.uuid).upper()
 
 
-def extract_key_tuple(table: 'tracked_tables.TrackedTable', message: Dict[str, Any]) -> Tuple:
-    key_bits = []
+def extract_key_tuple(table: 'tracked_tables.TrackedTable', message: Mapping[str, str | int]) -> Tuple[Any, ...]:
+    key_bits: List[Any] = []
     for kf in table.key_fields:
         if kf.sql_type_name == 'uniqueidentifier':
-            key_bits.append(SQLServerUUID(message[kf.name]))
+            key_bits.append(SQLServerUUID(str(message[kf.name])))
         elif kf.sql_type_name in constants.SQL_STRING_TYPES:
-            key_bits.append(message[kf.name].casefold())
+            key_bits.append(str(message[kf.name]).casefold())
         else:
             key_bits.append(message[kf.name])
     return tuple(key_bits)
@@ -63,22 +65,22 @@ class TableMessagesSummary(object):
         self.snapshot_count: int = 0
         self.unknown_operation_count: int = 0
         self.total_count: int = 0
-        self.keys_seen_in_snapshots: Set[Tuple] = set()
-        self.deleted_keys: Set[Tuple] = set()
-        self.keys_seen_in_changes: Set[Tuple] = set()
+        self.keys_seen_in_snapshots: Set[Tuple[Any, ...]] = set()
+        self.deleted_keys: Set[Tuple[Any, ...]] = set()
+        self.keys_seen_in_changes: Set[Tuple[Any, ...]] = set()
         self.min_change_index_seen: Optional[change_index.ChangeIndex] = None
         self.max_change_index_seen: Optional[change_index.ChangeIndex] = None
         self.max_change_index_seen_coordinates: Optional[str] = None
         self.latest_change_seen: Optional[datetime.datetime] = None
         self.change_index_order_regressions_count: int = 0
-        self.min_snapshot_key_seen: Optional[Tuple] = None
-        self.max_snapshot_key_seen: Optional[Tuple] = None
+        self.min_snapshot_key_seen: Optional[Tuple[Any, ...]] = None
+        self.max_snapshot_key_seen: Optional[Tuple[Any, ...]] = None
         self.snapshot_key_order_regressions_count: int = 0
         self.missing_offsets: int = 0
 
         self._last_processed_offset_by_partition: Dict[int, int] = {}
         self._last_change_index_seen_for_partition: Dict[int, change_index.ChangeIndex] = {}
-        self._last_snapshot_key_seen_for_partition: Dict[int, Tuple] = {}
+        self._last_snapshot_key_seen_for_partition: Dict[int, Tuple[Any, ...]] = {}
         self._last_snapshot_coordinates_seen_for_partition: Dict[int, str] = {}
 
     def __repr__(self) -> str:
@@ -221,15 +223,20 @@ class Validator(object):
             table = self._tables_by_name[table_name]
             failures, warnings, infos = [], [], []
 
-            snap_progress = progress.get((table.topic_name, constants.SNAPSHOT_ROWS_KIND))
+            progress_entry = progress.get((table.topic_name, constants.SNAPSHOT_ROWS_KIND))
+            snap_progress: Optional[Sequence[Any]] = None
 
-            if snap_progress:
-                if snap_progress.snapshot_index == constants.SNAPSHOT_COMPLETION_SENTINEL:
-                    snap_progress = constants.SNAPSHOT_COMPLETION_SENTINEL
+            if progress_entry and progress_entry.snapshot_index:
+                if progress_entry.snapshot_index == constants.SNAPSHOT_COMPLETION_SENTINEL:
+                    snap_progress = tuple(constants.SNAPSHOT_COMPLETION_SENTINEL.keys())
                 else:
-                    snap_progress = extract_key_tuple(table, snap_progress.snapshot_index)
-            changes_progress = progress.get((table.topic_name, constants.CHANGE_ROWS_KIND))
-            changes_progress_index = changes_progress and changes_progress.change_index
+                    snap_progress = extract_key_tuple(table, progress_entry.snapshot_index)
+
+            changes_progress: Optional[progress_tracking.ProgressEntry] = progress.get(
+                (table.topic_name, constants.CHANGE_ROWS_KIND))
+            changes_progress_index: Optional[change_index.ChangeIndex] = None
+            if changes_progress:
+                changes_progress_index = changes_progress.change_index
 
             db_delete_rows, db_insert_rows, db_update_rows, db_source_row_counts = 0, 0, 0, 0
             if summary.max_change_index_seen:
@@ -237,7 +244,7 @@ class Validator(object):
                     summary.max_change_index_seen)
 
             topic_snapshot_key_count = len(summary.keys_seen_in_snapshots.difference(summary.deleted_keys))
-            if topic_snapshot_key_count:
+            if topic_snapshot_key_count and summary.min_snapshot_key_seen and summary.max_snapshot_key_seen:
                 low_raw_key, high_raw_key = [], []
                 for k in summary.min_snapshot_key_seen:
                     if isinstance(k, SQLServerUUID):
@@ -278,10 +285,10 @@ class Validator(object):
             elif (datetime.datetime.utcnow() - summary.latest_change_seen) > datetime.timedelta(days=1):
                 infos.append(f'Last change entry seen in Kafka was dated {summary.latest_change_seen}.')
 
-            if changes_progress is None:
+            if not changes_progress_index:
                 failures.append(f'No changes progress found. Last key found in topic was '
                                 f'{summary.max_change_index_seen} @ {summary.max_change_index_seen_coordinates}')
-            elif changes_progress.is_heartbeat:
+            elif changes_progress_index.is_probably_heartbeat:
                 if summary.max_change_index_seen and summary.max_change_index_seen > changes_progress_index:
                     failures.append(f'Changes progress mismatch. Last recorded heartbeat progress was '
                                     f'{changes_progress_index} but last key found in topic was '
@@ -292,7 +299,7 @@ class Validator(object):
                                     f'but last key found in topic was {summary.max_change_index_seen} @ '
                                     f'{summary.max_change_index_seen_coordinates}')
 
-            if snap_progress != constants.SNAPSHOT_COMPLETION_SENTINEL and \
+            if snap_progress != tuple(constants.SNAPSHOT_COMPLETION_SENTINEL.keys()) and \
                     summary.min_snapshot_key_seen != snap_progress:
                 failures.append(f'Snapshot progress mismatch. Recorded progress key was {snap_progress} but last key '
                                 f'found in topic was {summary.min_snapshot_key_seen}')
@@ -348,8 +355,8 @@ class Validator(object):
         for ut_topic, ut_result in summaries_by_unified_topic.items():
             print(f"\nResults from analyzing {ut_result['total_messages_read']} messages from unified "
                   f"topic {ut_topic}:")
-            warnings: List[str] = ut_result['warnings']
-            failures: List[str] = ut_result['failures']
+            warnings = ut_result['warnings']
+            failures = ut_result['failures']
 
             for table_name, table_summary in ut_result['table_summaries'].items():
                 if table_summary.latest_change_seen is None:
@@ -394,7 +401,7 @@ class Validator(object):
         warnings: List[str] = []
         failures: List[str] = []
         sample_regression_indices: List[str] = []
-        unexpected_table_msg_counts = collections.defaultdict(int)
+        unexpected_table_msg_counts: Dict[str, int] = collections.defaultdict(int)
         total_messages_read: int = 0
         lsn_regressions_count: int = 0
         tombstones_count: int = 0

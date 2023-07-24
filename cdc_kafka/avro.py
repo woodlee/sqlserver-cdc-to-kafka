@@ -1,5 +1,5 @@
 import json
-from typing import Dict, Union, Sequence, List, Any, Tuple, Optional, Callable
+from typing import Dict, Sequence, List, Any, Tuple, Optional, Callable
 
 from avro.schema import Schema
 import confluent_kafka.avro
@@ -12,9 +12,10 @@ if TYPE_CHECKING:
 
 
 class AvroSchemaGenerator(object):
-    def __init__(self, always_use_avro_longs: bool, avro_type_spec_overrides: Dict[str, Union[str, Dict]]) -> None:
+    def __init__(self, always_use_avro_longs: bool,
+                 avro_type_spec_overrides: Dict[str, str | Dict[str, str | int]]) -> None:
         self.always_use_avro_longs: bool = always_use_avro_longs
-        self.normalized_avro_type_overrides: Dict[Tuple[str, str, str], Union[str, Dict]] = {}
+        self.normalized_avro_type_overrides: Dict[Tuple[str, str, str], str | Dict[str, str | int]] = {}
         for k, v in avro_type_spec_overrides.items():
             if k.count('.') != 2:
                 raise Exception(f'Avro type spec override "{k}" was incorrectly specified. Please key this config in '
