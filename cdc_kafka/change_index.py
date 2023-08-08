@@ -11,15 +11,18 @@ class ChangeIndex(object):
     def __init__(self, lsn: bytes, seqval: bytes, operation: int) -> None:
         self.lsn: bytes = lsn
         self.seqval: bytes = seqval
+        self.operation: int
         if isinstance(operation, int):
-            self.operation: int = operation
+            self.operation = operation
         elif isinstance(operation, str):
-            self.operation: int = constants.CDC_OPERATION_NAME_TO_ID[operation]
+            self.operation = constants.CDC_OPERATION_NAME_TO_ID[operation]
         else:
             raise Exception(f'Unrecognized type for parameter `operation` (type: {type(operation)}, '
                             f'value: {operation}).')
 
-    def __eq__(self, other: 'ChangeIndex') -> bool:
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ChangeIndex):
+            return NotImplemented
         if isinstance(other, ChangeIndex):
             # I know the below logic seems awkward, but it was the result of performance profiling. Short-circuiting
             # early when we can, since this will most often return False:
@@ -53,6 +56,10 @@ class ChangeIndex(object):
             constants.SEQVAL_NAME: f'0x{self.seqval.hex()}',
             constants.OPERATION_NAME: constants.CDC_OPERATION_ID_TO_NAME[self.operation]
         }
+
+    @property
+    def is_probably_heartbeat(self) -> bool:
+        return self.seqval == HIGHEST_CHANGE_INDEX.seqval and self.operation == HIGHEST_CHANGE_INDEX.operation
 
     @staticmethod
     def from_avro_ready_dict(avro_dict: Dict[str, Any]) -> 'ChangeIndex':

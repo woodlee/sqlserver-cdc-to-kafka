@@ -9,7 +9,7 @@ import requests
 
 from . import reporter_base
 
-from typing import TYPE_CHECKING, Optional, Dict, Any
+from typing import TYPE_CHECKING, Optional, Dict, Any, TypeVar, Type
 
 if TYPE_CHECKING:
     from .metrics import Metrics
@@ -17,11 +17,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+HttpPostReporterType = TypeVar('HttpPostReporterType', bound='HttpPostReporter')
+
+
 class HttpPostReporter(reporter_base.ReporterBase):
-    def __init__(self) -> None:
-        self._url: Optional[str] = None
-        self._template: Optional[Template] = None
-        self._headers: Dict[str, str] = {}
+    def __init__(self, url: str, template: Optional[Template], headers: Dict[str, str]) -> None:
+        self._url: str = url
+        self._template: Optional[Template] = template
+        self._headers: Dict[str, str] = headers
 
     def emit(self, metrics: 'Metrics') -> None:
         t = threading.Thread(target=self._post, args=(metrics.as_dict(),), name='HttpPostReporter')
@@ -41,7 +44,8 @@ class HttpPostReporter(reporter_base.ReporterBase):
         except requests.exceptions.RequestException as e:
             logger.warning('Failed to post metrics to %s: %s', self._url, e)
 
-    def add_arguments(self, parser: argparse.ArgumentParser) -> None:
+    @staticmethod
+    def add_arguments(parser: argparse.ArgumentParser) -> None:
         parser.add_argument('--http-metrics-url', default=os.environ.get('HTTP_METRICS_URL'),
                             help='URL to target when publishing process metrics metadata via the HttpPostReporter.')
         parser.add_argument('--http-metrics-headers', default=os.environ.get('HTTP_METRICS_HEADERS'), type=json.loads,
@@ -52,14 +56,12 @@ class HttpPostReporter(reporter_base.ReporterBase):
                                  'process metrics via the HttpPostReporter. It may reference the fields defined in '
                                  'the metric_reporting.metrics.Metrics class.')
 
-    def set_options(self, opts: argparse.Namespace) -> None:
+    @classmethod
+    def construct_with_options(cls: Type[HttpPostReporterType], opts: argparse.Namespace) -> HttpPostReporterType:
         if not opts.http_metrics_url:
             raise Exception('HttpPostReporter cannot be used without specifying a value for HTTP_METRICS_URL')
-
-        self._url = opts.http_metrics_url
-
+        template = None
         if opts.http_metrics_template:
-            self._template = Template(opts.http_metrics_template)
+            template = Template(opts.http_metrics_template)
+        return cls(opts.http_metrics_url, template, opts.http_metrics_headers)
 
-        if opts.http_metrics_headers:
-            self._headers = opts.http_metrics_headers

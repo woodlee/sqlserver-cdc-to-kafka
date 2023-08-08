@@ -30,8 +30,10 @@ def run() -> None:
 
     logger.debug('Parsed configuration: %s', json.dumps(vars(opts)))
 
-    if not (opts.schema_registry_url and opts.kafka_bootstrap_servers and opts.db_conn_string):
-        raise Exception('Arguments schema_registry_url, kafka_bootstrap_servers, and db_conn_string are all required.')
+    if not (opts.schema_registry_url and opts.kafka_bootstrap_servers and opts.db_conn_string
+            and opts.kafka_transactional_id):
+        raise Exception('Arguments schema_registry_url, kafka_bootstrap_servers, db_conn_string, and transactional_id '
+                        'are all required.')
 
     redo_snapshot_for_new_instance: bool = \
         opts.new_capture_instance_snapshot_handling == options.NEW_CAPTURE_INSTANCE_SNAPSHOT_HANDLING_BEGIN_NEW
@@ -53,7 +55,7 @@ def run() -> None:
 
         capture_instances_by_fq_name: Dict[str, CaptureInstanceMetadata] = get_latest_capture_instances_by_fq_name(
             db_conn, opts.capture_instance_version_strategy, opts.capture_instance_version_regex,
-            opts.table_whitelist_regex, opts.table_blacklist_regex)
+            opts.table_include_regex, opts.table_exclude_regex)
 
         if not capture_instances_by_fq_name:
             logger.error('No capture instances could be found.')
@@ -63,8 +65,8 @@ def run() -> None:
                                              for ci in capture_instances_by_fq_name.values()]
 
         tables: List[tracked_tables.TrackedTable] = build_tracked_tables_from_cdc_metadata(
-            db_conn, metrics_accumulator, opts.topic_name_template, opts.snapshot_table_whitelist_regex,
-            opts.snapshot_table_blacklist_regex, opts.truncate_fields, capture_instance_names, opts.db_row_batch_size,
+            db_conn, metrics_accumulator, opts.topic_name_template, opts.snapshot_table_include_regex,
+            opts.snapshot_table_exclude_regex, opts.truncate_fields, capture_instance_names, opts.db_row_batch_size,
             sql_query_processor, schema_generator)
 
         topic_to_source_table_map: Dict[str, str] = {
@@ -77,28 +79,28 @@ def run() -> None:
         with kafka.KafkaClient(
             metrics_accumulator, opts.kafka_bootstrap_servers, opts.schema_registry_url,
             opts.extra_kafka_consumer_config, opts.extra_kafka_producer_config,
-            disable_writing=opts.run_validations or opts.report_progress_only
-        ) as kafka_client, progress_tracking.ProgressTracker(
-            kafka_client, opts.progress_topic_name, topic_to_source_table_map, topic_to_change_table_map
-        ) as progress_tracker:
-
-            kafka_client.register_delivery_callback((
-                constants.SINGLE_TABLE_CHANGE_MESSAGE, constants.SINGLE_TABLE_SNAPSHOT_MESSAGE
-            ), progress_tracker.kafka_delivery_callback)
+            disable_writing=opts.run_validations or opts.report_progress_only,
+            transactional_id=opts.kafka_transactional_id
+        ) as kafka_client:
+            progress_tracker = progress_tracking.ProgressTracker(
+                kafka_client, opts.progress_topic_name, topic_to_source_table_map, topic_to_change_table_map
+            )
             kafka_client.register_delivery_callback((
                 constants.SINGLE_TABLE_CHANGE_MESSAGE, constants.UNIFIED_TOPIC_CHANGE_MESSAGE,
                 constants.SINGLE_TABLE_SNAPSHOT_MESSAGE, constants.DELETION_CHANGE_TOMBSTONE_MESSAGE
             ), metrics_accumulator.kafka_delivery_callback)
 
+            kafka_client.begin_transaction()
             determine_start_points_and_finalize_tables(
                 kafka_client, db_conn, tables, schema_generator, progress_tracker, opts.lsn_gap_handling,
                 opts.partition_count, opts.replication_factor, opts.extra_topic_config, opts.run_validations,
                 redo_snapshot_for_new_instance, publish_duplicate_changes_from_new_instance, opts.report_progress_only)
+            kafka_client.commit_transaction()
 
             if opts.report_progress_only:
                 exit(0)
 
-            table_to_unified_topics_map: Dict[str, List[Tuple[str]]] = collections.defaultdict(list)
+            table_to_unified_topics_map: Dict[str, List[str]] = collections.defaultdict(list)
             unified_topic_to_tables_map: Dict[str, List[tracked_tables.TrackedTable]] = collections.defaultdict(list)
 
             # "Unified" topics contain change messages from multiple capture instances in a globally-consistent LSN
@@ -152,6 +154,8 @@ def run() -> None:
                 nonlocal last_slow_table_heartbeat_time
                 nonlocal last_capture_instance_check_time
 
+                kafka_client.begin_transaction()
+
                 if (datetime.datetime.utcnow() - last_metrics_emission_time) > constants.METRICS_REPORTING_INTERVAL:
                     start_time = time.perf_counter()
                     metrics = metrics_accumulator.end_and_get_values()
@@ -173,8 +177,7 @@ def run() -> None:
                             if not last_topic_produce or (datetime.datetime.utcnow() - last_topic_produce) > \
                                     2 * constants.SLOW_TABLE_PROGRESS_HEARTBEAT_INTERVAL:
                                 logger.debug('Emitting heartbeat progress for slow table %s', t.fq_name)
-                                progress_tracker.emit_changes_progress_heartbeat(
-                                    t.topic_name, t.max_polled_change_index)
+                                progress_tracker.record_changes_progress(t.topic_name, t.max_polled_change_index)
                     last_slow_table_heartbeat_time = datetime.datetime.utcnow()
 
                 if opts.terminate_on_capture_instance_change and \
@@ -186,10 +189,13 @@ def run() -> None:
                     if should_terminate_due_to_capture_instance_change(
                             db_conn, progress_tracker, opts.capture_instance_version_strategy,
                             opts.capture_instance_version_regex, capture_instance_to_topic_map,
-                            capture_instances_by_fq_name, opts.table_whitelist_regex,
-                            opts.table_blacklist_regex, topic_to_max_polled_index_map):
+                            capture_instances_by_fq_name, opts.table_include_regex,
+                            opts.table_exclude_regex, topic_to_max_polled_index_map):
+                        kafka_client.commit_transaction()
                         return True
                     last_capture_instance_check_time = datetime.datetime.utcnow()
+
+                kafka_client.commit_transaction()
                 return False
 
             logger.info('Beginning processing for %s tracked table(s).', len(tables))
@@ -198,6 +204,8 @@ def run() -> None:
             # The above is all setup, now we come to the "hot loop":
 
             try:
+                row: 'parsed_row.ParsedRow'
+
                 while True:
                     snapshots_remain: bool = not all([t.snapshot_complete for t in tables])
                     change_tables_lagging: bool = any([t.change_reads_are_lagging for t in tables])
@@ -205,7 +213,10 @@ def run() -> None:
                     # ----- Poll for and produce snapshot data while change row queries run -----
 
                     if snapshots_remain and not change_tables_lagging:
-                        while datetime.datetime.utcnow() < next_cdc_poll_due_time:
+                        while datetime.datetime.utcnow() < next_cdc_poll_due_time and snapshots_remain:
+                            kafka_client.begin_transaction()
+                            snapshot_progress_by_topic: Dict[str, Dict[str, str | int]] = {}
+
                             for t in tables:
                                 if not t.snapshot_complete:
                                     for row in t.retrieve_snapshot_query_results():
@@ -213,11 +224,23 @@ def run() -> None:
                                                              row.avro_key_schema_id, row.value_dict,
                                                              row.avro_value_schema_id,
                                                              constants.SINGLE_TABLE_SNAPSHOT_MESSAGE)
+                                        snapshot_progress_by_topic[row.destination_topic] = row.key_dict
                                     if t.snapshot_complete:
-                                        progress_tracker.record_snapshot_completion(t.topic_name)
-                                t.enqueue_snapshot_query()   # NB: results may not be retrieved until next cycle
+                                        progress_tracker.record_snapshot_progress(
+                                            t.topic_name, constants.SNAPSHOT_COMPLETION_SENTINEL)
+                                        snapshot_progress_by_topic.pop(row.destination_topic, None)
+                                        snapshots_remain = not all([t.snapshot_complete for t in tables])
+                                    else:
+                                        t.enqueue_snapshot_query()   # NB: results may not be retrieved until next cycle
+
                                 if datetime.datetime.utcnow() > next_cdc_poll_due_time:
                                     break
+
+                            for topic_name, snapshot_index in snapshot_progress_by_topic.items():
+                                progress_tracker.record_snapshot_progress(topic_name, snapshot_index)
+
+                            kafka_client.commit_transaction()
+
                         if poll_periodic_tasks():
                             break
 
@@ -263,8 +286,11 @@ def run() -> None:
 
                     # ----- Produce change data to Kafka and commit progress -----
 
+                    kafka_client.begin_transaction()
+                    progress_by_topic: Dict[str, change_index.ChangeIndex] = {}
+
                     while change_rows_queue:
-                        row: 'parsed_row.ParsedRow' = heapq.heappop(change_rows_queue)[1]
+                        row = heapq.heappop(change_rows_queue)[1]
 
                         if row.change_idx > common_lsn_limit:
                             heapq.heappush(change_rows_queue, (row.change_idx, row))
@@ -288,7 +314,11 @@ def run() -> None:
                                                  None, row.avro_value_schema_id,
                                                  constants.DELETION_CHANGE_TOMBSTONE_MESSAGE)
 
-                    progress_tracker.commit_progress()
+                        progress_by_topic[row.destination_topic] = row.change_idx
+
+                    for topic_name, progress_index in progress_by_topic.items():
+                        progress_tracker.record_changes_progress(topic_name, progress_index)
+                    kafka_client.commit_transaction()
 
                     if poll_periodic_tasks():
                         break
@@ -300,12 +330,12 @@ def should_terminate_due_to_capture_instance_change(
         db_conn: pyodbc.Connection, progress_tracker: progress_tracking.ProgressTracker,
         capture_instance_version_strategy: str, capture_instance_version_regex: str,
         capture_instance_to_topic_map: Dict[str, str], current_capture_instances: Dict[str, CaptureInstanceMetadata],
-        table_whitelist_regex: str, table_blacklist_regex: str,
+        table_include_regex: str, table_exclude_regex: str,
         topic_to_max_polled_index_map: Dict[str, change_index.ChangeIndex]
 ) -> bool:
     new_capture_instances: Dict[str, CaptureInstanceMetadata] = get_latest_capture_instances_by_fq_name(
-        db_conn, capture_instance_version_strategy, capture_instance_version_regex, table_whitelist_regex,
-        table_blacklist_regex)
+        db_conn, capture_instance_version_strategy, capture_instance_version_regex, table_include_regex,
+        table_exclude_regex)
 
     current = {k: (v.capture_instance_name, v.types_checksum) for k, v in current_capture_instances.items()}
     new = {k: (v.capture_instance_name, v.types_checksum) for k, v in new_capture_instances.items()}
@@ -322,7 +352,7 @@ def should_terminate_due_to_capture_instance_change(
                 continue
             topic = capture_instance_to_topic_map[current_ci.capture_instance_name]
             if topic in topic_to_max_polled_index_map:
-                progress_tracker.emit_changes_progress_heartbeat(topic, topic_to_max_polled_index_map[topic])
+                progress_tracker.record_changes_progress(topic, topic_to_max_polled_index_map[topic])
             last_recorded_progress = progress_tracker.get_last_recorded_progress_for_topic(topic)
             current_idx = last_recorded_progress and last_recorded_progress.change_index or \
                 change_index.LOWEST_CHANGE_INDEX

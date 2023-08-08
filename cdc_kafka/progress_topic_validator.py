@@ -16,12 +16,8 @@ from .metric_reporting import accumulator
 logger = logging.getLogger(__name__)
 
 
-class NoopAccumulator(accumulator.AccumulatorAbstract):
-    pass
-
-
 class TopicProgressInfo(object):
-    def __init__(self):
+    def __init__(self) -> None:
         self.change_progress_count: int = 0
         self.snapshot_progress_count: int = 0
         self.last_change_progress: Optional[confluent_kafka.Message] = None
@@ -35,10 +31,10 @@ class TopicProgressInfo(object):
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument('--topics-to-check-regex',
-                   default=os.environ.get('TOPICS_TO_CHECK_REGEX', '.*'))
-    p.add_argument('--topics-to-blacklist-regex',
-                   default=os.environ.get('TOPICS_TO_BLACKLIST_REGEX'))
+    p.add_argument('--topics-to-include-regex',
+                   default=os.environ.get('TOPICS_TO_INCLUDE_REGEX', '.*'))
+    p.add_argument('--topics-to-exclude-regex',
+                   default=os.environ.get('TOPICS_TO_EXCLUDE_REGEX'))
     p.add_argument('--schema-registry-url',
                    default=os.environ.get('SCHEMA_REGISTRY_URL'))
     p.add_argument('--kafka-bootstrap-servers',
@@ -47,22 +43,22 @@ def main() -> None:
                    default=os.environ.get('PROGRESS_TOPIC_NAME', '_cdc_to_kafka_progress'))
     p.add_argument('--show-all',
                    type=options.str2bool, nargs='?', const=True,
-                   default=options.str2bool(os.environ.get('SHOW_ALL', False)))
+                   default=options.str2bool(os.environ.get('SHOW_ALL', '0')))
     opts = p.parse_args()
 
     if not (opts.schema_registry_url and opts.kafka_bootstrap_servers):
         raise Exception('Arguments schema_registry_url and kafka_bootstrap_servers are required.')
 
-    with kafka.KafkaClient(NoopAccumulator(), opts.kafka_bootstrap_servers,
+    with kafka.KafkaClient(accumulator.NoopAccumulator(), opts.kafka_bootstrap_servers,
                            opts.schema_registry_url, {}, {}, disable_writing=True) as kafka_client:
         if kafka_client.get_topic_partition_count(opts.progress_topic_name) is None:
             logger.error('Progress topic %s not found.', opts.progress_topic_name)
             exit(1)
 
-        topic_match_re = re.compile(opts.topics_to_check_regex, re.IGNORECASE)
-        topic_blacklist_re = None
-        if opts.topics_to_blacklist_regex:
-            topic_blacklist_re = re.compile(opts.topics_to_blacklist_regex, re.IGNORECASE)
+        topic_include_re = re.compile(opts.topics_to_include_regex, re.IGNORECASE)
+        topic_exclude_re = None
+        if opts.topics_to_exclude_regex:
+            topic_exclude_re = re.compile(opts.topics_to_exclude_regex, re.IGNORECASE)
 
         msg_ctr = 0
         topic_info: Dict[str, TopicProgressInfo] = collections.defaultdict(TopicProgressInfo)
@@ -80,9 +76,9 @@ def main() -> None:
             msg_key = dict(msg.key())
             topic, kind = msg_key['topic_name'], msg_key['progress_kind']
 
-            if not topic_match_re.match(topic):
+            if not topic_include_re.match(topic):
                 continue
-            if topic_blacklist_re and topic_blacklist_re.match(topic):
+            if topic_exclude_re and topic_exclude_re.match(topic):
                 continue
 
             prior = copy.copy(topic_info.get(topic))
@@ -96,48 +92,54 @@ def main() -> None:
             # noinspection PyTypeChecker,PyArgumentList
             current_change_table = dict(msg.value())['change_table_name']
             topic_info[topic].distinct_change_tables.add(current_change_table)
-            current_pe = progress_tracking.ProgressEntry(msg)
+            current_pe = progress_tracking.ProgressEntry.from_message(msg)
 
             if kind == constants.CHANGE_ROWS_KIND:
+                if not current_pe.change_index:
+                    raise Exception('Unexpected state.')
+                current_change_index = current_pe.change_index
                 topic_info[topic].change_progress_count += 1
                 topic_info[topic].last_change_progress = msg
-                if current_pe.is_heartbeat:
+                if current_change_index.is_probably_heartbeat:
                     topic_info[topic].heartbeat_count += 1
 
                 if prior and prior.last_change_progress:
-                    prior_pe = progress_tracking.ProgressEntry(prior.last_change_progress)
-                    if prior_pe.change_index == current_pe.change_index:
-                        if not (prior_pe.is_heartbeat and current_pe.is_heartbeat):
-                            topic_info[topic].problem_count += 1
-                            logger.warning('Duplicate change entry for topic %s between %s and %s', topic,
-                                           helpers.format_coordinates(prior.last_change_progress),
-                                           helpers.format_coordinates(msg))
-                    if prior_pe.change_index > current_pe.change_index:
+                    prior_pe = progress_tracking.ProgressEntry.from_message(prior.last_change_progress)
+                    if not prior_pe.change_index:
+                        raise Exception('Unexpected state.')
+                    prior_change_index = prior_pe.change_index
+                    if prior_change_index == current_change_index and not \
+                            current_change_index.is_probably_heartbeat:
+                        topic_info[topic].problem_count += 1
+                        logger.warning('Duplicate change entry for topic %s between %s and %s', topic,
+                                       helpers.format_coordinates(prior.last_change_progress),
+                                       helpers.format_coordinates(msg))
+                    if prior_change_index > current_change_index:
                         topic_info[topic].problem_count += 1
                         log_msg = '''
 Unordered change entry for topic %s
-    Prior  : progress message %s, acked %s@%s, index %s
-    Current: progress message %s, acked %s@%s, index %s
+    Prior  : progress message %s, index %s
+    Current: progress message %s, index %s
 '''
                         logger.error(log_msg, topic, helpers.format_coordinates(prior.last_change_progress),
-                                     '-' if prior_pe.is_heartbeat else prior_pe.last_ack_partition,
-                                     'Heartbt' if prior_pe.is_heartbeat else prior_pe.last_ack_offset,
-                                     prior_pe.change_index, helpers.format_coordinates(msg),
-                                     '-' if current_pe.is_heartbeat else current_pe.last_ack_partition,
-                                     'Heartbt' if current_pe.is_heartbeat else current_pe.last_ack_offset,
-                                     current_pe.change_index)
+                                     prior_change_index, helpers.format_coordinates(msg), current_change_index)
 
             if kind == constants.SNAPSHOT_ROWS_KIND:
+                if not current_pe.snapshot_index:
+                    raise Exception('Unexpected state.')
+                current_snapshot_index = current_pe.snapshot_index
                 topic_info[topic].snapshot_progress_count += 1
                 topic_info[topic].last_snapshot_progress = msg
 
                 if prior and prior.last_snapshot_progress:
-                    prior_pe = progress_tracking.ProgressEntry(prior.last_snapshot_progress)
-
-                    if current_pe.snapshot_index == constants.SNAPSHOT_COMPLETION_SENTINEL:
+                    prior_pe = progress_tracking.ProgressEntry.from_message(prior.last_snapshot_progress)
+                    if not prior_pe.snapshot_index:
+                        raise Exception('Unexpected state.')
+                    prior_snapshot_index = prior_pe.snapshot_index
+                    if current_snapshot_index == constants.SNAPSHOT_COMPLETION_SENTINEL:
                         pass
-                    elif prior_pe.snapshot_index == constants.SNAPSHOT_COMPLETION_SENTINEL or \
-                            tuple(prior_pe.snapshot_index.values()) < tuple(current_pe.snapshot_index.values()):
+                    elif prior_snapshot_index == constants.SNAPSHOT_COMPLETION_SENTINEL or \
+                            tuple(prior_snapshot_index.values()) < tuple(current_snapshot_index.values()):
                         if prior_pe.change_table_name != current_change_table:
                             topic_info[topic].evolution_count += 1
                             logger.info('Snapshot restart due to schema evolution to capture instance %s for topic %s '
@@ -147,15 +149,11 @@ Unordered change entry for topic %s
                             topic_info[topic].problem_count += 1
                             log_msg = '''
 Unordered snapshot entry for topic %s
-    Prior  : progress message %s, acked %s@%s, index %s
-    Current: progress message %s, acked %s@%s, index %s
+    Prior  : progress message %s, index %s
+    Current: progress message %s, index %s
 '''
                             logger.error(log_msg, topic, helpers.format_coordinates(prior.last_snapshot_progress),
-                                         '-' if prior_pe.is_heartbeat else prior_pe.last_ack_partition,
-                                         'Heartbt' if prior_pe.is_heartbeat else prior_pe.last_ack_offset,
                                          prior_pe.snapshot_index, helpers.format_coordinates(msg),
-                                         '-' if current_pe.is_heartbeat else current_pe.last_ack_partition,
-                                         'Heartbt' if current_pe.is_heartbeat else current_pe.last_ack_offset,
                                          current_pe.snapshot_index)
 
         logger.info('Read last message: %s', helpers.format_coordinates(msg))
@@ -175,7 +173,7 @@ Unordered snapshot entry for topic %s
         table = [[k,
                   v.change_progress_count,
                   v.snapshot_progress_count,
-                  'yes' if progress_tracking.ProgressEntry(v.last_snapshot_progress).snapshot_index == constants.SNAPSHOT_COMPLETION_SENTINEL else 'no',
+                  'yes' if progress_tracking.ProgressEntry.from_message(v.last_snapshot_progress).snapshot_index == constants.SNAPSHOT_COMPLETION_SENTINEL else 'no',
                   len(v.distinct_change_tables),
                   datetime.datetime.fromtimestamp(v.last_snapshot_progress.timestamp()[1] / 1000) if v.last_snapshot_progress else None,
                   datetime.datetime.fromtimestamp(v.last_change_progress.timestamp()[1] / 1000) if v.last_change_progress else None,

@@ -4,11 +4,14 @@ import logging
 
 from . import reporter_base
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar, Type
+
 if TYPE_CHECKING:
     from .metrics import Metrics
 
 logger = logging.getLogger(__name__)
+
+StdoutReporterType = TypeVar('StdoutReporterType', bound='StdoutReporter')
 
 
 class StdoutReporter(reporter_base.ReporterBase):
@@ -16,8 +19,10 @@ class StdoutReporter(reporter_base.ReporterBase):
         logger.info('Metrics recorded in last interval: %s', json.dumps(
             metrics.as_dict(), default=StdoutReporter.json_serialize_datetimes))
 
-    def add_arguments(self, parser: argparse.ArgumentParser) -> None:
+    @staticmethod
+    def add_arguments(parser: argparse.ArgumentParser) -> None:
         pass
 
-    def set_options(self, opts: argparse.Namespace) -> None:
-        pass
+    @classmethod
+    def construct_with_options(cls: Type[StdoutReporterType], opts: argparse.Namespace) -> StdoutReporterType:
+        return cls()

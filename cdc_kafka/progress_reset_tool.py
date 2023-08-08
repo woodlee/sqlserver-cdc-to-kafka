@@ -8,10 +8,6 @@ from .metric_reporting import accumulator
 logger = logging.getLogger(__name__)
 
 
-class NoopAccumulator(accumulator.AccumulatorAbstract):
-    pass
-
-
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument('--topic-names', required=True,
@@ -27,12 +23,14 @@ def main() -> None:
                    default=os.environ.get('PROGRESS_TOPIC_NAME'))
     p.add_argument('--execute',
                    type=options.str2bool, nargs='?', const=True,
-                   default=options.str2bool(os.environ.get('EXECUTE', False)))
+                   default=options.str2bool(os.environ.get('EXECUTE', '0')))
     opts = p.parse_args()
 
     logger.info(f"""
     
-Progress reset tool: WILL {'NOT (because --execute is not set)' if not opts.execute else ''} reset {opts.progress_kind} progress
+Progress reset tool: 
+
+WILL {'NOT (because --execute is not set)' if not opts.execute else ''} reset {opts.progress_kind} progress
 for topic(s) {opts.topic_names}, if prior progress is found
 in progress topic {opts.progress_topic_name} 
 in Kafka cluster with bootstrap server(s) {opts.kafka_bootstrap_servers}
@@ -41,8 +39,8 @@ Reading progress topic, please wait...
 
     """)
 
-    with kafka.KafkaClient(NoopAccumulator(), opts.kafka_bootstrap_servers, opts.schema_registry_url, {}, {},
-                           disable_writing=True) as kafka_client:
+    with kafka.KafkaClient(accumulator.NoopAccumulator(), opts.kafka_bootstrap_servers, opts.schema_registry_url, {},
+                           {}, disable_writing=True) as kafka_client:
         progress_tracker = progress_tracking.ProgressTracker(kafka_client, opts.progress_topic_name, {}, {})
         progress = progress_tracker.get_prior_progress()
 

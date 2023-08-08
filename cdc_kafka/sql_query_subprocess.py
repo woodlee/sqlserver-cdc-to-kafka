@@ -6,7 +6,9 @@ import queue
 import re
 import struct
 import time
-from typing import Any, Tuple, Dict, Optional, Iterable, NamedTuple, List
+from types import TracebackType
+from typing import Any, Tuple, Dict, Optional, NamedTuple, List, Sequence, Type
+from multiprocessing.synchronize import Event as EventClass
 
 import pyodbc
 
@@ -19,8 +21,8 @@ class SQLQueryRequest(NamedTuple):
     queue_name: str
     query_metadata_to_reflect: Any
     query_text: str
-    query_param_types: Optional[Iterable[Tuple]]
-    query_params: Optional[Iterable[Any]]
+    query_param_types: Sequence[Tuple[int, int, Optional[int]]]
+    query_params: Sequence[Any]
 
 
 class SQLQueryResult(NamedTuple):
@@ -29,7 +31,7 @@ class SQLQueryResult(NamedTuple):
     query_executed_utc: datetime.datetime
     query_took_sec: float
     result_rows: List[pyodbc.Row]
-    query_params: Optional[Tuple[Any]]
+    query_params: Sequence[Any]
 
 
 class SQLQueryProcessor(object):
@@ -39,7 +41,7 @@ class SQLQueryProcessor(object):
         if SQLQueryProcessor._instance is not None:
             raise Exception('SQLQueryProcessor class should be used as a singleton.')
 
-        self._stop_event: mp.Event = mp.Event()
+        self._stop_event: EventClass = mp.Event()
         self._subprocess_request_queue: 'mp.Queue[SQLQueryRequest]' = mp.Queue(1000)
         self._subprocess_result_queue: 'mp.Queue[SQLQueryResult]' = mp.Queue(1000)
         self._output_queues: Dict[str, 'collections.deque[SQLQueryResult]'] = {}
@@ -58,7 +60,8 @@ class SQLQueryProcessor(object):
         logger.debug("SQL query subprocess started.")
         return self
 
-    def __exit__(self, *args) -> None:
+    def __exit__(self, exc_type: Optional[Type[BaseException]], exc: Optional[BaseException],
+                 traceback: Optional[TracebackType]) -> None:
         if not self._ended:
             self._stop_event.set()
             self._check_if_ended()
@@ -80,6 +83,16 @@ class SQLQueryProcessor(object):
                 logger.info('Forcing termination of SQL query subprocess.')
                 self._subprocess.terminate()
                 time.sleep(1)
+            while not self._subprocess_request_queue.empty():
+                try:
+                    self._subprocess_request_queue.get_nowait()
+                except queue.Empty:
+                    break
+            while not self._subprocess_result_queue.empty():
+                try:
+                    self._subprocess_result_queue.get_nowait()
+                except queue.Empty:
+                    break
             self._subprocess.close()
             self._subprocess_request_queue.close()
             self._subprocess_request_queue.join_thread()
@@ -108,12 +121,13 @@ class SQLQueryProcessor(object):
             except queue.Empty:
                 pass
             if self._check_if_ended():
-                return
+                return None
+        return None
 
 
 # This runs in the separate process, and therefore uses its own DB connection:
-def query_processor(odbc_conn_string: str, stop_event: mp.Event, request_queue: 'mp.Queue[SQLQueryRequest]',
-                    result_queue: 'mp.Queue[SQLQueryResult]'):
+def query_processor(odbc_conn_string: str, stop_event: EventClass, request_queue: 'mp.Queue[SQLQueryRequest]',
+                    result_queue: 'mp.Queue[SQLQueryResult]') -> None:
     try:
         with get_db_conn(odbc_conn_string) as db_conn:
             while not stop_event.is_set():
@@ -153,9 +167,12 @@ def query_processor(odbc_conn_string: str, stop_event: mp.Event, request_queue: 
         if type(exc) == pyodbc.OperationalError and not exc.args[0].startswith('08S01'):
             raise exc
     except Exception as exc:
-        logger.exception('SQL query subprocess raised an exception and is terminating', exc_info=exc)
+        logger.exception('SQL query subprocess raised an exception.', exc_info=exc)
     finally:
         stop_event.set()
+        result_queue.close()
+        result_queue.join_thread()
+        logger.info("SQL query subprocess exiting.")
 
 
 def get_db_conn(odbc_conn_string: str) -> pyodbc.Connection:
@@ -166,20 +183,20 @@ def get_db_conn(odbc_conn_string: str) -> pyodbc.Connection:
     try:
         conn = pyodbc.connect(odbc_conn_string)
     except pyodbc.DatabaseError as e:
-        server = re.match(r".*SERVER=(?P<hostname>.*?);", odbc_conn_string)
-        failover_partner = re.match(r".*Failover_Partner=(?P<hostname>.*?);", odbc_conn_string)
+        server_match = re.match(r".*SERVER=(?P<hostname>.*?);", odbc_conn_string)
+        failover_partner_match = re.match(r".*Failover_Partner=(?P<hostname>.*?);", odbc_conn_string)
 
-        if failover_partner is None or server is None or e.args[0] not in ('42000', 'HYT00'):
+        if failover_partner_match is None or server_match is None or e.args[0] not in ('42000', 'HYT00'):
             raise
 
-        failover_partner = failover_partner.groups('hostname')[0]
-        server = server.groups('hostname')[0]
+        failover_partner = failover_partner_match.groups('hostname')[0]
+        server = server_match.groups('hostname')[0]
         odbc_conn_string = odbc_conn_string.replace(server, failover_partner)
         logger.warning('Connection to PRIMARY failed, trying failover... (primary: "%s", failover: "%s")',
                        server, failover_partner)
         conn = pyodbc.connect(odbc_conn_string)
 
-    def decode_truncated_utf16(raw_bytes):
+    def decode_truncated_utf16(raw_bytes: bytes) -> str:
         # SQL Server generally uses UTF-16-LE encoding for text. The length of NCHAR and NVARCHAR columns is the number
         # of byte pairs that can be stored in the column. But some higher UTF-16 codepoints are 4 bytes long. So it's
         # possible for a 4-byte character to get truncated halfway through, causing decode errors. This is to work
@@ -189,7 +206,7 @@ def get_db_conn(odbc_conn_string: str) -> pyodbc.Connection:
         except UnicodeDecodeError as ex:
             return raw_bytes[:ex.start].decode("utf-16le")
 
-    def decode_datetimeoffset(raw_bytes):
+    def decode_datetimeoffset(raw_bytes: bytes) -> datetime.datetime:
         tup = struct.unpack("<6hI2h", raw_bytes)
         return datetime.datetime(
             tup[0], tup[1], tup[2], tup[3], tup[4], tup[5], tup[6] // 1000,

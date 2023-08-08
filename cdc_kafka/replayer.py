@@ -75,7 +75,7 @@ MERGE_BATCH_SIZE = 5000
 MAX_BATCH_LATENCY_SECONDS = 10
 
 
-def commit_cb(err: KafkaError, tps: List[TopicPartition]):
+def commit_cb(err: KafkaError, tps: List[TopicPartition]) -> None:
     if err is not None:
         logger.error(f'Error committing offsets: {err}')
     else:

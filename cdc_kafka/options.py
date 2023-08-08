@@ -5,6 +5,7 @@ import os
 import socket
 
 from typing import Tuple, List
+from .metric_reporting import reporter_base
 
 
 # String constants for options with discrete choices:
@@ -30,7 +31,7 @@ def str2bool(v: str) -> bool:
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
 
-def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List]:
+def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List[reporter_base.ReporterBase]]:
     p = argparse.ArgumentParser()
 
     # Required
@@ -45,6 +46,15 @@ def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List]:
     p.add_argument('--schema-registry-url',
                    default=os.environ.get('SCHEMA_REGISTRY_URL'),
                    help='URL to your Confluent Schema Registry, e.g. "http://localhost:8081"')
+
+    p.add_argument('--kafka-transactional-id',
+                   default=os.environ.get('KAFKA_TRANSACTIONAL_ID'),
+                   help='An identifier of your choosing that should stay stable across restarts of a particularly-'
+                        'configured deployment of this tool. If for example you have several deployments, each '
+                        'pointing at a different source DB or set of tables, each of those should have its own unique '
+                        'identifier. This value is passed to the Kafka producer as its `transactional.id` config, '
+                        'which is used to guarantee atomic writes across multiple topics, including the topic this '
+                        'tool uses to track its own progress against CDC data.')
 
     # Optional
     p.add_argument('--extra-kafka-consumer-config',
@@ -64,15 +74,15 @@ def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List]:
                    help='Optional JSON object of additional librdkafka config parameters to be used when creating new '
                         'topics. For example: `{"min.insync.replicas": "2"}`.')
 
-    p.add_argument('--table-blacklist-regex',
-                   default=os.environ.get('TABLE_BLACKLIST_REGEX'),
-                   help="A regex used to blacklist any tables that are tracked by CDC in your DB, but for which you "
+    p.add_argument('--table-exclude-regex',
+                   default=os.environ.get('TABLE_EXCLUDE_REGEX'),
+                   help="A regex used to exclude any tables that are tracked by CDC in your DB, but for which you "
                         "don't wish to publish data using this tool. Tables names are specified in dot-separated "
-                        "'schema_name.table_name' form. Applied after the whitelist, if specified.")
+                        "'schema_name.table_name' form. Applied after the include regex, if specified.")
 
-    p.add_argument('--table-whitelist-regex',
-                   default=os.environ.get('TABLE_WHITELIST_REGEX'),
-                   help="A regex used to whitelist the specific CDC-tracked tables in your DB that you wish to publish "
+    p.add_argument('--table-include-regex',
+                   default=os.environ.get('TABLE_INCLUDE_REGEX'),
+                   help="A regex used to include the specific CDC-tracked tables in your DB that you wish to publish "
                         "data for with this tool. Tables names are specified in dot-separated 'schema_name.table_name' "
                         "form.")
 
@@ -82,16 +92,16 @@ def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List]:
                         "values. Values available for substitution are `schema_name`, `table_name`, and `capture_"
                         "instance_name`.")
 
-    p.add_argument('--snapshot-table-blacklist-regex',
-                   default=os.environ.get('SNAPSHOT_TABLE_BLACKLIST_REGEX'),
-                   help="A regex used to blacklist any tables for which you don't want to do a full initial-snapshot "
+    p.add_argument('--snapshot-table-exclude-regex',
+                   default=os.environ.get('SNAPSHOT_TABLE_EXCLUDE_REGEX'),
+                   help="A regex used to exclude any tables for which you don't want to do a full initial-snapshot "
                         "read, in the case that this tool is being applied against them for the first time. Table "
                         "names are specified in dot-separated 'schema_name.table_name' form. Applied after the "
-                        "whitelist, if specified.")
+                        "inclusion regex, if specified.")
 
-    p.add_argument('--snapshot-table-whitelist-regex',
-                   default=os.environ.get('SNAPSHOT_TABLE_WHITELIST_REGEX'),
-                   help="A regex used to whitelist the specific tables for which you want to do a full initial-"
+    p.add_argument('--snapshot-table-include-regex',
+                   default=os.environ.get('SNAPSHOT_TABLE_INCLUDE_REGEX'),
+                   help="A regex used to include the specific tables for which you want to do a full initial-"
                         "snapshot read, in the case that this tool is being applied against them for the first time. "
                         "Tables names are specified in dot-separated 'schema_name.table_name' form.")
 
@@ -120,7 +130,7 @@ def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List]:
 
     p.add_argument('--disable-deletion-tombstones',
                    type=str2bool, nargs='?', const=True,
-                   default=str2bool(os.environ.get('DISABLE_DELETION_TOMBSTONES', False)),
+                   default=str2bool(os.environ.get('DISABLE_DELETION_TOMBSTONES', '0')),
                    help="When false (the default), CDC deletion events will lead to emitting two records: one with "
                         "the CDC data and a second with the same key but a null value, to signal Kafka log compaction "
                         "to remove the entry for that key. If set to true, the null-value 'tombstones' are not "
@@ -179,9 +189,9 @@ def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List]:
 
     p.add_argument('--run-validations',
                    type=str2bool, nargs='?', const=True,
-                   default=str2bool(os.environ.get('RUN_VALIDATIONS', False)),
+                   default=str2bool(os.environ.get('RUN_VALIDATIONS', '0')),
                    help="Runs count validations between messages in the Kafka topic and rows in the change and "
-                        "source tables, then quits. Respects the table whitelist/blacklist regexes.")
+                        "source tables, then quits. Respects the table inclusion/exclusion regexes.")
 
     p.add_argument('--metrics-reporters',
                    default=os.environ.get('METRICS_REPORTERS',
@@ -233,7 +243,7 @@ def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List]:
 
     p.add_argument('--terminate-on-capture-instance-change',
                    type=str2bool, nargs='?', const=True,
-                   default=str2bool(os.environ.get('TERMINATE_ON_CAPTURE_INSTANCE_CHANGE', False)),
+                   default=str2bool(os.environ.get('TERMINATE_ON_CAPTURE_INSTANCE_CHANGE', '0')),
                    help="When true, will cause the process to terminate if it detects a change in the set of capture "
                         "instances tracked based on the CAPTURE_INSTANCE_VERSION_* settings, BUT NOT UNTIL the "
                         "existing process has caught up to the minimum LSN available in the new capture instance(s) "
@@ -244,14 +254,14 @@ def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List]:
 
     p.add_argument('--report-progress-only',
                    type=str2bool, nargs='?', const=True,
-                   default=str2bool(os.environ.get('REPORT_PROGRESS_ONLY', False)),
+                   default=str2bool(os.environ.get('REPORT_PROGRESS_ONLY', '0')),
                    help="Prints the table of instances being captured and their change data / snapshot data progress, "
                         "then exits without changing any state. Can be handy for validating other configuration such "
                         "as the regexes used to control which tables are followed and/or snapshotted.")
 
     p.add_argument('--always-use-avro-longs',
                    type=str2bool, nargs='?', const=True,
-                   default=str2bool(os.environ.get('ALWAYS_USE_AVRO_LONGS', False)),
+                   default=str2bool(os.environ.get('ALWAYS_USE_AVRO_LONGS', '0')),
                    help="Defaults to False. If set to True, Avro schemas produced/registered by this process will "
                         "use the Avro `long` type instead of the `int` type for fields corresponding to SQL Server "
                         "INT, SMALLINT, or TINYINT columns. This can be used to future-proof in cases where the column "
@@ -268,18 +278,20 @@ def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List]:
 
     opts = p.parse_args()
 
-    reporters = []
+    reporter_classes: List[reporter_base.ReporterBase] = []
+    reporters: List[reporter_base.ReporterBase] = []
+
     if opts.metrics_reporters:
         for class_path in opts.metrics_reporters.split(','):
             package_module, class_name = class_path.rsplit('.', 1)
             module = importlib.import_module(package_module)
-            reporter = getattr(module, class_name)()
-            reporters.append(reporter)
-            reporter.add_arguments(p)
+            reporter_class = getattr(module, class_name)
+            reporter_classes.append(reporter_class)
+            reporter_class.add_arguments(p)
 
         opts = p.parse_args()
 
-        for reporter in reporters:
-            reporter.set_options(opts)
+        for reporter_class in reporter_classes:
+            reporters.append(reporter_class.construct_with_options(opts))
 
     return opts, reporters

@@ -1,10 +1,8 @@
 import collections
 import datetime
-import json
 import logging
 import re
-import time
-from typing import Dict, List, Tuple, Iterable, Union, Optional, Any, Set, NamedTuple
+from typing import Dict, List, Tuple, Iterable, Optional, Any, Set, NamedTuple, Mapping
 
 import pyodbc
 from tabulate import tabulate
@@ -18,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 def build_tracked_tables_from_cdc_metadata(
     db_conn: pyodbc.Connection, metrics_accumulator: accumulator.Accumulator, topic_name_template: str,
-    snapshot_table_whitelist_regex: str, snapshot_table_blacklist_regex: str, truncate_fields: Dict[str, int],
+    snapshot_table_include_config: str, snapshot_table_exclude_config: str, truncate_fields: Dict[str, int],
     capture_instance_names: List[str], db_row_batch_size: int,
     sql_query_processor: sql_query_subprocess.SQLQueryProcessor,
     schema_generator: avro.AvroSchemaGenerator
@@ -27,12 +25,13 @@ def build_tracked_tables_from_cdc_metadata(
 
     truncate_fields = {k.lower(): v for k, v in truncate_fields.items()}
 
-    snapshot_table_whitelist_regex = snapshot_table_whitelist_regex and re.compile(
-        snapshot_table_whitelist_regex, re.IGNORECASE)
-    snapshot_table_blacklist_regex = snapshot_table_blacklist_regex and re.compile(
-        snapshot_table_blacklist_regex, re.IGNORECASE)
+    snapshot_table_include_regex = snapshot_table_include_config and re.compile(
+        snapshot_table_include_config, re.IGNORECASE)
+    snapshot_table_exclude_regex = snapshot_table_exclude_config and re.compile(
+        snapshot_table_exclude_config, re.IGNORECASE)
 
-    name_to_meta_fields: Dict[Tuple, List[Tuple]] = collections.defaultdict(list)
+    name_to_meta_fields: Dict[Tuple[Any, ...], List[Tuple[Any, ...]]] \
+        = collections.defaultdict(list)
 
     with db_conn.cursor() as cursor:
         q, _ = sql_queries.get_cdc_tracked_tables_metadata(capture_instance_names)
@@ -46,12 +45,12 @@ def build_tracked_tables_from_cdc_metadata(
 
         can_snapshot = False
 
-        if snapshot_table_whitelist_regex and snapshot_table_whitelist_regex.match(fq_table_name):
-            logger.debug('Table %s matched snapshotting whitelist', fq_table_name)
+        if snapshot_table_include_regex and snapshot_table_include_regex.match(fq_table_name):
+            logger.debug('Table %s matched snapshotting inclusion regex', fq_table_name)
             can_snapshot = True
 
-        if snapshot_table_blacklist_regex and snapshot_table_blacklist_regex.match(fq_table_name):
-            logger.debug('Table %s matched snapshotting blacklist and will NOT be snapshotted', fq_table_name)
+        if snapshot_table_exclude_regex and snapshot_table_exclude_regex.match(fq_table_name):
+            logger.debug('Table %s matched snapshotting exclusion regex and will NOT be snapshotted', fq_table_name)
             can_snapshot = False
 
         topic_name = topic_name_template.format(
@@ -63,7 +62,7 @@ def build_tracked_tables_from_cdc_metadata(
 
         for (change_table_ordinal, column_name, sql_type_name, _, primary_key_ordinal, decimal_precision,
              decimal_scale, _) in fields:
-            truncate_after = truncate_fields.get(f'{schema_name}.{table_name}.{column_name}'.lower())
+            truncate_after: int = truncate_fields.get(f'{schema_name}.{table_name}.{column_name}'.lower(), 0)
             tracked_table.append_field(tracked_tables.TrackedField(
                 column_name, sql_type_name, change_table_ordinal, primary_key_ordinal, decimal_precision,
                 decimal_scale, truncate_after))
@@ -77,45 +76,28 @@ def determine_start_points_and_finalize_tables(
         kafka_client: kafka.KafkaClient, db_conn: pyodbc.Connection, tables: Iterable[tracked_tables.TrackedTable],
         schema_generator: avro.AvroSchemaGenerator, progress_tracker: progress_tracking.ProgressTracker,
         lsn_gap_handling: str, partition_count: int, replication_factor: int,
-        extra_topic_config: Dict[str, Union[str, int]], validation_mode: bool = False,
+        extra_topic_config: Dict[str, str | int], validation_mode: bool = False,
         redo_snapshot_for_new_instance: bool = False, publish_duplicate_changes_from_new_instance: bool = False,
         report_progress_only: bool = False
 ) -> None:
-    topic_names: List[str] = [t.topic_name for t in tables]
-
     if validation_mode:
         for table in tables:
             table.snapshot_allowed = False
             table.finalize_table(change_index.LOWEST_CHANGE_INDEX, None, {}, lsn_gap_handling)
         return
 
-    if report_progress_only:
-        watermarks_by_topic = []
-    else:
-        watermarks_by_topic = kafka_client.get_topic_watermarks(topic_names)
-        first_check_watermarks_json = json.dumps(watermarks_by_topic)
-
-        logger.info(f'Pausing for {constants.WATERMARK_STABILITY_CHECK_DELAY_SECS} seconds to ensure target topics are '
-                    f'not receiving new messages from elsewhere...')
-        time.sleep(constants.WATERMARK_STABILITY_CHECK_DELAY_SECS)
-
-        watermarks_by_topic = kafka_client.get_topic_watermarks(topic_names)
-        second_check_watermarks_json = json.dumps(watermarks_by_topic)
-
-        if first_check_watermarks_json != second_check_watermarks_json:
-            raise Exception(f'Watermarks for one or more target topics changed between successive checks. '
-                            f'Another process may be producing to the topic(s). Bailing.\nFirst check: '
-                            f'{first_check_watermarks_json}\nSecond check: {second_check_watermarks_json}')
-        logger.debug('Topic watermarks: %s', second_check_watermarks_json)
-
     prior_progress_log_table_data = []
     prior_progress = progress_tracker.get_prior_progress_or_create_progress_topic()
+
+    snapshot_progress: Optional[progress_tracking.ProgressEntry]
+    changes_progress: Optional[progress_tracking.ProgressEntry]
 
     for table in tables:
         snapshot_progress, changes_progress = None, None
         prior_change_table_max_index: Optional[change_index.ChangeIndex] = None
 
-        if not report_progress_only and table.topic_name not in watermarks_by_topic:  # new topic; create it
+        if not report_progress_only and kafka_client.get_topic_partition_count(
+                table.topic_name) is None:  # new topic; create it
             if partition_count:
                 this_topic_partition_count = partition_count
             else:
@@ -132,10 +114,8 @@ def determine_start_points_and_finalize_tables(
             kafka_client.create_topic(table.topic_name, this_topic_partition_count, replication_factor,
                                       extra_topic_config)
         else:
-            snapshot_progress: Union[None, progress_tracking.ProgressEntry] = prior_progress.get(
-                (table.topic_name, constants.SNAPSHOT_ROWS_KIND))
-            changes_progress: Union[None, progress_tracking.ProgressEntry] = prior_progress.get(
-                (table.topic_name, constants.CHANGE_ROWS_KIND))
+            snapshot_progress = prior_progress.get((table.topic_name, constants.SNAPSHOT_ROWS_KIND))
+            changes_progress = prior_progress.get((table.topic_name, constants.CHANGE_ROWS_KIND))
 
             fq_change_table_name = helpers.get_fq_change_table_name(table.capture_instance_name)
             if snapshot_progress and (snapshot_progress.change_table_name != fq_change_table_name):
@@ -150,9 +130,11 @@ def determine_start_points_and_finalize_tables(
                         logger.info('Will start new snapshot.')
                         snapshot_progress = None
                     else:
-                        progress_tracker.record_snapshot_completion(table.topic_name)
+                        progress_tracker.record_snapshot_progress(table.topic_name,
+                                                                  constants.SNAPSHOT_COMPLETION_SENTINEL)
                 else:
-                    progress_tracker.record_snapshot_completion(table.topic_name)
+                    progress_tracker.record_snapshot_progress(table.topic_name,
+                                                              constants.SNAPSHOT_COMPLETION_SENTINEL)
                     logger.info('Will NOT start new snapshot.')
 
             if changes_progress and (changes_progress.change_table_name != fq_change_table_name):
@@ -177,9 +159,11 @@ def determine_start_points_and_finalize_tables(
                 else:
                     logger.info('Will NOT republish any change rows duplicated by the new capture instance.')
 
-        starting_change_index = (changes_progress and changes_progress.change_index) \
-            or change_index.LOWEST_CHANGE_INDEX
-        starting_snapshot_index = snapshot_progress and snapshot_progress.snapshot_index
+        starting_change_index: change_index.ChangeIndex = \
+            (changes_progress and changes_progress.change_index) or change_index.LOWEST_CHANGE_INDEX
+        starting_snapshot_index: Optional[Mapping[str, str | int]] = None
+        if snapshot_progress:
+            starting_snapshot_index = snapshot_progress.snapshot_index
 
         if report_progress_only:  # elide schema registration
             table.finalize_table(starting_change_index, prior_change_table_max_index, starting_snapshot_index,
@@ -187,7 +171,7 @@ def determine_start_points_and_finalize_tables(
         else:
             table.finalize_table(starting_change_index, prior_change_table_max_index, starting_snapshot_index,
                                  lsn_gap_handling, kafka_client.register_schemas, progress_tracker.reset_progress,
-                                 progress_tracker.record_snapshot_completion)
+                                 progress_tracker.record_snapshot_progress)
 
         if not table.snapshot_allowed:
             snapshot_state = '<not doing>'
@@ -202,11 +186,11 @@ def determine_start_points_and_finalize_tables(
                                               starting_change_index or '<from beginning>', snapshot_state))
 
     headers = ('Capture instance name', 'Source table name', 'Topic name', 'From change table index', 'Snapshots')
-    table = tabulate(sorted(prior_progress_log_table_data), headers, tablefmt='fancy_grid')
+    display_table = tabulate(sorted(prior_progress_log_table_data), headers, tablefmt='fancy_grid')
 
     logger.info('Processing will proceed from the following positions based on the last message from each topic '
                 'and/or the snapshot progress committed in Kafka (NB: snapshot reads occur BACKWARDS from high to '
-                'low key column values):\n%s\n%s tables total.', table, len(prior_progress_log_table_data))
+                'low key column values):\n%s\n%s tables total.', display_table, len(prior_progress_log_table_data))
 
 
 def ddl_change_requires_new_snapshot(db_conn: pyodbc.Connection, schema_generator: avro.AvroSchemaGenerator,
@@ -348,18 +332,18 @@ class CaptureInstanceMetadata(NamedTuple):
 
 # This pulls the "greatest" capture instance running for each source table, in the event there is more than one.
 def get_latest_capture_instances_by_fq_name(
-        db_conn: pyodbc.Connection, capture_instance_version_strategy: str, capture_instance_version_regex: str,
-        table_whitelist_regex: str, table_blacklist_regex: str
+        db_conn: pyodbc.Connection, capture_instance_version_strategy: str, capture_instance_version_config: str,
+        table_include_config: str, table_exclude_config: str
 ) -> Dict[str, CaptureInstanceMetadata]:
     if capture_instance_version_strategy == options.CAPTURE_INSTANCE_VERSION_STRATEGY_REGEX \
-            and not capture_instance_version_regex:
+            and not capture_instance_version_config:
         raise Exception('Please provide a capture_instance_version_regex when specifying the `regex` '
                         'capture_instance_version_strategy.')
     result: Dict[str, CaptureInstanceMetadata] = {}
     fq_name_to_capture_instances: Dict[str, List[CaptureInstanceMetadata]] = collections.defaultdict(list)
-    capture_instance_version_regex = capture_instance_version_regex and re.compile(capture_instance_version_regex)
-    table_whitelist_regex = table_whitelist_regex and re.compile(table_whitelist_regex, re.IGNORECASE)
-    table_blacklist_regex = table_blacklist_regex and re.compile(table_blacklist_regex, re.IGNORECASE)
+    capture_instance_version_regex = capture_instance_version_config and re.compile(capture_instance_version_config)
+    table_include_regex = table_include_config and re.compile(table_include_config, re.IGNORECASE)
+    table_exclude_regex = table_exclude_config and re.compile(table_exclude_config, re.IGNORECASE)
 
     with db_conn.cursor() as cursor:
         q, _ = sql_queries.get_cdc_capture_instances_metadata()
@@ -367,12 +351,12 @@ def get_latest_capture_instances_by_fq_name(
         for row in cursor.fetchall():
             fq_table_name = f'{row[0]}.{row[1]}'
 
-            if table_whitelist_regex and not table_whitelist_regex.match(fq_table_name):
-                logger.debug('Table %s excluded by whitelist', fq_table_name)
+            if table_include_regex and not table_include_regex.match(fq_table_name):
+                logger.debug('Table %s excluded; did not match inclusion regex', fq_table_name)
                 continue
 
-            if table_blacklist_regex and table_blacklist_regex.match(fq_table_name):
-                logger.debug('Table %s excluded by blacklist', fq_table_name)
+            if table_exclude_regex and table_exclude_regex.match(fq_table_name):
+                logger.debug('Table %s excluded; matched exclusion regex', fq_table_name)
                 continue
 
             if row[3] is None or row[4] is None:
@@ -380,11 +364,10 @@ def get_latest_capture_instances_by_fq_name(
                              'next pass', fq_table_name)
                 continue
 
+            regex_matched_group: str = ''
             if capture_instance_version_regex:
                 match = capture_instance_version_regex.match(row[1])
                 regex_matched_group = match and match.group(1) or ''
-            else:
-                regex_matched_group = None
 
             ci_meta = CaptureInstanceMetadata(fq_table_name, row[2], row[3], row[4], row[5], regex_matched_group)
             fq_name_to_capture_instances[ci_meta.fq_name].append(ci_meta)
