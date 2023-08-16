@@ -48,7 +48,7 @@ class SQLQueryProcessor(object):
         self._subprocess: mp.Process = mp.Process(target=query_processor, args=(
             odbc_conn_string, self._stop_event, self._subprocess_request_queue, self._subprocess_result_queue))
         self._results_wait_time: datetime.timedelta = datetime.timedelta(
-            seconds=constants.SQL_QUERY_RETRIES *
+            seconds=(constants.SQL_QUERY_RETRIES + 1) *
             (constants.SQL_QUERY_TIMEOUT_SECONDS + constants.SQL_QUERY_INTER_RETRY_INTERVAL_SECONDS)
         )
         self._ended: bool = False
@@ -95,9 +95,7 @@ class SQLQueryProcessor(object):
                     break
             self._subprocess.close()
             self._subprocess_request_queue.close()
-            self._subprocess_request_queue.join_thread()
             self._subprocess_result_queue.close()
-            self._subprocess_result_queue.join_thread()
             logger.info("Done.")
         return self._ended
 

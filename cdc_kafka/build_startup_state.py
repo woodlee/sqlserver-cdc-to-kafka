@@ -93,6 +93,7 @@ def determine_start_points_and_finalize_tables(
     changes_progress: Optional[progress_tracking.ProgressEntry]
 
     for table in tables:
+        kafka_client.begin_transaction()
         snapshot_progress, changes_progress = None, None
         prior_change_table_max_index: Optional[change_index.ChangeIndex] = None
 
@@ -184,6 +185,7 @@ def determine_start_points_and_finalize_tables(
 
         prior_progress_log_table_data.append((table.capture_instance_name, table.fq_name, table.topic_name,
                                               starting_change_index or '<from beginning>', snapshot_state))
+        kafka_client.commit_transaction()
 
     headers = ('Capture instance name', 'Source table name', 'Topic name', 'From change table index', 'Snapshots')
     display_table = tabulate(sorted(prior_progress_log_table_data), headers, tablefmt='fancy_grid')

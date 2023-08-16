@@ -415,12 +415,16 @@ class TrackedTable(object):
         with self._db_conn.cursor() as cursor:
             q, _ = sql_queries.get_max_key_value(self.schema_name, self.table_name, self._key_field_names)
             cursor.execute(q)
-            res: Tuple[Any, ...] = tuple(cursor.fetchone())
-            return res
+            row: pyodbc.Row | None = cursor.fetchone()
+            if row:
+                return tuple(row)
+            return None
 
     def _get_min_key_value(self) -> Optional[Tuple[Any, ...]]:
         with self._db_conn.cursor() as cursor:
             q, _ = sql_queries.get_min_key_value(self.schema_name, self.table_name, self._key_field_names)
             cursor.execute(q)
-            res: Tuple[Any, ...] = tuple(cursor.fetchone())
-            return res
+            row: pyodbc.Row | None = cursor.fetchone()
+            if row:
+                return tuple(row)
+            return None
