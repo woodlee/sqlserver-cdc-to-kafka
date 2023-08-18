@@ -98,7 +98,7 @@ def determine_start_points_and_finalize_tables(
         prior_change_table_max_index: Optional[change_index.ChangeIndex] = None
 
         if not report_progress_only and kafka_client.get_topic_partition_count(
-                table.topic_name) is None:  # new topic; create it
+                table.topic_name) == 0:  # new topic; create it
             if partition_count:
                 this_topic_partition_count = partition_count
             else:
