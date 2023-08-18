@@ -90,12 +90,10 @@ def run() -> None:
                 constants.SINGLE_TABLE_SNAPSHOT_MESSAGE, constants.DELETION_CHANGE_TOMBSTONE_MESSAGE
             ), metrics_accumulator.kafka_delivery_callback)
 
-            kafka_client.begin_transaction()
             determine_start_points_and_finalize_tables(
                 kafka_client, db_conn, tables, schema_generator, progress_tracker, opts.lsn_gap_handling,
                 opts.partition_count, opts.replication_factor, opts.extra_topic_config, opts.run_validations,
                 redo_snapshot_for_new_instance, publish_duplicate_changes_from_new_instance, opts.report_progress_only)
-            kafka_client.commit_transaction()
 
             if opts.report_progress_only:
                 exit(0)

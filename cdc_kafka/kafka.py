@@ -194,7 +194,7 @@ class KafkaClient(object):
                             on_delivery=lambda err, msg: self._delivery_callback(
                                 constants.UNIFIED_TOPIC_CHANGE_MESSAGE, err, msg, key, value),
                             headers={'cdc_to_kafka_message_type': constants.UNIFIED_TOPIC_CHANGE_MESSAGE,
-                                     'cdd_to_kafka_original_topic': topic}
+                                     'cdc_to_kafka_original_topic': topic}
                         )
                         break
                     except BufferError:
