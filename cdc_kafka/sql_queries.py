@@ -197,8 +197,18 @@ def get_max_lsn() -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
 def get_max_lsn_for_change_table(fq_change_table_name: str) -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
     return f'''
 -- cdc-to-kafka: get_max_lsn_for_change_table
-SELECT TOP 1 __$start_lsn, __$command_id, __$seqval, __$operation 
-FROM {fq_change_table_name} 
+WITH lsns AS (
+    SELECT __$start_lsn, __$command_id, __$seqval, __$operation
+    FROM {fq_change_table_name}
+
+    UNION ALL
+
+    SELECT sys.fn_cdc_increment_lsn(start_lsn), 0, 0x00000000000000000000, 0
+    FROM [{constants.CDC_DB_SCHEMA_NAME}].[change_tables]
+    WHERE object_id = OBJECT_ID('{fq_change_table_name}')
+)
+SELECT TOP 1 __$start_lsn, __$command_id, __$seqval, __$operation
+FROM lsns
 ORDER BY __$start_lsn DESC, __$command_id DESC, __$seqval DESC, __$operation DESC
     ''', []
 
