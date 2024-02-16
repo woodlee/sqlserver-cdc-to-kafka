@@ -215,6 +215,14 @@ class KafkaClient(object):
                 'consume_all: Requested topic %s does not appear to exist. Returning nothing.', topic_name)
             return
 
+        watermarks = self.get_topic_watermarks([topic_name])[topic_name]  # will be list of (low, hi) mark tuples
+        message_count = sum(x[1] for x in watermarks)
+        if not message_count:
+            logger.warning(
+                'consume_all: Requested topic %s contains no messages at present. Returning nothing.', topic_name)
+            return
+        logger.debug('Progress topic %s contains %s messages', topic_name, message_count)
+
         self._consumer.assign([confluent_kafka.TopicPartition(topic_name, part_id, confluent_kafka.OFFSET_BEGINNING)
                                for part_id in range(part_count)])
 
