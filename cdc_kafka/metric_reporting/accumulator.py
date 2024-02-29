@@ -67,7 +67,7 @@ class Accumulator(AccumulatorAbstract):
 
     # noinspection PyAttributeOutsideInit
     def reset_and_start(self) -> None:
-        self._interval_start_epoch_sec: float = helpers.naive_utcnow().timestamp()
+        self._interval_start_epoch_sec: float = datetime.datetime.now(datetime.UTC).timestamp()
         self._total_sleep_time_sec: float = 0
         self._db_change_data_queries_count: int = 0
         self._db_change_data_queries_total_time_sec: float = 0
@@ -89,7 +89,7 @@ class Accumulator(AccumulatorAbstract):
         self._produced_update_changes_count: int = 0
 
     def end_and_get_values(self) -> metrics.Metrics:
-        end_epoch_sec = helpers.naive_utcnow().timestamp()
+        end_epoch_sec = datetime.datetime.now(datetime.UTC).timestamp()
         interval_delta_sec = end_epoch_sec - self._interval_start_epoch_sec
         db_all_data_queries_total_time_sec = self._db_snapshot_queries_total_time_sec + \
             self._db_change_data_queries_total_time_sec
@@ -239,7 +239,7 @@ class Accumulator(AccumulatorAbstract):
         if timestamp_type != confluent_kafka.TIMESTAMP_CREATE_TIME:
             produce_datetime = helpers.naive_utcnow()
         else:
-            produce_datetime = datetime.datetime.fromtimestamp(timestamp / 1000.0)
+            produce_datetime = datetime.datetime.fromtimestamp(timestamp / 1000.0, datetime.UTC).replace(tzinfo=None)
 
         event_time = datetime.datetime.fromisoformat(original_value[constants.EVENT_TIME_NAME])
         db_commit_time = self._clock_syncer.db_time_to_utc(event_time)

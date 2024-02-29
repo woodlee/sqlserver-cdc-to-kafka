@@ -15,8 +15,7 @@ class ClockSync(object):
         if ClockSync._instance is not None:
             raise Exception('ClockSync class should be used as a singleton.')
 
-        self._last_sync_time: datetime.datetime = (helpers.naive_utcnow() -
-                                                   2 * constants.DB_CLOCK_SYNC_INTERVAL)
+        self._last_sync_time: datetime.datetime = (helpers.naive_utcnow() - 2 * constants.DB_CLOCK_SYNC_INTERVAL)
         self._db_conn: pyodbc.Connection = db_conn
         self._clock_skew: datetime.timedelta = self._get_skew()
 

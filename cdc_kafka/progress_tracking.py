@@ -418,9 +418,9 @@ class ProgressTracker(object):
                     'WARNING: Progress topic %s contains unordered entries for %s! Prior: p%s:o%s (%s), '
                     'pos %s; Current: p%s:o%s (%s), pos %s', self._progress_topic_name, result_key,
                     prior_message.partition(), prior_message.offset(),
-                    datetime.datetime.fromtimestamp(prior_message.timestamp()[1] / 1000),
+                    datetime.datetime.fromtimestamp(prior_message.timestamp()[1] / 1000, datetime.UTC),
                     prior_entry.change_index, progress_msg.partition(), progress_msg.offset(),
-                    datetime.datetime.fromtimestamp(progress_msg.timestamp()[1] / 1000),
+                    datetime.datetime.fromtimestamp(progress_msg.timestamp()[1] / 1000, datetime.UTC),
                     curr_entry.change_index)
             result[result_key] = curr_entry  # last read for a given key will win
             messages[result_key] = progress_msg

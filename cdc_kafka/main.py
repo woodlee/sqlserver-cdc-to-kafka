@@ -7,7 +7,7 @@ import json
 import logging
 import re
 import time
-from typing import Dict, Optional, List, Tuple, Mapping, Callable
+from typing import Dict, Optional, List, Tuple
 
 import pyodbc
 
