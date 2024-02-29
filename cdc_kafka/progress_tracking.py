@@ -321,7 +321,7 @@ class ProgressTracker(object):
             high_wms[str(partition)] = hi_wm
 
         event_time_iso = event_time.isoformat() if event_time is not None \
-            else datetime.datetime.now(datetime.UTC).isoformat()
+            else helpers.naive_utcnow().isoformat()
 
         msg = {
             "action": action,

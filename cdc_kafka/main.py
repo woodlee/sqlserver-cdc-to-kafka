@@ -1,12 +1,13 @@
 import argparse
 import collections
 import datetime
+import functools
 import heapq
 import json
 import logging
 import re
 import time
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple, Mapping, Callable
 
 import pyodbc
 
@@ -40,11 +41,11 @@ def run() -> None:
     publish_duplicate_changes_from_new_instance: bool = \
         opts.new_capture_instance_overlap_handling == options.NEW_CAPTURE_INSTANCE_OVERLAP_HANDLING_REPUBLISH
 
-    with (sql_query_subprocess.get_db_conn(
+    with sql_query_subprocess.get_db_conn(
         opts.db_conn_string
     ) as db_conn, sql_query_subprocess.SQLQueryProcessor(
         opts.db_conn_string
-    ) as sql_query_processor):
+    ) as sql_query_processor:
         clock_syncer: clock_sync.ClockSync = clock_sync.ClockSync(db_conn)
 
         metrics_accumulator: accumulator.Accumulator = accumulator.Accumulator(
@@ -132,11 +133,11 @@ def run() -> None:
                 validator.run()
                 exit(0)
 
-            last_metrics_emission_time: datetime.datetime = datetime.datetime.now(datetime.UTC)
-            last_capture_instance_check_time: datetime.datetime = datetime.datetime.now(datetime.UTC)
-            last_slow_table_heartbeat_time: datetime.datetime = datetime.datetime.now(datetime.UTC)
-            next_cdc_poll_allowed_time: datetime.datetime = datetime.datetime.now(datetime.UTC)
-            next_cdc_poll_due_time: datetime.datetime = datetime.datetime.now(datetime.UTC)
+            last_metrics_emission_time: datetime.datetime = helpers.naive_utcnow()
+            last_capture_instance_check_time: datetime.datetime = helpers.naive_utcnow()
+            last_slow_table_heartbeat_time: datetime.datetime = helpers.naive_utcnow()
+            next_cdc_poll_allowed_time: datetime.datetime = helpers.naive_utcnow()
+            next_cdc_poll_due_time: datetime.datetime = helpers.naive_utcnow()
             last_produced_row: Optional['parsed_row.ParsedRow'] = None
             last_topic_produces: Dict[str, datetime.datetime] = {}
             change_rows_queue: List[Tuple[change_index.ChangeIndex, 'parsed_row.ParsedRow']] = []
@@ -150,8 +151,7 @@ def run() -> None:
 
                 kafka_client.begin_transaction()
 
-                now = datetime.datetime.now(datetime.UTC)
-                if (now - last_metrics_emission_time) > constants.METRICS_REPORTING_INTERVAL:
+                if (helpers.naive_utcnow() - last_metrics_emission_time) > constants.METRICS_REPORTING_INTERVAL:
                     start_time = time.perf_counter()
                     metrics = metrics_accumulator.end_and_get_values()
                     for reporter in reporters:
@@ -162,21 +162,21 @@ def run() -> None:
                     elapsed = (time.perf_counter() - start_time)
                     logger.debug('Metrics reporting completed in %s ms', elapsed * 1000)
                     metrics_accumulator.reset_and_start()
-                    last_metrics_emission_time = datetime.datetime.now(datetime.UTC)
+                    last_metrics_emission_time = helpers.naive_utcnow()
 
-                if (datetime.datetime.now(datetime.UTC) - last_slow_table_heartbeat_time) > \
+                if (helpers.naive_utcnow() - last_slow_table_heartbeat_time) > \
                         constants.SLOW_TABLE_PROGRESS_HEARTBEAT_INTERVAL:
                     for t in tables:
                         if not queued_change_row_counts[t.topic_name]:
                             last_topic_produce = last_topic_produces.get(t.topic_name)
-                            if not last_topic_produce or (datetime.datetime.now(datetime.UTC) - last_topic_produce) > \
+                            if not last_topic_produce or (helpers.naive_utcnow() - last_topic_produce) > \
                                     2 * constants.SLOW_TABLE_PROGRESS_HEARTBEAT_INTERVAL:
                                 logger.debug('Emitting heartbeat progress for slow table %s', t.fq_name)
                                 progress_tracker.record_changes_progress(t.topic_name, t.max_polled_change_index)
-                    last_slow_table_heartbeat_time = datetime.datetime.now(datetime.UTC)
+                    last_slow_table_heartbeat_time = helpers.naive_utcnow()
 
                 if opts.terminate_on_capture_instance_change and \
-                        (datetime.datetime.now(datetime.UTC) - last_capture_instance_check_time) > \
+                        (helpers.naive_utcnow() - last_capture_instance_check_time) > \
                         constants.CHANGED_CAPTURE_INSTANCES_CHECK_INTERVAL:
                     topic_to_max_polled_index_map:  Dict[str, change_index.ChangeIndex] = {
                         t.topic_name: t.max_polled_change_index for t in tables
@@ -188,7 +188,7 @@ def run() -> None:
                             opts.table_exclude_regex, topic_to_max_polled_index_map):
                         kafka_client.commit_transaction()
                         return True
-                    last_capture_instance_check_time = datetime.datetime.now(datetime.UTC)
+                    last_capture_instance_check_time = helpers.naive_utcnow()
 
                 kafka_client.commit_transaction()
                 return False
@@ -208,11 +208,10 @@ def run() -> None:
                     # ----- Poll for and produce snapshot data while change row queries run -----
 
                     if snapshots_remain and not change_tables_lagging:
-                        while datetime.datetime.now(datetime.UTC) < next_cdc_poll_due_time and snapshots_remain:
+                        while helpers.naive_utcnow() < next_cdc_poll_due_time and snapshots_remain:
                             kafka_client.begin_transaction()
                             snapshot_progress_by_topic: Dict[str, Dict[str, str | int]] = {}
-                            completions_to_log: \
-                                List[Tuple[str, str, int, int, datetime.datetime, Dict[str, str | int]]] = []
+                            completions_to_log: List[functools.partial[None]] = []
 
                             for t in tables:
                                 if not t.snapshot_complete:
@@ -226,14 +225,15 @@ def run() -> None:
                                         progress_tracker.record_snapshot_progress(
                                             t.topic_name, constants.SNAPSHOT_COMPLETION_SENTINEL)
                                         snapshot_progress_by_topic.pop(row.destination_topic, None)
-                                        completions_to_log.append((t.topic_name, t.fq_name, t.key_schema_id,
-                                                                   t.value_schema_id,
-                                                                   datetime.datetime.now(datetime.UTC), row.key_dict))
+                                        completions_to_log.append(functools.partial(
+                                            progress_tracker.log_snapshot_completed, t.topic_name, t.fq_name,
+                                            t.key_schema_id, t.value_schema_id, helpers.naive_utcnow(), row.key_dict
+                                        ))
                                         snapshots_remain = not all([t.snapshot_complete for t in tables])
                                     else:
                                         t.enqueue_snapshot_query()   # NB: results may not be retrieved until next cycle
 
-                                if datetime.datetime.now(datetime.UTC) > next_cdc_poll_due_time:
+                                if helpers.naive_utcnow() > next_cdc_poll_due_time:
                                     break
 
                             for topic_name, snapshot_index in snapshot_progress_by_topic.items():
@@ -246,8 +246,8 @@ def run() -> None:
                             # the final snapshot row(s) have been produced:
                             if completions_to_log:
                                 kafka_client.begin_transaction()
-                                for completion_args in completions_to_log:
-                                    progress_tracker.log_snapshot_completed(*completion_args)
+                                for completion in completions_to_log:
+                                    completion()
                                 kafka_client.commit_transaction()
 
                         if poll_periodic_tasks():
@@ -256,7 +256,7 @@ def run() -> None:
                     # ----- Wait for next poll window (if needed) and get ceiling LSN for cycle -----
 
                     if not change_tables_lagging:
-                        wait_time = (next_cdc_poll_allowed_time - datetime.datetime.now(datetime.UTC)).total_seconds()
+                        wait_time = (next_cdc_poll_allowed_time - helpers.naive_utcnow()).total_seconds()
                         if wait_time > 0:
                             time.sleep(wait_time)
                             metrics_accumulator.register_sleep(wait_time)
@@ -269,10 +269,8 @@ def run() -> None:
                         cursor.execute(q)
                         lsn_limit = cursor.fetchval()
 
-                    next_cdc_poll_allowed_time = (datetime.datetime.now(datetime.UTC) +
-                                                  constants.MIN_CDC_POLLING_INTERVAL)
-                    next_cdc_poll_due_time = (datetime.datetime.now(datetime.UTC) +
-                                              constants.MAX_CDC_POLLING_INTERVAL)
+                    next_cdc_poll_allowed_time = (helpers.naive_utcnow() + constants.MIN_CDC_POLLING_INTERVAL)
+                    next_cdc_poll_due_time = (helpers.naive_utcnow() + constants.MAX_CDC_POLLING_INTERVAL)
 
                     # ----- Query for change rows ----
 
@@ -317,7 +315,7 @@ def run() -> None:
                                              row.value_dict, row.avro_value_schema_id,
                                              constants.SINGLE_TABLE_CHANGE_MESSAGE,
                                              table_to_unified_topics_map.get(row.table_fq_name, []))
-                        last_topic_produces[row.destination_topic] = datetime.datetime.now(datetime.UTC)
+                        last_topic_produces[row.destination_topic] = helpers.naive_utcnow()
 
                         if not opts.disable_deletion_tombstones and row.operation_name == \
                                 constants.DELETE_OPERATION_NAME:

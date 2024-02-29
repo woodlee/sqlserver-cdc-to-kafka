@@ -31,3 +31,7 @@ def quote_name(name: str) -> str:
     name = name.replace(']', '')
     parts = name.split('.')
     return '.'.join([f"[{p}]" for p in parts])
+
+
+def naive_utcnow() -> datetime.datetime:
+    return datetime.datetime.now(datetime.UTC).replace(tzinfo=None)

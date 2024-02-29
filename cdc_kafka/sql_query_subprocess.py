@@ -12,7 +12,7 @@ from multiprocessing.synchronize import Event as EventClass
 
 import pyodbc
 
-from . import constants
+from . import constants, helpers
 
 logger = logging.getLogger(__name__)
 
@@ -109,8 +109,8 @@ class SQLQueryProcessor(object):
     def get_result(self, queue_name: str) -> Optional['SQLQueryResult']:
         if len(self._output_queues[queue_name]):
             return self._output_queues[queue_name].popleft()
-        deadline = datetime.datetime.now(datetime.UTC) + self._results_wait_time
-        while datetime.datetime.now(datetime.UTC) < deadline:
+        deadline = helpers.naive_utcnow() + self._results_wait_time
+        while helpers.naive_utcnow() < deadline:
             try:
                 res = self._subprocess_result_queue.get(timeout=0.1)
                 if res.queue_name == queue_name:
@@ -154,7 +154,7 @@ def query_processor(odbc_conn_string: str, stop_event: EventClass, request_queue
                                 time.sleep(constants.SQL_QUERY_INTER_RETRY_INTERVAL_SECONDS)
                                 continue
                             raise exc
-                    query_executed_utc = datetime.datetime.now(datetime.UTC)
+                    query_executed_utc = helpers.naive_utcnow()
                     result_rows = cursor.fetchall()
                 query_took_sec = (time.perf_counter() - start_time)
                 result_queue.put_nowait(SQLQueryResult(request.queue_name, request.query_metadata_to_reflect,

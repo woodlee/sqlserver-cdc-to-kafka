@@ -282,7 +282,7 @@ class Validator(object):
             if summary.latest_change_seen is None:
                 if db_delete_rows or db_insert_rows or db_update_rows:
                     failures.append('No change entries found!')
-            elif (datetime.datetime.now(datetime.UTC) - summary.latest_change_seen) > datetime.timedelta(days=1):
+            elif (helpers.naive_utcnow() - summary.latest_change_seen) > datetime.timedelta(days=1):
                 infos.append(f'Last change entry seen in Kafka was dated {summary.latest_change_seen}.')
 
             if not changes_progress_index:
@@ -361,8 +361,7 @@ class Validator(object):
             for table_name, table_summary in ut_result['table_summaries'].items():
                 if table_summary.latest_change_seen is None:
                     warnings.append(f'For table {table_name}: No change entries found!')
-                elif (datetime.datetime.now(datetime.UTC) -
-                      table_summary.latest_change_seen) > datetime.timedelta(days=1):
+                elif (helpers.naive_utcnow() - table_summary.latest_change_seen) > datetime.timedelta(days=1):
                     warnings.append(f'For table {table_name}: Last change entry seen in Kafka was dated '
                                     f'{table_summary.latest_change_seen}.')
                 if table_summary.change_index_order_regressions_count:

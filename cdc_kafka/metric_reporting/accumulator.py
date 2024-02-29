@@ -6,7 +6,7 @@ import confluent_kafka
 import pyodbc
 import sortedcontainers
 
-from .. import constants, sql_queries
+from .. import constants, sql_queries, helpers
 from . import metrics
 
 from typing import TYPE_CHECKING
@@ -67,7 +67,7 @@ class Accumulator(AccumulatorAbstract):
 
     # noinspection PyAttributeOutsideInit
     def reset_and_start(self) -> None:
-        self._interval_start_epoch_sec: float = datetime.datetime.now(datetime.UTC).timestamp()
+        self._interval_start_epoch_sec: float = helpers.naive_utcnow().timestamp()
         self._total_sleep_time_sec: float = 0
         self._db_change_data_queries_count: int = 0
         self._db_change_data_queries_total_time_sec: float = 0
@@ -89,7 +89,7 @@ class Accumulator(AccumulatorAbstract):
         self._produced_update_changes_count: int = 0
 
     def end_and_get_values(self) -> metrics.Metrics:
-        end_epoch_sec = datetime.datetime.now(datetime.UTC).timestamp()
+        end_epoch_sec = helpers.naive_utcnow().timestamp()
         interval_delta_sec = end_epoch_sec - self._interval_start_epoch_sec
         db_all_data_queries_total_time_sec = self._db_snapshot_queries_total_time_sec + \
             self._db_change_data_queries_total_time_sec
@@ -102,7 +102,7 @@ class Accumulator(AccumulatorAbstract):
         with self._db_conn.cursor() as cursor:
             q, _ = sql_queries.get_latest_cdc_entry_time()
             cursor.execute(q)
-            cdc_lag = (datetime.datetime.now(datetime.UTC) - self._clock_syncer.db_time_to_utc(cursor.fetchval())) \
+            cdc_lag = (helpers.naive_utcnow() - self._clock_syncer.db_time_to_utc(cursor.fetchval())) \
                 .total_seconds()
 
         m = metrics.Metrics()
@@ -237,9 +237,9 @@ class Accumulator(AccumulatorAbstract):
 
         timestamp_type, timestamp = message.timestamp()
         if timestamp_type != confluent_kafka.TIMESTAMP_CREATE_TIME:
-            produce_datetime = datetime.datetime.now(datetime.UTC)
+            produce_datetime = helpers.naive_utcnow()
         else:
-            produce_datetime = datetime.datetime.fromtimestamp(timestamp / 1000.0, datetime.UTC)
+            produce_datetime = datetime.datetime.fromtimestamp(timestamp / 1000.0)
 
         event_time = datetime.datetime.fromisoformat(original_value[constants.EVENT_TIME_NAME])
         db_commit_time = self._clock_syncer.db_time_to_utc(event_time)
