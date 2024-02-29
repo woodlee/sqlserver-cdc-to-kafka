@@ -2,7 +2,7 @@ import argparse
 import json
 import logging
 import os
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
 
 import confluent_kafka
 from tabulate import tabulate
@@ -35,7 +35,7 @@ def main() -> None:
 
     with kafka.KafkaClient(accumulator.NoopAccumulator(), opts.kafka_bootstrap_servers, opts.schema_registry_url, {},
                            {}, disable_writing=True) as kafka_client:
-        last_start: Optional[confluent_kafka.Message] = None
+        last_start: Optional[Dict[str, Any]] = None
         consumed_count: int = 0
         relevant_count: int = 0
         headers = [
@@ -52,27 +52,29 @@ def main() -> None:
         ]
         display_table: List[List[str]] = []
         completion_seen_since_start: bool = False
-        for log in kafka_client.consume_all(opts.snapshot_logging_topic_name):
+        for msg in kafka_client.consume_all(opts.snapshot_logging_topic_name):
+            # noinspection PyTypeChecker,PyArgumentList
+            log = dict(msg.value())
             consumed_count += 1
-            if log.value()['topic_name'] != opts.topic_name:
+            if log['topic_name'] != opts.topic_name:
                 continue
             relevant_count += 1
             display_table.append([
-                log.value()["event_time_utc"],
-                log.value()["action"],
-                log.value()["table_name"],
-                log.value()["starting_snapshot_index"],
-                log.value()["ending_snapshot_index"],
-                log.value()["partition_watermarks_low"],
-                log.value()["partition_watermarks_high"],
-                log.value()["process_hostname"],
-                log.value()["key_schema_id"],
-                log.value()["value_schema_id"],
+                log["event_time_utc"],
+                log["action"],
+                log["table_name"],
+                log["starting_snapshot_index"],
+                log["ending_snapshot_index"],
+                log["partition_watermarks_low"],
+                log["partition_watermarks_high"],
+                log["process_hostname"],
+                log["key_schema_id"],
+                log["value_schema_id"],
             ])
-            if log.value()["action"] == constants.SNAPSHOT_LOG_ACTION_STARTED:
+            if log["action"] == constants.SNAPSHOT_LOG_ACTION_STARTED:
                 last_start = log
                 completion_seen_since_start = False
-            if log.value()["action"] == constants.SNAPSHOT_LOG_ACTION_COMPLETED:
+            if log["action"] == constants.SNAPSHOT_LOG_ACTION_COMPLETED:
                 completion_seen_since_start = True
 
         all_topic_configs = kafka_client.get_topic_config(opts.topic_name)
@@ -101,10 +103,12 @@ Current topic watermarks are: {watermarks}.
     if last_start:
         config_alter, restore_by_add, restore_by_delete = '', '', ''
         delete_parts = [{"topic": opts.topic_name, "partition": int(part), "offset": wm}
-                        for part, wm in last_start.value()['partition_watermarks_high'].items()]
+                        for part, wm in last_start['partition_watermarks_high'].items()]
         delete_spec = json.dumps({"partitions": delete_parts}, indent=4)
         if not topic_has_delete_cleanup_policy:
-            config_alter = f'kafka-configs --bootstrap-server {opts.kafka_bootstrap_servers} --alter --entity-type topics --entity-name {opts.topic_name} --add-config cleanup.policy=delete,retention.ms=-1,retention.bytes=-1'
+            config_alter = (f'kafka-configs --bootstrap-server {opts.kafka_bootstrap_servers} '
+                            f'--alter --entity-type topics --entity-name {opts.topic_name} --add-config '
+                            f'cleanup.policy=delete,retention.ms=-1,retention.bytes=-1')
             to_add = []
             to_delete = []
             for ret_con in RETENTION_CONFIG_NAMES:
@@ -112,8 +116,12 @@ Current topic watermarks are: {watermarks}.
                     to_add.append(f'{ret_con}=[{topic_level_retention_configs[ret_con]}]')
                 else:
                     to_delete.append(ret_con)
-            restore_by_add = f"kafka-configs --bootstrap-server {opts.kafka_bootstrap_servers} --alter --entity-type topics --entity-name {opts.topic_name} --add-config {','.join(to_add)}"
-            restore_by_delete = f"kafka-configs --bootstrap-server {opts.kafka_bootstrap_servers} --alter --entity-type topics --entity-name {opts.topic_name} --delete-config {','.join(to_delete)}"
+            restore_by_add = (f"kafka-configs --bootstrap-server {opts.kafka_bootstrap_servers} --alter "
+                              f"--entity-type topics --entity-name {opts.topic_name} "
+                              f"--add-config {','.join(to_add)}")
+            restore_by_delete = (f"kafka-configs --bootstrap-server {opts.kafka_bootstrap_servers} --alter "
+                                 f"--entity-type topics --entity-name {opts.topic_name} "
+                                 f"--delete-config {','.join(to_delete)}")
 
         if not completion_seen_since_start:
             print('''
