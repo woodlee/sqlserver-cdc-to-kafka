@@ -5,7 +5,7 @@ from typing import Dict, Tuple, Any, Optional, Mapping, TypeVar, Type
 
 import confluent_kafka.avro
 
-from . import constants
+from . import constants, helpers, tracked_tables
 from .change_index import ChangeIndex
 
 from typing import TYPE_CHECKING
@@ -108,6 +108,71 @@ PROGRESS_TRACKING_AVRO_VALUE_SCHEMA = confluent_kafka.avro.loads(json.dumps({
     ]
 }))
 
+SNAPSHOT_LOGGING_SCHEMA_VERSION = '1'
+SNAPSHOT_LOGGING_AVRO_VALUE_SCHEMA = confluent_kafka.avro.loads(json.dumps({
+    "name": f"{constants.AVRO_SCHEMA_NAMESPACE}__snapshot_logging_v{SNAPSHOT_LOGGING_SCHEMA_VERSION}__value",
+    "namespace": constants.AVRO_SCHEMA_NAMESPACE,
+    "type": "record",
+    "fields": [
+        {
+            "name": "topic_name",
+            "type": "string"
+        },
+        {
+            "name": "table_name",
+            "type": "string"
+        },
+        {
+            "name": "action",
+            "type": "string"
+        },
+        {
+            "name": "process_hostname",
+            "type": "string"
+        },
+        {
+            "name": "event_time_utc",
+            "type": "string"
+        },
+        {
+            "name": "key_schema_id",
+            "type": ["null", "long"]
+        },
+        {
+            "name": "value_schema_id",
+            "type": ["null", "long"]
+        },
+        {
+            "name": "partition_watermarks_low",
+            "type": ["null", {
+                "type": "map",
+                "values": "long"
+            }]
+        },
+        {
+            "name": "partition_watermarks_high",
+            "type": ["null", {
+                "type": "map",
+                "values": "long"
+            }]
+        },
+        {
+            "name": "starting_snapshot_index",
+            "type": ["null", {
+                "type": "map",
+                "values": ["string", "long"]
+            }]
+        },
+        {
+            "name": "ending_snapshot_index",
+            "type": ["null", {
+                "type": "map",
+                "values": ["string", "long"]
+            }]
+        }
+    ]
+}))
+
 ProgressEntryType = TypeVar('ProgressEntryType', bound='ProgressEntry')
 
 
@@ -121,17 +186,19 @@ class ProgressEntry(object):
         if kind not in (constants.CHANGE_ROWS_KIND, constants.SNAPSHOT_ROWS_KIND):
             raise Exception(f"Unrecognized progress kind from message: {kind}")
 
+        coords = helpers.format_coordinates(message)
+
         if kind == constants.SNAPSHOT_ROWS_KIND:
             return cls(kind, k['topic_name'], v['source_table_name'], v['change_table_name'],
-                       v['last_ack_position']['key_fields'], None)
+                       v['last_ack_position']['key_fields'], None, coords)
 
         else:
             return cls(kind, k['topic_name'], v['source_table_name'], v['change_table_name'],
-                       None, ChangeIndex.from_avro_ready_dict(v['last_ack_position']))
+                       None, ChangeIndex.from_avro_ready_dict(v['last_ack_position']), coords)
 
     def __init__(self, progress_kind: str, topic_name: str, source_table_name: str, change_table_name: str,
                  snapshot_index: Optional[Mapping[str, str | int]] = None,
-                 change_index: Optional[ChangeIndex] = None) -> None:
+                 change_index: Optional[ChangeIndex] = None, progress_msg_coordinates: Optional[str] = None) -> None:
         if progress_kind not in (constants.CHANGE_ROWS_KIND, constants.SNAPSHOT_ROWS_KIND):
             raise Exception(f'Unrecognized progress kind: {progress_kind}')
 
@@ -141,6 +208,7 @@ class ProgressEntry(object):
         self.change_table_name: str = change_table_name
         self.snapshot_index: Optional[Mapping[str, str | int]] = snapshot_index
         self.change_index: Optional[ChangeIndex] = change_index
+        self.progress_msg_coordinates: Optional[str] = progress_msg_coordinates
 
     @property
     def key(self) -> Dict[str, str]:
@@ -170,21 +238,32 @@ class ProgressEntry(object):
 class ProgressTracker(object):
     _instance = None
 
-    def __init__(self, kafka_client: 'KafkaClient', progress_topic_name: str,
-                 topic_to_source_table_map: Dict[str, str],
-                 topic_to_change_table_map: Dict[str, str]) -> None:
+    def __init__(self, kafka_client: 'KafkaClient', progress_topic_name: str, process_hostname: str,
+                 snapshot_logging_topic_name: Optional[str] = None) -> None:
         if ProgressTracker._instance is not None:
             raise Exception('ProgressTracker class should be used as a singleton.')
 
         self._kafka_client: 'KafkaClient' = kafka_client
         self._progress_topic_name: str = progress_topic_name
-        self._topic_to_source_table_map: Dict[str, str] = topic_to_source_table_map
-        self._topic_to_change_table_map: Dict[str, str] = topic_to_change_table_map
+        self._process_hostname: str = process_hostname
+        self._snapshot_logging_topic_name: Optional[str] = snapshot_logging_topic_name
         self._progress_key_schema_id, self._progress_value_schema_id = kafka_client.register_schemas(
             progress_topic_name, PROGRESS_TRACKING_AVRO_KEY_SCHEMA, PROGRESS_TRACKING_AVRO_VALUE_SCHEMA)
+        if snapshot_logging_topic_name:
+            _, self._snapshot_logging_schema_id = kafka_client.register_schemas(
+                snapshot_logging_topic_name, None, SNAPSHOT_LOGGING_AVRO_VALUE_SCHEMA)
+        else:
+            self._snapshot_logging_schema_id = 0
         self._last_recorded_progress_by_topic: Dict[str, ProgressEntry] = {}
+        self._topic_to_source_table_map: Dict[str, str] = {}
+        self._topic_to_change_table_map: Dict[str, str] = {}
 
         ProgressTracker._instance = self
+
+    def register_table(self, table: 'tracked_tables.TrackedTable') -> None:
+        self._topic_to_source_table_map[table.topic_name] = table.fq_name
+        self._topic_to_change_table_map[table.topic_name] = helpers.get_fq_change_table_name(
+            table.capture_instance_name)
 
     def get_last_recorded_progress_for_topic(self, topic_name: str) -> Optional[ProgressEntry]:
         return self._last_recorded_progress_by_topic.get(topic_name)
@@ -227,15 +306,90 @@ class ProgressTracker(object):
             message_type=constants.SNAPSHOT_PROGRESS_MESSAGE
         )
 
+    def _log_snapshot_event(self, topic_name: str, table_name: str, action: str,
+                            key_schema_id: Optional[int] = None, value_schema_id: Optional[int] = None,
+                            event_time: Optional[datetime.datetime] = None,
+                            starting_snapshot_index: Optional[Mapping[str, str | int]] = None,
+                            ending_snapshot_index: Optional[Mapping[str, str | int]] = None) -> None:
+        if self._snapshot_logging_topic_name is None:
+            return
+
+        low_wms: Dict[str, int] = {}
+        high_wms: Dict[str, int] = {}
+        for partition, (lo_wm, hi_wm) in enumerate(self._kafka_client.get_topic_watermarks([topic_name])[topic_name]):
+            low_wms[str(partition)] = lo_wm
+            high_wms[str(partition)] = hi_wm
+
+        event_time_iso = event_time.isoformat() if event_time is not None \
+            else datetime.datetime.now(datetime.UTC).isoformat()
+
+        msg = {
+            "action": action,
+            "ending_snapshot_index": ending_snapshot_index,
+            "event_time_utc": event_time_iso,
+            "partition_watermarks_high": high_wms,
+            "partition_watermarks_low": low_wms,
+            "process_hostname": self._process_hostname,
+            "starting_snapshot_index": starting_snapshot_index,
+            "table_name": table_name,
+            "topic_name": topic_name,
+            "key_schema_id": key_schema_id,
+            "value_schema_id": value_schema_id
+        }
+
+        logger.debug('Logging snapshot event: %s', msg)
+
+        self._kafka_client.produce(
+            topic=self._snapshot_logging_topic_name,
+            key=None,
+            key_schema_id=0,
+            value=msg,
+            value_schema_id=self._snapshot_logging_schema_id,
+            message_type=constants.SNAPSHOT_LOGGING_MESSAGE
+        )
+
+    def log_snapshot_started(self, topic_name: str, table_name: str, key_schema_id: int, value_schema_id: int,
+                             starting_snapshot_index: Mapping[str, str | int]) -> None:
+        return self._log_snapshot_event(topic_name, table_name, constants.SNAPSHOT_LOG_ACTION_STARTED,
+                                        key_schema_id=key_schema_id, value_schema_id=value_schema_id,
+                                        starting_snapshot_index=starting_snapshot_index)
+
+    def log_snapshot_resumed(self, topic_name: str, table_name: str, key_schema_id: int, value_schema_id: int,
+                             starting_snapshot_index: Mapping[str, str | int]) -> None:
+        return self._log_snapshot_event(topic_name, table_name, constants.SNAPSHOT_LOG_ACTION_RESUMED,
+                                        key_schema_id=key_schema_id, value_schema_id=value_schema_id,
+                                        starting_snapshot_index=starting_snapshot_index)
+
+    def log_snapshot_completed(self, topic_name: str, table_name: str, key_schema_id: int, value_schema_id: int,
+                               event_time: datetime.datetime, ending_snapshot_index: Mapping[str, str | int]) -> None:
+        return self._log_snapshot_event(topic_name, table_name, constants.SNAPSHOT_LOG_ACTION_COMPLETED,
+                                        key_schema_id=key_schema_id, value_schema_id=value_schema_id,
+                                        event_time=event_time, ending_snapshot_index=ending_snapshot_index)
+
+    def log_snapshot_progress_reset(self, topic_name: str, table_name: str,
+                                    prior_progress_snapshot_index: Optional[Mapping[str, str | int]]) -> None:
+        return self._log_snapshot_event(topic_name, table_name, constants.SNAPSHOT_LOG_ACTION_RESET,
+                                        ending_snapshot_index=prior_progress_snapshot_index)
+
     def get_prior_progress_or_create_progress_topic(self) -> Dict[Tuple[str, str], ProgressEntry]:
-        if self._kafka_client.get_topic_partition_count(self._progress_topic_name) is None:
+        if not self._kafka_client.get_topic_partition_count(self._progress_topic_name):
             logger.warning('No existing progress storage topic found; creating topic %s', self._progress_topic_name)
 
             # log.segment.bytes set to 16 MB. Compaction will not run until the next log segment rolls, so we set this
             # a bit low (the default is 1 GB!) to prevent having to read too much from the topic on process startup:
-            self._kafka_client.create_topic(self._progress_topic_name, 1, extra_config={"segment.bytes": 16777216})
+            self._kafka_client.create_topic(self._progress_topic_name, 1,
+                                            extra_config={"segment.bytes": 16 * 1024 * 1024})
             return {}
         return self.get_prior_progress()
+
+    def maybe_create_snapshot_logging_topic(self) -> None:
+        if (self._snapshot_logging_topic_name and not
+                self._kafka_client.get_topic_partition_count(self._snapshot_logging_topic_name)):
+            logger.warning('No existing snapshot logging topic found; creating topic %s',
+                           self._snapshot_logging_topic_name)
+            self._kafka_client.create_topic(self._snapshot_logging_topic_name, 1,
+                                            extra_config={'cleanup.policy': 'delete',
+                                                          'retention.ms': 365 * 24 * 60 * 60 * 1000})  # 1 year
 
     # the keys in the returned dictionary are tuples of (topic_name, progress_kind)
     def get_prior_progress(self) -> Dict[Tuple[str, str], ProgressEntry]:
@@ -274,7 +428,8 @@ class ProgressTracker(object):
         logger.info('Read %s prior progress messages from Kafka topic %s', progress_msg_ctr, self._progress_topic_name)
         return result
 
-    def reset_progress(self, topic_name: str, kind_to_reset: str) -> None:
+    def reset_progress(self, topic_name: str, kind_to_reset: str, source_table_name: str,
+                       prior_progress_snapshot_index: Optional[Mapping[str, str | int]] = None) -> None:
         # Produce messages with empty values to "delete" them from Kafka
         matched = False
 
@@ -296,6 +451,8 @@ class ProgressTracker(object):
             self._kafka_client.produce(self._progress_topic_name, key, self._progress_key_schema_id, None,
                                        self._progress_value_schema_id, constants.PROGRESS_DELETION_TOMBSTONE_MESSAGE)
             logger.info('Deleted existing snapshot progress records for topic %s.', topic_name)
+            self.maybe_create_snapshot_logging_topic()
+            self.log_snapshot_progress_reset(topic_name, source_table_name, prior_progress_snapshot_index)
             matched = True
 
         if not matched:

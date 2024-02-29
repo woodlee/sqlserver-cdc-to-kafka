@@ -109,8 +109,8 @@ class SQLQueryProcessor(object):
     def get_result(self, queue_name: str) -> Optional['SQLQueryResult']:
         if len(self._output_queues[queue_name]):
             return self._output_queues[queue_name].popleft()
-        deadline = datetime.datetime.utcnow() + self._results_wait_time
-        while datetime.datetime.utcnow() < deadline:
+        deadline = datetime.datetime.now(datetime.UTC) + self._results_wait_time
+        while datetime.datetime.now(datetime.UTC) < deadline:
             try:
                 res = self._subprocess_result_queue.get(timeout=0.1)
                 if res.queue_name == queue_name:
@@ -154,7 +154,7 @@ def query_processor(odbc_conn_string: str, stop_event: EventClass, request_queue
                                 time.sleep(constants.SQL_QUERY_INTER_RETRY_INTERVAL_SECONDS)
                                 continue
                             raise exc
-                    query_executed_utc = datetime.datetime.utcnow()
+                    query_executed_utc = datetime.datetime.now(datetime.UTC)
                     result_rows = cursor.fetchall()
                 query_took_sec = (time.perf_counter() - start_time)
                 result_queue.put_nowait(SQLQueryResult(request.queue_name, request.query_metadata_to_reflect,
@@ -162,7 +162,7 @@ def query_processor(odbc_conn_string: str, stop_event: EventClass, request_queue
                                                        request.query_params))
     except (KeyboardInterrupt, pyodbc.OperationalError) as exc:
         # 08S01 is the error code for "Communication link failure" which may be raised in response to KeyboardInterrupt
-        if type(exc) == pyodbc.OperationalError and not exc.args[0].startswith('08S01'):
+        if exc is pyodbc.OperationalError and not exc.args[0].startswith('08S01'):
             raise exc
     except Exception as exc:
         logger.exception('SQL query subprocess raised an exception.', exc_info=exc)

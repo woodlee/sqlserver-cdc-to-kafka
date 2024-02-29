@@ -5,6 +5,7 @@ import os
 import socket
 
 from typing import Tuple, List
+from . import constants
 from .metric_reporting import reporter_base
 
 
@@ -127,6 +128,13 @@ def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List[report
                    help="Name of the topic used to store progress details reading change tables (and also source "
                         "tables, in the case of snapshots). This process will create the topic if it does not yet "
                         "exist. IMPORTANT: It should have only one partition.")
+
+    p.add_argument('--snapshot-logging-topic-name',
+                   default=os.environ.get('SNAPSHOT_LOGGING_TOPIC_NAME'),
+                   help="Optional name of a topic which will receive messages logging events related to table "
+                        f"snapshots. Logged actions include '{constants.SNAPSHOT_LOG_ACTION_STARTED}', "
+                        f"'{constants.SNAPSHOT_LOG_ACTION_RESUMED}', '{constants.SNAPSHOT_LOG_ACTION_COMPLETED}', "
+                        f"and '{constants.SNAPSHOT_LOG_ACTION_RESET}'.")
 
     p.add_argument('--disable-deletion-tombstones',
                    type=str2bool, nargs='?', const=True,

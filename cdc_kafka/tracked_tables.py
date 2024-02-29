@@ -10,7 +10,7 @@ import pyodbc
 
 from .avro import avro_transform_fn_from_sql_type
 from . import constants, change_index, options, sql_queries, sql_query_subprocess, parsed_row, \
-    helpers, avro
+    helpers, avro, progress_tracking
 
 if TYPE_CHECKING:
     from .metric_reporting import accumulator
@@ -50,7 +50,7 @@ class TrackedTable(object):
                  sql_query_processor: sql_query_subprocess.SQLQueryProcessor,
                  schema_generator: avro.AvroSchemaGenerator, schema_name: str, table_name: str,
                  capture_instance_name: str, topic_name: str, min_lsn: bytes, snapshot_allowed: bool,
-                 db_row_batch_size: int) -> None:
+                 db_row_batch_size: int, progress_tracker: 'progress_tracking.ProgressTracker') -> None:
         self._db_conn: pyodbc.Connection = db_conn
         self._metrics_accumulator: 'accumulator.Accumulator' = metrics_accumulator
         self._sql_query_processor: sql_query_subprocess.SQLQueryProcessor = sql_query_processor
@@ -62,6 +62,7 @@ class TrackedTable(object):
         self.snapshot_allowed: bool = snapshot_allowed
         self.fq_name: str = f'{schema_name}.{table_name}'
         self.db_row_batch_size: int = db_row_batch_size
+        self.progress_tracker: progress_tracking.ProgressTracker = progress_tracker
 
         # Most of the below properties are not set until sometime after `finalize_table` is called:
 
@@ -137,9 +138,9 @@ class TrackedTable(object):
         prior_change_table_max_index: Optional[change_index.ChangeIndex],
         start_from_key_for_snapshot: Optional[Mapping[str, Any]], lsn_gap_handling: str,
         schema_id_getter: Optional[Callable[[str, Schema, Schema], Tuple[int, int]]] = None,
-        progress_reset_fn: Optional[Callable[[str, str], None]] = None,
-        record_snapshot_progress_fn: Optional[Callable[[str, Mapping[str, str | int]], None]] = None
+        allow_progress_writes: bool = False
     ) -> None:
+        self.progress_tracker.register_table(self)
         if self._finalized:
             raise Exception(f"Attempted to finalize table {self.fq_name} more than once")
 
@@ -157,10 +158,11 @@ class TrackedTable(object):
                 logger.warning('%s Proceeding anyway since lsn_gap_handling is set to "%s"!',
                                msg, options.LSN_GAP_HANDLING_IGNORE)
             elif lsn_gap_handling == options.LSN_GAP_HANDLING_BEGIN_NEW_SNAPSHOT:
-                if self.snapshot_allowed and progress_reset_fn:
+                if self.snapshot_allowed and allow_progress_writes:
+                    self.progress_tracker.reset_progress(self.topic_name, constants.ALL_PROGRESS_KINDS, self.fq_name,
+                                                         start_from_key_for_snapshot)
                     start_from_key_for_snapshot = None
                     logger.warning('%s Beginning new table snapshot!', msg)
-                    progress_reset_fn(self.topic_name, constants.ALL_PROGRESS_KINDS)
                 else:
                     raise Exception(
                         f'{msg} lsn_gap_handling was set to "{options.LSN_GAP_HANDLING_BEGIN_NEW_SNAPSHOT}", but due '
@@ -241,27 +243,40 @@ class TrackedTable(object):
 
                     if key_min_tuple and key_min_tuple == start_key_tuple:
                         self.snapshot_complete = True
-                        if record_snapshot_progress_fn is not None:
-                            record_snapshot_progress_fn(self.topic_name, constants.SNAPSHOT_COMPLETION_SENTINEL)
+                        if allow_progress_writes:
+                            self.progress_tracker.record_snapshot_progress(self.topic_name,
+                                                                           constants.SNAPSHOT_COMPLETION_SENTINEL)
                     else:
+                        if allow_progress_writes:
+                            start_key_dict = dict(zip(self._key_field_names, start_key_tuple))
+                            self.progress_tracker.log_snapshot_resumed(self.topic_name, self.fq_name,
+                                                                       self.key_schema_id, self.value_schema_id,
+                                                                       start_key_dict)
+
                         self._last_read_key_for_snapshot = start_key_tuple
                 else:
                     key_max = self._get_max_key_value()
                     if key_max:
-                        logger.info('Table %s is starting a full snapshot, working back from max key (%s)',
-                                    self.fq_name,
-                                    ', '.join([f'{k}: {v}' for k, v in zip(self._key_field_names, key_max)]))
+                        key_max_map = dict(zip(self._key_field_names, key_max))
+                        logger.info('Table %s is starting a full snapshot, working back from max key %s',
+                                    self.fq_name, key_max_map)
 
                         self._initial_snapshot_rows_query, _ = sql_queries.get_snapshot_rows(
                             self.db_row_batch_size, self.schema_name, self.table_name, self._value_field_names,
                             columns_no_longer_on_base_table, self._key_field_names, True, self._odbc_columns)
 
+                        if allow_progress_writes:
+                            self.progress_tracker.log_snapshot_started(self.topic_name, self.fq_name,
+                                                                       self.key_schema_id, self.value_schema_id,
+                                                                       key_max_map)
+
                         self._last_read_key_for_snapshot = None
                     else:
                         logger.warning('Snapshot was requested for table %s but it appears empty.', self.fq_name)
                         self.snapshot_complete = True
-                        if record_snapshot_progress_fn is not None:
-                            record_snapshot_progress_fn(self.topic_name, constants.SNAPSHOT_COMPLETION_SENTINEL)
+                        if allow_progress_writes:
+                            self.progress_tracker.record_snapshot_progress(self.topic_name,
+                                                                           constants.SNAPSHOT_COMPLETION_SENTINEL)
             else:
                 raise Exception(
                     f"Snapshotting was requested for table {self.fq_name}, but it does not appear to have a primary "
