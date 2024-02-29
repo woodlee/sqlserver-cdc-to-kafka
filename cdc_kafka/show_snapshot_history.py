@@ -101,6 +101,16 @@ Current topic watermarks are: {watermarks}.
         ''')
 
     if last_start:
+        topic_starts_with_last_snapshot = True
+        for part, (low_wm, _) in enumerate(watermarks):
+            if low_wm != last_start['partition_watermarks_high'][str(part)]:
+                topic_starts_with_last_snapshot = False
+        if topic_starts_with_last_snapshot:
+            print('''
+The first message in all topic-partitions appears to coincide with the beginning of the most recent snapshot.
+            ''')
+            exit(0)
+
         config_alter, restore_by_add, restore_by_delete = '', '', ''
         delete_parts = [{"topic": opts.topic_name, "partition": int(part), "offset": wm}
                         for part, wm in last_start['partition_watermarks_high'].items()]
