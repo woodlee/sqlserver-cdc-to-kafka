@@ -134,7 +134,8 @@ def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List[report
                    help="Optional name of a topic which will receive messages logging events related to table "
                         f"snapshots. Logged actions include '{constants.SNAPSHOT_LOG_ACTION_STARTED}', "
                         f"'{constants.SNAPSHOT_LOG_ACTION_RESUMED}', '{constants.SNAPSHOT_LOG_ACTION_COMPLETED}', "
-                        f"and '{constants.SNAPSHOT_LOG_ACTION_RESET}'.")
+                        f"'{constants.SNAPSHOT_LOG_ACTION_RESET_AUTO}', and "
+                        f"'{constants.SNAPSHOT_LOG_ACTION_RESET_MANUAL}'.")
 
     p.add_argument('--disable-deletion-tombstones',
                    type=str2bool, nargs='?', const=True,

@@ -160,7 +160,7 @@ class TrackedTable(object):
             elif lsn_gap_handling == options.LSN_GAP_HANDLING_BEGIN_NEW_SNAPSHOT:
                 if self.snapshot_allowed and allow_progress_writes:
                     self.progress_tracker.reset_progress(self.topic_name, constants.ALL_PROGRESS_KINDS, self.fq_name,
-                                                         start_from_key_for_snapshot)
+                                                         True, start_from_key_for_snapshot)
                     start_from_key_for_snapshot = None
                     logger.warning('%s Beginning new table snapshot!', msg)
                 else:

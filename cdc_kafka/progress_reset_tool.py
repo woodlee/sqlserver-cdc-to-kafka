@@ -57,7 +57,7 @@ Reading progress topic, please wait...
                         f'{progress.progress_msg_coordinates}: {progress}')
             if opts.execute:
                 kafka_client._disable_writing = False
-                progress_tracker.reset_progress(topic, progress_kind, progress.source_table_name,
+                progress_tracker.reset_progress(topic, progress_kind, progress.source_table_name, False,
                                                 progress.snapshot_index)
 
         for topic_name in opts.topic_names.split(','):

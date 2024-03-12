@@ -39,7 +39,8 @@ ALL_PROGRESS_KINDS = "all_progress"
 SNAPSHOT_LOG_ACTION_STARTED = 'started'
 SNAPSHOT_LOG_ACTION_RESUMED = 'resumed'
 SNAPSHOT_LOG_ACTION_COMPLETED = 'completed'
-SNAPSHOT_LOG_ACTION_RESET = 'progress-reset'
+SNAPSHOT_LOG_ACTION_RESET_AUTO = 'progress-reset-auto'
+SNAPSHOT_LOG_ACTION_RESET_MANUAL = 'progress-reset-manual'
 
 # CDC operation types; IDs 1-4 here match what SQL Server provides; ID 0 is of our own creation:
 

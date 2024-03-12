@@ -126,12 +126,16 @@ The first message in all topic-partitions appears to coincide with the beginning
                     to_add.append(f'{ret_con}=[{topic_level_retention_configs[ret_con]}]')
                 else:
                     to_delete.append(ret_con)
-            restore_by_add = (f"kafka-configs --bootstrap-server {opts.kafka_bootstrap_servers} --alter "
-                              f"--entity-type topics --entity-name {opts.topic_name} "
-                              f"--add-config {','.join(to_add)}")
-            restore_by_delete = (f"kafka-configs --bootstrap-server {opts.kafka_bootstrap_servers} --alter "
-                                 f"--entity-type topics --entity-name {opts.topic_name} "
-                                 f"--delete-config {','.join(to_delete)}")
+            restore_by_add = ''
+            if to_add:
+                restore_by_add = (f"kafka-configs --bootstrap-server {opts.kafka_bootstrap_servers} --alter "
+                                  f"--entity-type topics --entity-name {opts.topic_name} "
+                                  f"--add-config {','.join(to_add)}")
+            restore_by_delete = ''
+            if to_delete:
+                restore_by_delete = (f"kafka-configs --bootstrap-server {opts.kafka_bootstrap_servers} --alter "
+                                     f"--entity-type topics --entity-name {opts.topic_name} "
+                                     f"--delete-config {','.join(to_delete)}")
 
         if not completion_seen_since_start:
             print('''

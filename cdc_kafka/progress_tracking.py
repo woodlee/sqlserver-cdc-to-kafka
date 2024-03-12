@@ -366,9 +366,11 @@ class ProgressTracker(object):
                                         key_schema_id=key_schema_id, value_schema_id=value_schema_id,
                                         event_time=event_time, ending_snapshot_index=ending_snapshot_index)
 
-    def log_snapshot_progress_reset(self, topic_name: str, table_name: str,
+    def log_snapshot_progress_reset(self, topic_name: str, table_name: str, is_auto_reset: bool,
                                     prior_progress_snapshot_index: Optional[Mapping[str, str | int]]) -> None:
-        return self._log_snapshot_event(topic_name, table_name, constants.SNAPSHOT_LOG_ACTION_RESET,
+        action = constants.SNAPSHOT_LOG_ACTION_RESET_AUTO if is_auto_reset \
+            else constants.SNAPSHOT_LOG_ACTION_RESET_MANUAL
+        return self._log_snapshot_event(topic_name, table_name, action,
                                         ending_snapshot_index=prior_progress_snapshot_index)
 
     def get_prior_progress_or_create_progress_topic(self) -> Dict[Tuple[str, str], ProgressEntry]:
@@ -428,7 +430,7 @@ class ProgressTracker(object):
         logger.info('Read %s prior progress messages from Kafka topic %s', progress_msg_ctr, self._progress_topic_name)
         return result
 
-    def reset_progress(self, topic_name: str, kind_to_reset: str, source_table_name: str,
+    def reset_progress(self, topic_name: str, kind_to_reset: str, source_table_name: str, is_auto_reset: bool,
                        prior_progress_snapshot_index: Optional[Mapping[str, str | int]] = None) -> None:
         # Produce messages with empty values to "delete" them from Kafka
         matched = False
@@ -452,7 +454,8 @@ class ProgressTracker(object):
                                        self._progress_value_schema_id, constants.PROGRESS_DELETION_TOMBSTONE_MESSAGE)
             logger.info('Deleted existing snapshot progress records for topic %s.', topic_name)
             self.maybe_create_snapshot_logging_topic()
-            self.log_snapshot_progress_reset(topic_name, source_table_name, prior_progress_snapshot_index)
+            self.log_snapshot_progress_reset(topic_name, source_table_name, is_auto_reset,
+                                             prior_progress_snapshot_index)
             matched = True
 
         if not matched:
