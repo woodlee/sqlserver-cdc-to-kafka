@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import socket
 
 from cdc_kafka import kafka, constants, progress_tracking, options
 from .metric_reporting import accumulator
@@ -11,7 +12,7 @@ logger = logging.getLogger(__name__)
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument('--topic-names', required=True,
-                   default=os.environ.get('TOPIC_NAME'))
+                   default=os.environ.get('TOPIC_NAMES'))
     p.add_argument('--progress-kind', required=True,
                    choices=(constants.CHANGE_ROWS_KIND, constants.ALL_PROGRESS_KINDS, constants.SNAPSHOT_ROWS_KIND),
                    default=os.environ.get('PROGRESS_KIND'))
@@ -21,6 +22,8 @@ def main() -> None:
                    default=os.environ.get('KAFKA_BOOTSTRAP_SERVERS'))
     p.add_argument('--progress-topic-name', required=True,
                    default=os.environ.get('PROGRESS_TOPIC_NAME'))
+    p.add_argument('--snapshot-logging-topic-name', required=True,
+                   default=os.environ.get('SNAPSHOT_LOGGING_TOPIC_NAME'))
     p.add_argument('--execute',
                    type=options.str2bool, nargs='?', const=True,
                    default=options.str2bool(os.environ.get('EXECUTE', '0')))
@@ -41,18 +44,21 @@ Reading progress topic, please wait...
 
     with kafka.KafkaClient(accumulator.NoopAccumulator(), opts.kafka_bootstrap_servers, opts.schema_registry_url, {},
                            {}, disable_writing=True) as kafka_client:
-        progress_tracker = progress_tracking.ProgressTracker(kafka_client, opts.progress_topic_name, {}, {})
-        progress = progress_tracker.get_prior_progress()
+        progress_tracker = progress_tracking.ProgressTracker(kafka_client, opts.progress_topic_name, socket.getfqdn(),
+                                                             opts.snapshot_logging_topic_name)
+        progress_entries = progress_tracker.get_prior_progress()
 
         def act(topic: str, progress_kind: str) -> None:
-            if (topic, progress_kind) not in progress:
+            if (topic, progress_kind) not in progress_entries:
                 logger.warning(f'No {progress_kind} progress found for topic {topic}')
                 return
-            logger.info(f'Existing {progress_kind} progress found for topic {topic}: '
-                        f'{progress[(topic, progress_kind)]}')
+            progress = progress_entries[(topic, progress_kind)]
+            logger.info(f'Existing {progress_kind} progress found for topic {topic} at '
+                        f'{progress.progress_msg_coordinates}: {progress}')
             if opts.execute:
                 kafka_client._disable_writing = False
-                progress_tracker.reset_progress(topic, progress_kind)
+                progress_tracker.reset_progress(topic, progress_kind, progress.source_table_name, False,
+                                                progress.snapshot_index)
 
         for topic_name in opts.topic_names.split(','):
             topic_name = topic_name.strip()

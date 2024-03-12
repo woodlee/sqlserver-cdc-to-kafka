@@ -36,6 +36,12 @@ CHANGE_ROWS_KIND = "change_rows"
 SNAPSHOT_ROWS_KIND = "snapshot_rows"
 ALL_PROGRESS_KINDS = "all_progress"
 
+SNAPSHOT_LOG_ACTION_STARTED = 'started'
+SNAPSHOT_LOG_ACTION_RESUMED = 'resumed'
+SNAPSHOT_LOG_ACTION_COMPLETED = 'completed'
+SNAPSHOT_LOG_ACTION_RESET_AUTO = 'progress-reset-auto'
+SNAPSHOT_LOG_ACTION_RESET_MANUAL = 'progress-reset-manual'
+
 # CDC operation types; IDs 1-4 here match what SQL Server provides; ID 0 is of our own creation:
 
 SNAPSHOT_OPERATION_ID = 0
@@ -89,6 +95,7 @@ SINGLE_TABLE_SNAPSHOT_MESSAGE = 'table-snapshot'
 DELETION_CHANGE_TOMBSTONE_MESSAGE = 'deletion-tombstone'
 CHANGE_PROGRESS_MESSAGE = 'change-progress'
 SNAPSHOT_PROGRESS_MESSAGE = 'snapshot-progress'
+SNAPSHOT_LOGGING_MESSAGE = 'snapshot-logging'
 PROGRESS_DELETION_TOMBSTONE_MESSAGE = 'progress-deletion-tombstone'
 METRIC_REPORTING_MESSAGE = 'metric-reporting'
 

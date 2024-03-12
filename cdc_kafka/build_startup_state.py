@@ -19,7 +19,7 @@ def build_tracked_tables_from_cdc_metadata(
     snapshot_table_include_config: str, snapshot_table_exclude_config: str, truncate_fields: Dict[str, int],
     capture_instance_names: List[str], db_row_batch_size: int,
     sql_query_processor: sql_query_subprocess.SQLQueryProcessor,
-    schema_generator: avro.AvroSchemaGenerator
+    schema_generator: avro.AvroSchemaGenerator, progress_tracker: progress_tracking.ProgressTracker
 ) -> List[tracked_tables.TrackedTable]:
     result: List[tracked_tables.TrackedTable] = []
 
@@ -58,7 +58,7 @@ def build_tracked_tables_from_cdc_metadata(
 
         tracked_table = tracked_tables.TrackedTable(
             db_conn,  metrics_accumulator, sql_query_processor, schema_generator, schema_name, table_name,
-            capture_instance_name, topic_name, min_lsn, can_snapshot, db_row_batch_size)
+            capture_instance_name, topic_name, min_lsn, can_snapshot, db_row_batch_size, progress_tracker)
 
         for (change_table_ordinal, column_name, sql_type_name, _, primary_key_ordinal, decimal_precision,
              decimal_scale, _) in fields:
@@ -87,6 +87,8 @@ def determine_start_points_and_finalize_tables(
         return
 
     prior_progress_log_table_data = []
+
+    progress_tracker.maybe_create_snapshot_logging_topic()
     prior_progress = progress_tracker.get_prior_progress_or_create_progress_topic()
 
     snapshot_progress: Optional[progress_tracking.ProgressEntry]
@@ -97,8 +99,7 @@ def determine_start_points_and_finalize_tables(
         snapshot_progress, changes_progress = None, None
         prior_change_table_max_index: Optional[change_index.ChangeIndex] = None
 
-        if not report_progress_only and kafka_client.get_topic_partition_count(
-                table.topic_name) == 0:  # new topic; create it
+        if not report_progress_only and not kafka_client.get_topic_partition_count(table.topic_name):
             if partition_count:
                 this_topic_partition_count = partition_count
             else:
@@ -111,7 +112,6 @@ def determine_start_points_and_finalize_tables(
                         f'{table.topic_name} based on a change table rows per second rate of {per_second}. This '
                         f'seems excessive, so the program is exiting to prevent overwhelming your Kafka cluster. '
                         f'Look at setting PARTITION_COUNT to take manual control of this.')
-            logger.info('Creating topic %s with %s partition(s)', table.topic_name, this_topic_partition_count)
             kafka_client.create_topic(table.topic_name, this_topic_partition_count, replication_factor,
                                       extra_topic_config)
         else:
@@ -171,8 +171,7 @@ def determine_start_points_and_finalize_tables(
                                  options.LSN_GAP_HANDLING_IGNORE)
         else:
             table.finalize_table(starting_change_index, prior_change_table_max_index, starting_snapshot_index,
-                                 lsn_gap_handling, kafka_client.register_schemas, progress_tracker.reset_progress,
-                                 progress_tracker.record_snapshot_progress)
+                                 lsn_gap_handling, kafka_client.register_schemas, allow_progress_writes=True)
 
         if not table.snapshot_allowed:
             snapshot_state = '<not doing>'

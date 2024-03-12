@@ -92,7 +92,7 @@ class KafkaClient(object):
         self._avro_decoders: Dict[int, Callable[[io.BytesIO], Dict[str, Any]]] = dict()
         self._schema_ids_to_names: Dict[int, str] = dict()
         self._delivery_callbacks: Dict[str, List[Callable[
-            [str, confluent_kafka.Message, Dict[str, Any], Optional[Dict[str, Any]]], None
+            [str, confluent_kafka.Message, Optional[Dict[str, Any]], Optional[Dict[str, Any]]], None
         ]]] = collections.defaultdict(list)
         self._disable_writing = disable_writing
         self._creation_warned_topic_names: Set[str] = set()
@@ -117,7 +117,7 @@ class KafkaClient(object):
         logger.info("Done.")
 
     def register_delivery_callback(self, for_message_types: Iterable[str],
-                                   callback: Callable[[str, confluent_kafka.Message, Dict[str, Any],
+                                   callback: Callable[[str, confluent_kafka.Message, Optional[Dict[str, Any]],
                                                        Optional[Dict[str, Any]]], None]) -> None:
         for message_type in for_message_types:
             if message_type not in constants.ALL_KAFKA_MESSAGE_TYPES:
@@ -150,13 +150,17 @@ class KafkaClient(object):
                 logger.debug('Kafka transaction commit from %s', f'{previous_frame[0]}, line {previous_frame[1]}')
         self._producer.commit_transaction()
 
-    def produce(self, topic: str, key: Dict[str, Any], key_schema_id: int, value: Optional[Dict[str, Any]],
+    def produce(self, topic: str, key: Optional[Dict[str, Any]], key_schema_id: int, value: Optional[Dict[str, Any]],
                 value_schema_id: int, message_type: str, copy_to_unified_topics: Optional[List[str]] = None) -> None:
         if self._disable_writing:
             return
 
         start_time = time.perf_counter()
-        key_ser = self._avro_serializer.encode_record_with_schema_id(key_schema_id, key, True)
+        if key is None:
+            key_ser = None
+        else:
+            key_ser = self._avro_serializer.encode_record_with_schema_id(key_schema_id, key, True)
+
         if value is None:  # a deletion tombstone probably
             value_ser = None
         else:
@@ -332,7 +336,8 @@ class KafkaClient(object):
         extra_config = extra_config or {}
         topic_config = {**{'cleanup.policy': 'compact'}, **extra_config}
 
-        logger.debug('Kafka topic configuration for %s: %s', topic_name, json.dumps(topic_config))
+        logger.info('Creating Kafka topic "%s" with %s partitions, replication factor %s, and config: %s', topic_name,
+                    partition_count, replication_factor, json.dumps(topic_config))
         topic = confluent_kafka.admin.NewTopic(topic_name, partition_count, replication_factor, config=topic_config)
         self._admin.create_topics([topic])[topic_name].result()
         time.sleep(constants.KAFKA_CONFIG_RELOAD_DELAY_SECS)
@@ -362,8 +367,14 @@ class KafkaClient(object):
 
         return result
 
+    def get_topic_config(self, topic_name: str) -> Any:
+        resource = confluent_kafka.admin.ConfigResource(
+            restype=confluent_kafka.admin.ConfigResource.Type.TOPIC, name=topic_name)
+        result = self._admin.describe_configs([resource])
+        return result[resource].result()
+
     # returns (key schema ID, value schema ID)
-    def register_schemas(self, topic_name: str, key_schema: Schema, value_schema: Schema,
+    def register_schemas(self, topic_name: str, key_schema: Optional[Schema], value_schema: Schema,
                          key_schema_compatibility_level: str = constants.DEFAULT_KEY_SCHEMA_COMPATIBILITY_LEVEL,
                          value_schema_compatibility_level: str = constants.DEFAULT_VALUE_SCHEMA_COMPATIBILITY_LEVEL) \
             -> Tuple[int, int]:
@@ -380,15 +391,18 @@ class KafkaClient(object):
         key_subject, value_subject = topic_name + '-key', topic_name + '-value'
         registered = False
 
-        key_schema_id, current_key_schema, _ = self._schema_registry.get_latest_schema(key_subject)
-        if (current_key_schema is None or current_key_schema != key_schema) and not self._disable_writing:
-            logger.info('Key schema for subject %s does not exist or is outdated; registering now.', key_subject)
-            key_schema_id = self._schema_registry.register(key_subject, key_schema)
-            logger.debug('Schema registered for subject %s: %s', key_subject, key_schema)
-            if current_key_schema is None:
-                time.sleep(constants.KAFKA_CONFIG_RELOAD_DELAY_SECS)
-                self._schema_registry.update_compatibility(key_schema_compatibility_level, key_subject)
-            registered = True
+        if key_schema:
+            key_schema_id, current_key_schema, _ = self._schema_registry.get_latest_schema(key_subject)
+            if (current_key_schema is None or current_key_schema != key_schema) and not self._disable_writing:
+                logger.info('Key schema for subject %s does not exist or is outdated; registering now.', key_subject)
+                key_schema_id = self._schema_registry.register(key_subject, key_schema)
+                logger.debug('Schema registered for subject %s: %s', key_subject, key_schema)
+                if current_key_schema is None:
+                    time.sleep(constants.KAFKA_CONFIG_RELOAD_DELAY_SECS)
+                    self._schema_registry.update_compatibility(key_schema_compatibility_level, key_subject)
+                registered = True
+        else:
+            key_schema_id = 0
 
         value_schema_id, current_value_schema, _ = self._schema_registry.get_latest_schema(value_subject)
         if (current_value_schema is None or current_value_schema != value_schema) and not self._disable_writing:
@@ -419,7 +433,7 @@ class KafkaClient(object):
         return metadata
 
     def _delivery_callback(self, message_type: str, err: confluent_kafka.KafkaError, message: confluent_kafka.Message,
-                           original_key: Dict[str, Any], original_value: Optional[Dict[str, Any]]) -> None:
+                           original_key: Optional[Dict[str, Any]], original_value: Optional[Dict[str, Any]]) -> None:
         if err is not None:
             raise confluent_kafka.KafkaException(f'Delivery error on topic {message.topic()}: {err}')
 

@@ -3,7 +3,7 @@ import logging
 
 import pyodbc
 
-from . import sql_queries, constants
+from . import sql_queries, constants, helpers
 
 logger = logging.getLogger(__name__)
 
@@ -15,21 +15,21 @@ class ClockSync(object):
         if ClockSync._instance is not None:
             raise Exception('ClockSync class should be used as a singleton.')
 
-        self._last_sync_time: datetime.datetime = datetime.datetime.utcnow() - 2 * constants.DB_CLOCK_SYNC_INTERVAL
+        self._last_sync_time: datetime.datetime = (helpers.naive_utcnow() - 2 * constants.DB_CLOCK_SYNC_INTERVAL)
         self._db_conn: pyodbc.Connection = db_conn
         self._clock_skew: datetime.timedelta = self._get_skew()
 
         ClockSync._instance = self
 
     def db_time_to_utc(self, db_time: datetime.datetime) -> datetime.datetime:
-        now = datetime.datetime.utcnow()
+        now = helpers.naive_utcnow()
         if (now - self._last_sync_time) > constants.DB_CLOCK_SYNC_INTERVAL:
             self._clock_skew = self._get_skew()
             self._last_sync_time = now
         return db_time + self._clock_skew
 
     def _get_skew(self) -> datetime.timedelta:
-        now = datetime.datetime.utcnow()
+        now = helpers.naive_utcnow()
         with self._db_conn.cursor() as cursor:
             q, _ = sql_queries.get_date()
             cursor.execute(q)

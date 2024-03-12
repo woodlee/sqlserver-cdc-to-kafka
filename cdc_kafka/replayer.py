@@ -41,7 +41,7 @@ import os
 import queue as stdlib_queue
 import socket
 import time
-from datetime import datetime
+from datetime import datetime, UTC
 from multiprocessing.synchronize import Event as EventClass
 from typing import Set, Any, List, Dict, Tuple, NamedTuple
 
@@ -197,7 +197,8 @@ VALUES (
     , row.[replayer_process_id]
 );
             ''', (opts.replay_topic, partition, opts.target_db_table_schema, opts.target_db_table_name, offset,
-                  datetime.fromtimestamp(timestamp / 1000), opts.progress_tracking_namespace, proc_id))
+                  datetime.fromtimestamp(timestamp / 1000, UTC).replace(tzinfo=None),
+                  opts.progress_tracking_namespace, proc_id))
         db_conn.commit()
 
 
@@ -210,7 +211,7 @@ def commit_cb(err: KafkaError, tps: List[TopicPartition]) -> None:
 
 def format_coordinates(msg: Message) -> str:
     return f'{msg.topic()}:{msg.partition()}@{msg.offset()}, ' \
-           f'time {datetime.fromtimestamp(msg.timestamp()[1] / 1000)}'
+           f'time {datetime.fromtimestamp(msg.timestamp()[1] / 1000, UTC)}'
 
 
 def main() -> None:
