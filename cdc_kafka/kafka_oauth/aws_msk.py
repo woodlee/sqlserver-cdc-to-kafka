@@ -40,6 +40,9 @@ class AwsMskOauthCallbackProvider(KafkaOauthProviderAbstract):
     def add_arguments(parser: argparse.ArgumentParser) -> None:
         parser.add_argument('--aws-region', default=os.environ.get('AWS_REGION'),
                             help='AWS region name to use for IAM-based authentication to an AWS MSK cluster.')
+        parser.add_argument('--aws-role-session-name', default=os.environ.get('AWS_ROLE_SESSION_NAME'),
+                            help='A session name for the process to maintain principal-name stability when'
+                                 're-authenticating for AWS IAM/SASL')
 
     @classmethod
     def construct_with_options(cls: Type[AwsMskOauthCallbackProviderType],
