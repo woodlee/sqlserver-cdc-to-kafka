@@ -14,7 +14,7 @@ import confluent_kafka.admin
 import confluent_kafka.avro
 import fastavro
 
-from . import constants
+from . import constants, kafka_oauth
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -40,8 +40,7 @@ class KafkaClient(object):
             'bootstrap.servers': bootstrap_servers,
             'group.id': f'cdc_to_kafka_{socket.getfqdn()}',
             'enable.partition.eof': True,
-            'enable.auto.commit': False,
-            'broker.address.family': 'v4'
+            'enable.auto.commit': False
         }, **extra_kafka_consumer_config}
         producer_config: Dict[str, Any] = {**{
             'bootstrap.servers': bootstrap_servers,
@@ -50,13 +49,23 @@ class KafkaClient(object):
             'statistics.interval.ms': 30 * 60 * 1000,
             'enable.gapless.guarantee': True,
             'retry.backoff.ms': 250,
-            'compression.codec': 'snappy',
-            'broker.address.family': 'v4'
+            'compression.codec': 'snappy'
         }, **extra_kafka_producer_config}
         admin_config: Dict[str, Any] = {
-            'bootstrap.servers': bootstrap_servers,
-            'broker.address.family': 'v4'
+            'bootstrap.servers': bootstrap_servers
         }
+
+        oauth_provider = kafka_oauth.get_kafka_oauth_provider()
+
+        if oauth_provider is not None:
+            logger.debug('Using Kafka OAuth provider class %s', type(oauth_provider).__name__)
+            for config_dict in (consumer_config, producer_config, admin_config):
+                if not config_dict.get('security.protocol'):
+                    config_dict['security.protocol'] = 'SASL_SSL'
+                if not config_dict.get('sasl.mechanisms'):
+                    config_dict['sasl.mechanisms'] = 'OAUTHBEARER'
+                if not config_dict.get('client.id'):
+                    config_dict['client.id'] = socket.gethostname()
 
         logger.debug('Kafka consumer configuration: %s', json.dumps(consumer_config))
         logger.debug('Kafka producer configuration: %s', json.dumps(producer_config))
@@ -73,16 +82,17 @@ class KafkaClient(object):
         admin_config['throttle_cb'] = KafkaClient._log_kafka_throttle_event
         admin_config['logger'] = logger
 
+        if oauth_provider is not None:
+            consumer_config['oauth_cb'] = oauth_provider.consumer_oauth_cb
+            producer_config['oauth_cb'] = oauth_provider.producer_oauth_cb
+            admin_config['oauth_cb'] = oauth_provider.admin_oauth_cb
+
         self._use_transactions: bool = False
         if transactional_id is not None:
             producer_config['transactional.id'] = transactional_id
             self._use_transactions = True
 
         self._producer: confluent_kafka.Producer = confluent_kafka.Producer(producer_config)
-
-        if self._use_transactions:
-            self._producer.init_transactions()
-
         self._schema_registry: confluent_kafka.avro.CachedSchemaRegistryClient = \
             confluent_kafka.avro.CachedSchemaRegistryClient(schema_registry_url)
         self._consumer: confluent_kafka.Consumer = confluent_kafka.Consumer(consumer_config)
@@ -96,6 +106,18 @@ class KafkaClient(object):
         ]]] = collections.defaultdict(list)
         self._disable_writing = disable_writing
         self._creation_warned_topic_names: Set[str] = set()
+
+        if oauth_provider is not None:
+            # I dislike this, but it seems like these polls are needed to trigger initial invocations of the oauth_cb
+            # before we act further with the producer, admin client, or consumer:
+            oauth_cb_poll_timeout = 3
+            self._producer.poll(oauth_cb_poll_timeout)
+            self._consumer.poll(oauth_cb_poll_timeout)
+            self._admin.poll(oauth_cb_poll_timeout)
+
+        if self._use_transactions:
+            self._producer.init_transactions(constants.KAFKA_REQUEST_TIMEOUT_SECS)
+
         self._cluster_metadata: confluent_kafka.admin.ClusterMetadata = self._get_cluster_metadata()
 
         KafkaClient._instance = self
