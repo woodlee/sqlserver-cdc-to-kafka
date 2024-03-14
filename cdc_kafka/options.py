@@ -5,7 +5,7 @@ import os
 import socket
 
 from typing import Tuple, List
-from . import constants
+from . import constants, kafka_oauth
 from .metric_reporting import reporter_base
 
 
@@ -285,7 +285,9 @@ def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List[report
                    default=os.environ.get('DB_ROW_BATCH_SIZE', 2000),
                    help="Maximum number of rows to retrieve in a single change data or snapshot query. Default 2000.")
 
-    opts = p.parse_args()
+    kafka_oauth.add_kafka_oauth_arg(p)
+
+    opts, _ = p.parse_known_args()
 
     reporter_classes: List[reporter_base.ReporterBase] = []
     reporters: List[reporter_base.ReporterBase] = []
@@ -298,7 +300,7 @@ def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List[report
             reporter_classes.append(reporter_class)
             reporter_class.add_arguments(p)
 
-        opts = p.parse_args()
+        opts, _ = p.parse_known_args()
 
         for reporter_class in reporter_classes:
             reporters.append(reporter_class.construct_with_options(opts))

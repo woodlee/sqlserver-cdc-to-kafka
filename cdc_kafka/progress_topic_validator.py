@@ -2,6 +2,7 @@ import argparse
 import collections
 import copy
 import datetime
+import json
 import logging
 import os
 import re
@@ -10,7 +11,7 @@ from typing import Dict, Optional, Set
 import confluent_kafka
 from tabulate import tabulate
 
-from cdc_kafka import kafka, constants, progress_tracking, options, helpers
+from cdc_kafka import kafka, constants, progress_tracking, options, helpers, kafka_oauth
 from .metric_reporting import accumulator
 
 logger = logging.getLogger(__name__)
@@ -41,16 +42,20 @@ def main() -> None:
                    default=os.environ.get('KAFKA_BOOTSTRAP_SERVERS'))
     p.add_argument('--progress-topic-name',
                    default=os.environ.get('PROGRESS_TOPIC_NAME', '_cdc_to_kafka_progress'))
+    p.add_argument('--extra-kafka-consumer-config',
+                   default=os.environ.get('EXTRA_KAFKA_CONSUMER_CONFIG', {}), type=json.loads)
+    kafka_oauth.add_kafka_oauth_arg(p)
     p.add_argument('--show-all',
                    type=options.str2bool, nargs='?', const=True,
                    default=options.str2bool(os.environ.get('SHOW_ALL', '0')))
-    opts = p.parse_args()
+    opts, _ = p.parse_known_args()
 
     if not (opts.schema_registry_url and opts.kafka_bootstrap_servers):
         raise Exception('Arguments schema_registry_url and kafka_bootstrap_servers are required.')
 
     with kafka.KafkaClient(accumulator.NoopAccumulator(), opts.kafka_bootstrap_servers,
-                           opts.schema_registry_url, {}, {}, disable_writing=True) as kafka_client:
+                           opts.schema_registry_url, opts.extra_kafka_consumer_config, {},
+                           disable_writing=True) as kafka_client:
         if kafka_client.get_topic_partition_count(opts.progress_topic_name) is None:
             logger.error('Progress topic %s not found.', opts.progress_topic_name)
             exit(1)

@@ -7,7 +7,7 @@ from typing import List, Optional, Any, Dict
 import confluent_kafka
 from tabulate import tabulate
 
-from cdc_kafka import kafka
+from cdc_kafka import kafka, kafka_oauth
 from . import constants
 from .metric_reporting import accumulator
 
@@ -31,10 +31,13 @@ def main() -> None:
                    default=os.environ.get('KAFKA_BOOTSTRAP_SERVERS'))
     p.add_argument('--snapshot-logging-topic-name', required=True,
                    default=os.environ.get('SNAPSHOT_LOGGING_TOPIC_NAME'))
-    opts = p.parse_args()
+    p.add_argument('--extra-kafka-consumer-config',
+                   default=os.environ.get('EXTRA_KAFKA_CONSUMER_CONFIG', {}), type=json.loads)
+    kafka_oauth.add_kafka_oauth_arg(p)
+    opts, _ = p.parse_known_args()
 
-    with kafka.KafkaClient(accumulator.NoopAccumulator(), opts.kafka_bootstrap_servers, opts.schema_registry_url, {},
-                           {}, disable_writing=True) as kafka_client:
+    with kafka.KafkaClient(accumulator.NoopAccumulator(), opts.kafka_bootstrap_servers, opts.schema_registry_url,
+                           opts.extra_kafka_consumer_config, {}, disable_writing=True) as kafka_client:
         last_start: Optional[Dict[str, Any]] = None
         consumed_count: int = 0
         relevant_count: int = 0

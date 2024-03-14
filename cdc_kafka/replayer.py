@@ -35,6 +35,7 @@ Python package requirements:
 """
 
 import argparse
+import json
 import logging.config
 import multiprocessing as mp
 import os
@@ -51,6 +52,8 @@ from confluent_kafka.serialization import SerializationContext, MessageField
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroDeserializer
 from faster_fifo import Queue
+
+from cdc_kafka import kafka_oauth
 
 log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
 
@@ -224,6 +227,9 @@ def main() -> None:
                    default=os.environ.get('KAFKA_BOOTSTRAP_SERVERS'))
     p.add_argument('--schema-registry-url',
                    default=os.environ.get('SCHEMA_REGISTRY_URL'))
+    p.add_argument('--extra-kafka-consumer-config',
+                   default=os.environ.get('EXTRA_KAFKA_CONSUMER_CONFIG', {}), type=json.loads)
+    kafka_oauth.add_kafka_oauth_arg(p)
 
     # Config for data target / progress tracking
     p.add_argument('--target-db-server',
@@ -257,7 +263,7 @@ def main() -> None:
     p.add_argument('--consumed-messages-limit', type=int,
                    default=os.environ.get('CONSUMED_MESSAGES_LIMIT', 0))
 
-    opts = p.parse_args()
+    opts, _ = p.parse_known_args()
 
     if not (opts.replay_topic and opts.kafka_bootstrap_servers and opts.schema_registry_url and
             opts.target_db_server and opts.target_db_user and opts.target_db_password and opts.target_db_database and
@@ -537,7 +543,15 @@ def consumer_process(opts: argparse.Namespace, stop_event: EventClass, queue: Qu
                      'enable.auto.offset.store': False,
                      'enable.auto.commit': False,  # We don't use Kafka for offset management in this code
                      'auto.offset.reset': "earliest",
-                     'on_commit': commit_cb}
+                     'on_commit': commit_cb,
+                     **opts.extra_kafka_consumer_config}
+    oauth_provider = kafka_oauth.get_kafka_oauth_provider()
+    if oauth_provider is not None:
+        if not consumer_conf.get('security.protocol'):
+            consumer_conf['security.protocol'] = 'SASL_SSL'
+        if not consumer_conf.get('sasl.mechanisms'):
+            consumer_conf['sasl.mechanisms'] = 'OAUTHBEARER'
+        consumer_conf['oauth_cb'] = oauth_provider.consumer_oauth_cb
     consumer: Consumer = Consumer(consumer_conf)
     start_offset_by_partition: Dict[int, int] = {
         p.source_topic_partition: p.last_handled_message_offset + 1 for p in progress
