@@ -112,8 +112,10 @@ class KafkaClient(object):
             # before we act further with the producer, admin client, or consumer:
             oauth_cb_poll_timeout = 3
             self._producer.poll(oauth_cb_poll_timeout)
-            self._consumer.poll(oauth_cb_poll_timeout)
             self._admin.poll(oauth_cb_poll_timeout)
+            # Keep the consumer poll last, because it will actually take up thw whole timeout and in the meantime,
+            # the producer/admin clients can finish their (evidently) in-the-background auth'ing:
+            self._consumer.poll(oauth_cb_poll_timeout)
 
         if self._use_transactions:
             self._producer.init_transactions(constants.KAFKA_REQUEST_TIMEOUT_SECS)
