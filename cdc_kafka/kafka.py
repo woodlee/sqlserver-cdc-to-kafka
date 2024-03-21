@@ -136,7 +136,10 @@ class KafkaClient(object):
     def __exit__(self, exc_type: Optional[Type[BaseException]], exc: Optional[BaseException],
                  traceback: Optional[TracebackType]) -> None:
         logger.info("Cleaning up Kafka resources...")
-        self._consumer.close()
+        # We found that under some circumstances the consumer.close() call could hang during process shutdown.
+        # Commenting it out because upon reflection it seems unnecessary anyway, since we neither use consumer groups
+        # nor commit offsets in this process, and those are the main things close() helps to "clean up":
+        # self._consumer.close()
         self._producer.flush(constants.KAFKA_FULL_FLUSH_TIMEOUT_SECS)
         logger.info("Done.")
 
