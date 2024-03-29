@@ -110,12 +110,11 @@ class KafkaClient(object):
         if oauth_provider is not None:
             # I dislike this, but it seems like these polls are needed to trigger initial invocations of the oauth_cb
             # before we act further with the producer, admin client, or consumer:
-            oauth_cb_poll_timeout = 3
-            self._producer.poll(oauth_cb_poll_timeout)
-            self._admin.poll(oauth_cb_poll_timeout)
+            self._producer.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)
+            self._admin.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)
             # Keep the consumer poll last, because it will actually take up thw whole timeout and in the meantime,
             # the producer/admin clients can finish their (evidently) in-the-background auth'ing:
-            self._consumer.poll(oauth_cb_poll_timeout)
+            self._consumer.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)
 
         if self._use_transactions:
             self._producer.init_transactions(constants.KAFKA_REQUEST_TIMEOUT_SECS)
@@ -366,6 +365,7 @@ class KafkaClient(object):
         logger.info('Creating Kafka topic "%s" with %s partitions, replication factor %s, and config: %s', topic_name,
                     partition_count, replication_factor, json.dumps(topic_config))
         topic = confluent_kafka.admin.NewTopic(topic_name, partition_count, replication_factor, config=topic_config)
+        self._admin.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)  # In case oauth token refresh is needed
         self._admin.create_topics([topic])[topic_name].result()
         time.sleep(constants.KAFKA_CONFIG_RELOAD_DELAY_SECS)
         self._refresh_cluster_metadata()
@@ -373,6 +373,7 @@ class KafkaClient(object):
     # Returns dict where key is topic name and value is ordered list of tuples of (low, high) watermarks per partition:
     def get_topic_watermarks(self, topic_names: List[str]) -> Dict[str, List[Tuple[int, int]]]:
         result = collections.defaultdict(list)
+        self._consumer.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)  # In case oauth token refresh is needed
 
         for topic_name in topic_names:
             part_count = self.get_topic_partition_count(topic_name)
@@ -397,6 +398,7 @@ class KafkaClient(object):
     def get_topic_config(self, topic_name: str) -> Any:
         resource = confluent_kafka.admin.ConfigResource(
             restype=confluent_kafka.admin.ConfigResource.Type.TOPIC, name=topic_name)
+        self._admin.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)  # In case oauth token refresh is needed
         result = self._admin.describe_configs([resource])
         return result[resource].result()
 
@@ -454,6 +456,7 @@ class KafkaClient(object):
         self._cluster_metadata = self._get_cluster_metadata()
 
     def _get_cluster_metadata(self) -> confluent_kafka.admin.ClusterMetadata:
+        self._admin.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)  # In case oauth token refresh is needed
         metadata = self._admin.list_topics(timeout=constants.KAFKA_REQUEST_TIMEOUT_SECS)
         if metadata is None:
             raise Exception(f'Cluster metadata request to Kafka timed out')

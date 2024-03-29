@@ -69,6 +69,7 @@ class SQLQueryProcessor(object):
     def _check_if_ended(self) -> bool:
         exitcode = self._subprocess.exitcode
         if (self._stop_event.is_set() or exitcode is not None) and not self._ended:
+            logger.info('Ending SQL query subprocess...')
             self._ended = True
             if exitcode in (None, 0):
                 pass
@@ -86,12 +87,12 @@ class SQLQueryProcessor(object):
             while not self._subprocess_request_queue.empty():
                 try:
                     self._subprocess_request_queue.get_nowait()
-                except queue.Empty:
+                except (queue.Empty, EOFError):
                     break
             while not self._subprocess_result_queue.empty():
                 try:
                     self._subprocess_result_queue.get_nowait()
-                except queue.Empty:
+                except (queue.Empty, EOFError):
                     break
             self._subprocess.close()
             self._subprocess_request_queue.close()
