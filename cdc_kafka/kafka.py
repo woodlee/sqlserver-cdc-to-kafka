@@ -36,7 +36,7 @@ class KafkaClient(object):
         self._metrics_accumulator: 'accumulator.AccumulatorAbstract' = metrics_accumulator
 
         # Kafka consumer/producer librdkafka config defaults are here:
-        consumer_config: Dict[str, Any] = {**{
+        self.consumer_config: Dict[str, Any] = {**{
             'bootstrap.servers': bootstrap_servers,
             'group.id': f'cdc_to_kafka_{socket.getfqdn()}',
             'enable.partition.eof': True,
@@ -57,9 +57,11 @@ class KafkaClient(object):
 
         oauth_provider = kafka_oauth.get_kafka_oauth_provider()
 
+        self._use_oauth: bool = False
         if oauth_provider is not None:
+            self._use_oauth = True
             logger.debug('Using Kafka OAuth provider class %s', type(oauth_provider).__name__)
-            for config_dict in (consumer_config, producer_config, admin_config):
+            for config_dict in (self.consumer_config, producer_config, admin_config):
                 if not config_dict.get('security.protocol'):
                     config_dict['security.protocol'] = 'SASL_SSL'
                 if not config_dict.get('sasl.mechanisms'):
@@ -67,13 +69,13 @@ class KafkaClient(object):
                 if not config_dict.get('client.id'):
                     config_dict['client.id'] = socket.gethostname()
 
-        logger.debug('Kafka consumer configuration: %s', json.dumps(consumer_config))
+        logger.debug('Kafka consumer configuration: %s', json.dumps(self.consumer_config))
         logger.debug('Kafka producer configuration: %s', json.dumps(producer_config))
         logger.debug('Kafka admin client configuration: %s', json.dumps(admin_config))
 
-        consumer_config['error_cb'] = KafkaClient._raise_kafka_error
-        consumer_config['throttle_cb'] = KafkaClient._log_kafka_throttle_event
-        consumer_config['logger'] = logger
+        self.consumer_config['error_cb'] = KafkaClient._raise_kafka_error
+        self.consumer_config['throttle_cb'] = KafkaClient._log_kafka_throttle_event
+        self.consumer_config['logger'] = logger
         producer_config['error_cb'] = KafkaClient._raise_kafka_error
         producer_config['stats_cb'] = KafkaClient._emit_producer_stats
         producer_config['throttle_cb'] = KafkaClient._log_kafka_throttle_event
@@ -83,7 +85,7 @@ class KafkaClient(object):
         admin_config['logger'] = logger
 
         if oauth_provider is not None:
-            consumer_config['oauth_cb'] = oauth_provider.consumer_oauth_cb
+            self.consumer_config['oauth_cb'] = oauth_provider.consumer_oauth_cb
             producer_config['oauth_cb'] = oauth_provider.producer_oauth_cb
             admin_config['oauth_cb'] = oauth_provider.admin_oauth_cb
 
@@ -95,7 +97,6 @@ class KafkaClient(object):
         self._producer: confluent_kafka.Producer = confluent_kafka.Producer(producer_config)
         self._schema_registry: confluent_kafka.avro.CachedSchemaRegistryClient = \
             confluent_kafka.avro.CachedSchemaRegistryClient(schema_registry_url)
-        self._consumer: confluent_kafka.Consumer = confluent_kafka.Consumer(consumer_config)
         self._admin: confluent_kafka.admin.AdminClient = confluent_kafka.admin.AdminClient(admin_config)
         self._avro_serializer: confluent_kafka.avro.MessageSerializer = \
             confluent_kafka.avro.MessageSerializer(self._schema_registry)
@@ -107,14 +108,10 @@ class KafkaClient(object):
         self._disable_writing = disable_writing
         self._creation_warned_topic_names: Set[str] = set()
 
-        if oauth_provider is not None:
-            # I dislike this, but it seems like these polls are needed to trigger initial invocations of the oauth_cb
-            # before we act further with the producer, admin client, or consumer:
+        if self._use_oauth:
+            # trigger initial oauth_cb calls
             self._producer.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)
             self._admin.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)
-            # Keep the consumer poll last, because it will actually take up thw whole timeout and in the meantime,
-            # the producer/admin clients can finish their (evidently) in-the-background auth'ing:
-            self._consumer.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)
 
         if self._use_transactions:
             self._producer.init_transactions(constants.KAFKA_REQUEST_TIMEOUT_SECS)
@@ -135,11 +132,10 @@ class KafkaClient(object):
     def __exit__(self, exc_type: Optional[Type[BaseException]], exc: Optional[BaseException],
                  traceback: Optional[TracebackType]) -> None:
         logger.info("Cleaning up Kafka resources...")
-        # We found that under some circumstances the consumer.close() call could hang during process shutdown.
-        # Commenting it out because upon reflection it seems unnecessary anyway, since we neither use consumer groups
-        # nor commit offsets in this process, and those are the main things close() helps to "clean up":
-        # self._consumer.close()
         self._producer.flush(constants.KAFKA_FULL_FLUSH_TIMEOUT_SECS)
+        del self._admin
+        del self._producer
+        time.sleep(1)  # gives librdkafka threads more of a chance to exit properly before admin/producer are GC'd
         logger.info("Done.")
 
     def register_delivery_callback(self, for_message_types: Iterable[str],
@@ -253,14 +249,18 @@ class KafkaClient(object):
             return
         logger.debug('Progress topic %s contains %s messages', topic_name, message_count)
 
-        self._consumer.assign([confluent_kafka.TopicPartition(topic_name, part_id, confluent_kafka.OFFSET_BEGINNING)
-                               for part_id in range(part_count)])
+        consumer: confluent_kafka.Consumer = confluent_kafka.Consumer(self.consumer_config)
+        if self._use_oauth:
+            consumer.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)  # Trigger initial oauth_cb call
+
+        consumer.assign([confluent_kafka.TopicPartition(topic_name, part_id, confluent_kafka.OFFSET_BEGINNING)
+                         for part_id in range(part_count)])
 
         finished_parts = [False] * part_count
         ctr = 0
 
         while True:
-            msg = self._consumer.poll(constants.KAFKA_REQUEST_TIMEOUT_SECS)
+            msg = consumer.poll(constants.KAFKA_REQUEST_TIMEOUT_SECS)
 
             if msg is None:
                 time.sleep(0.2)
@@ -282,6 +282,8 @@ class KafkaClient(object):
             self._set_decoded_msg(msg)
             yield msg
 
+        consumer.close()
+
     def consume_bounded(self, topic_name: str, approx_max_recs: int,
                         boundary_watermarks: List[Tuple[int, int]]) -> Generator[confluent_kafka.Message, None, None]:
         part_count = self.get_topic_partition_count(topic_name)
@@ -297,14 +299,19 @@ class KafkaClient(object):
 
         rewind_per_part = int(approx_max_recs / part_count)
         start_offsets = [max(lo, hi - rewind_per_part) for lo, hi in boundary_watermarks]
-        self._consumer.assign([confluent_kafka.TopicPartition(topic_name, part_id, offset)
+
+        consumer: confluent_kafka.Consumer = confluent_kafka.Consumer(self.consumer_config)
+        if self._use_oauth:
+            consumer.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)  # Trigger initial oauth_cb call
+
+        consumer.assign([confluent_kafka.TopicPartition(topic_name, part_id, offset)
                                for part_id, offset in enumerate(start_offsets)])
 
         finished_parts = [False] * part_count
         ctr = 0
 
         while True:
-            msg = self._consumer.poll(constants.KAFKA_REQUEST_TIMEOUT_SECS)
+            msg = consumer.poll(constants.KAFKA_REQUEST_TIMEOUT_SECS)
 
             if msg is None:
                 time.sleep(0.2)
@@ -330,6 +337,8 @@ class KafkaClient(object):
 
             self._set_decoded_msg(msg)
             yield msg
+
+        consumer.close()
 
     def _set_decoded_msg(self, msg: confluent_kafka.Message) -> None:
         # noinspection PyArgumentList
@@ -365,7 +374,8 @@ class KafkaClient(object):
         logger.info('Creating Kafka topic "%s" with %s partitions, replication factor %s, and config: %s', topic_name,
                     partition_count, replication_factor, json.dumps(topic_config))
         topic = confluent_kafka.admin.NewTopic(topic_name, partition_count, replication_factor, config=topic_config)
-        self._admin.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)  # In case oauth token refresh is needed
+        if self._use_oauth:
+            self._admin.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)  # In case oauth token refresh is needed
         self._admin.create_topics([topic])[topic_name].result()
         time.sleep(constants.KAFKA_CONFIG_RELOAD_DELAY_SECS)
         self._refresh_cluster_metadata()
@@ -373,7 +383,10 @@ class KafkaClient(object):
     # Returns dict where key is topic name and value is ordered list of tuples of (low, high) watermarks per partition:
     def get_topic_watermarks(self, topic_names: List[str]) -> Dict[str, List[Tuple[int, int]]]:
         result = collections.defaultdict(list)
-        self._consumer.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)  # In case oauth token refresh is needed
+
+        consumer: confluent_kafka.Consumer = confluent_kafka.Consumer(self.consumer_config)
+        if self._use_oauth:
+            consumer.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)  # In case oauth token refresh is needed
 
         for topic_name in topic_names:
             part_count = self.get_topic_partition_count(topic_name)
@@ -386,19 +399,21 @@ class KafkaClient(object):
                 continue
 
             for part_id in range(part_count):
-                watermarks = self._consumer.get_watermark_offsets(
+                watermarks = consumer.get_watermark_offsets(
                     confluent_kafka.TopicPartition(topic_name, part_id), timeout=constants.KAFKA_REQUEST_TIMEOUT_SECS)
                 if watermarks is None:
                     raise Exception(f'Timeout requesting watermark offsets from Kafka for topic {topic_name}, '
                                     f'partition {part_id}')
                 result[topic_name].append(watermarks)
 
+        consumer.close()
         return result
 
     def get_topic_config(self, topic_name: str) -> Any:
         resource = confluent_kafka.admin.ConfigResource(
             restype=confluent_kafka.admin.ConfigResource.Type.TOPIC, name=topic_name)
-        self._admin.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)  # In case oauth token refresh is needed
+        if self._use_oauth:
+            self._admin.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)  # In case oauth token refresh is needed
         result = self._admin.describe_configs([resource])
         return result[resource].result()
 
@@ -456,7 +471,8 @@ class KafkaClient(object):
         self._cluster_metadata = self._get_cluster_metadata()
 
     def _get_cluster_metadata(self) -> confluent_kafka.admin.ClusterMetadata:
-        self._admin.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)  # In case oauth token refresh is needed
+        if self._use_oauth:
+            self._admin.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)  # In case oauth token refresh is needed
         metadata = self._admin.list_topics(timeout=constants.KAFKA_REQUEST_TIMEOUT_SECS)
         if metadata is None:
             raise Exception(f'Cluster metadata request to Kafka timed out')

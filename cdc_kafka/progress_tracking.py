@@ -186,15 +186,15 @@ class ProgressEntry(object):
         if kind not in (constants.CHANGE_ROWS_KIND, constants.SNAPSHOT_ROWS_KIND):
             raise Exception(f"Unrecognized progress kind from message: {kind}")
 
-        coords = helpers.format_coordinates(message)
+        msg_coordinates = helpers.format_coordinates(message)
 
         if kind == constants.SNAPSHOT_ROWS_KIND:
             return cls(kind, k['topic_name'], v['source_table_name'], v['change_table_name'],
-                       v['last_ack_position']['key_fields'], None, coords)
+                       v['last_ack_position']['key_fields'], None, msg_coordinates)
 
         else:
             return cls(kind, k['topic_name'], v['source_table_name'], v['change_table_name'],
-                       None, ChangeIndex.from_avro_ready_dict(v['last_ack_position']), coords)
+                       None, ChangeIndex.from_avro_ready_dict(v['last_ack_position']), msg_coordinates)
 
     def __init__(self, progress_kind: str, topic_name: str, source_table_name: str, change_table_name: str,
                  snapshot_index: Optional[Mapping[str, str | int]] = None,

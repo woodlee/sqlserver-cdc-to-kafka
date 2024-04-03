@@ -557,11 +557,11 @@ def consumer_process(opts: argparse.Namespace, stop_event: EventClass, queue: Qu
         p.source_topic_partition: p.last_handled_message_offset + 1 for p in progress
     }
     partitions: List[int] = consumer.list_topics(topic=opts.replay_topic).topics[opts.replay_topic].partitions
-    toppars: List[TopicPartition] = [TopicPartition(
+    topic_partitions: List[TopicPartition] = [TopicPartition(
         opts.replay_topic, p, start_offset_by_partition.get(p, OFFSET_BEGINNING)
     ) for p in partitions]
-    logger.info('Consumer assignments: %s', [f'{tp.topic}:{tp.partition}@{tp.offset}' for tp in toppars])
-    consumer.assign(toppars)
+    logger.info('Consumer assignments: %s', [f'{tp.topic}:{tp.partition}@{tp.offset}' for tp in topic_partitions])
+    consumer.assign(topic_partitions)
     msg_ctr: int = 0
 
     logger.info(f'Starting consumer for {opts.replay_topic}.')

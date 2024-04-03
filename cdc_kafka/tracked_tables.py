@@ -73,7 +73,7 @@ class TrackedTable(object):
         self.key_fields: Tuple[TrackedField, ...] = tuple()
         self.value_fields: Tuple[TrackedField, ...] = tuple()
         self.max_polled_change_index: change_index.ChangeIndex = change_index.LOWEST_CHANGE_INDEX
-        self.change_reads_are_lagging: bool = True
+        self.change_reads_are_lagging: bool = False
         self.snapshot_complete: bool = False
         self.min_lsn: bytes = min_lsn
 
@@ -94,6 +94,8 @@ class TrackedTable(object):
         self._changes_query_pending: bool = False
         self._changes_query_queue_name: str = self.fq_name + constants.CHANGE_ROWS_KIND
         self._snapshot_query_queue_name: str = self.fq_name + constants.SNAPSHOT_ROWS_KIND
+
+        self.progress_tracker.register_table(self)
 
     @property
     def last_read_key_for_snapshot_display(self) -> Optional[str]:
@@ -140,7 +142,6 @@ class TrackedTable(object):
         schema_id_getter: Optional[Callable[[str, Schema, Schema], Tuple[int, int]]] = None,
         allow_progress_writes: bool = False
     ) -> None:
-        self.progress_tracker.register_table(self)
         if self._finalized:
             raise Exception(f"Attempted to finalize table {self.fq_name} more than once")
 
@@ -154,6 +155,8 @@ class TrackedTable(object):
             if prior_change_table_max_index and prior_change_table_max_index <= start_after_change_table_index:
                 logger.info('%s Proceeding anyway, because it appears that no new entries are present in the prior '
                             'capture instance with an LSN higher than the last changes sent to Kafka.', msg)
+                self.progress_tracker.record_changes_progress(self.topic_name, change_index.ChangeIndex(
+                    self.min_lsn, change_index.LOWEST_CHANGE_INDEX.seqval, change_index.LOWEST_CHANGE_INDEX.operation))
             elif lsn_gap_handling == options.LSN_GAP_HANDLING_IGNORE:
                 logger.warning('%s Proceeding anyway since lsn_gap_handling is set to "%s"!',
                                msg, options.LSN_GAP_HANDLING_IGNORE)
