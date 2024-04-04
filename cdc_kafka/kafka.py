@@ -305,7 +305,7 @@ class KafkaClient(object):
             consumer.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)  # Trigger initial oauth_cb call
 
         consumer.assign([confluent_kafka.TopicPartition(topic_name, part_id, offset)
-                               for part_id, offset in enumerate(start_offsets)])
+                         for part_id, offset in enumerate(start_offsets)])
 
         finished_parts = [False] * part_count
         ctr = 0
