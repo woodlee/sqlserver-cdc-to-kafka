@@ -249,6 +249,9 @@ def run() -> None:
                                     completion()
                                 kafka_client.commit_transaction()
 
+                            if change_tables_lagging:
+                                break
+
                         if poll_periodic_tasks():
                             break
 

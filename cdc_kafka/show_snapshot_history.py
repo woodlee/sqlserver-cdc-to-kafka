@@ -1,8 +1,7 @@
 import argparse
 import json
 import logging
-import os
-from typing import List, Optional, Any, Dict
+from typing import List, Any, Dict
 
 import confluent_kafka
 from tabulate import tabulate
@@ -23,46 +22,47 @@ RETENTION_CONFIG_NAMES = (
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument('--topic-name', required=True,
-                   default=os.environ.get('TOPIC_NAME'))
-    p.add_argument('--schema-registry-url', required=True,
-                   default=os.environ.get('SCHEMA_REGISTRY_URL'))
-    p.add_argument('--kafka-bootstrap-servers', required=True,
-                   default=os.environ.get('KAFKA_BOOTSTRAP_SERVERS'))
-    p.add_argument('--snapshot-logging-topic-name', required=True,
-                   default=os.environ.get('SNAPSHOT_LOGGING_TOPIC_NAME'))
-    p.add_argument('--extra-kafka-consumer-config',
-                   default=os.environ.get('EXTRA_KAFKA_CONSUMER_CONFIG', {}), type=json.loads)
+    p.add_argument('--topic-names', required=True)
+    p.add_argument('--schema-registry-url', required=True)
+    p.add_argument('--kafka-bootstrap-servers', required=True)
+    p.add_argument('--snapshot-logging-topic-name', required=True)
+    p.add_argument('--extra-kafka-consumer-config', type=json.loads, default={})
+    p.add_argument('--script-output-file', type=argparse.FileType('w'))
+    p.add_argument('--extra-kafka-cli-command-arg', nargs='*')
+
     kafka_oauth.add_kafka_oauth_arg(p)
     opts, _ = p.parse_known_args()
+    topic_names: List[str] = opts.topic_names.split(',')
+    display_table: List[List[str]] = []
+    completions_seen_since_start: Dict[str, bool] = {tn: False for tn in topic_names}
+    last_starts: Dict[str, Dict[str, Any]] = {tn: {} for tn in topic_names}
+    consumed_count: int = 0
+    relevant_count: int = 0
+    table_headers = [
+        "Topic",
+        "Time",
+        "Action",
+        "Source table",
+        "Starting Key",
+        "Ending key",
+        "Low watermarks",
+        "High watermarks",
+        "Acting hostname",
+        "Key schema ID",
+        "Value schema ID",
+    ]
 
     with kafka.KafkaClient(accumulator.NoopAccumulator(), opts.kafka_bootstrap_servers, opts.schema_registry_url,
                            opts.extra_kafka_consumer_config, {}, disable_writing=True) as kafka_client:
-        last_start: Optional[Dict[str, Any]] = None
-        consumed_count: int = 0
-        relevant_count: int = 0
-        headers = [
-            "Time",
-            "Action",
-            "Source table",
-            "Starting Key",
-            "Ending key",
-            "Low watermarks",
-            "High watermarks",
-            "Acting hostname",
-            "Key schema ID",
-            "Value schema ID",
-        ]
-        display_table: List[List[str]] = []
-        completion_seen_since_start: bool = False
         for msg in kafka_client.consume_all(opts.snapshot_logging_topic_name):
             # noinspection PyTypeChecker,PyArgumentList
             log = dict(msg.value())
             consumed_count += 1
-            if log['topic_name'] != opts.topic_name:
+            if log['topic_name'] not in topic_names:
                 continue
             relevant_count += 1
             display_table.append([
+                log['topic_name'],
                 log["event_time_utc"],
                 log["action"],
                 log["table_name"],
@@ -75,91 +75,95 @@ def main() -> None:
                 log["value_schema_id"],
             ])
             if log["action"] == constants.SNAPSHOT_LOG_ACTION_STARTED:
-                last_start = log
-                completion_seen_since_start = False
+                last_starts[log['topic_name']] = log
+                completions_seen_since_start[log['topic_name']] = False
             if log["action"] == constants.SNAPSHOT_LOG_ACTION_COMPLETED:
-                completion_seen_since_start = True
+                completions_seen_since_start[log['topic_name']] = True
 
-        all_topic_configs = kafka_client.get_topic_config(opts.topic_name)
-        topic_has_delete_cleanup_policy = 'delete' in all_topic_configs['cleanup.policy'].value
-        topic_level_retention_configs = {
-            k: v.value for k, v in all_topic_configs.items()
-            if k in RETENTION_CONFIG_NAMES
-            and v.source == confluent_kafka.admin.ConfigSource.DYNAMIC_TOPIC_CONFIG.value
-        }
-        watermarks = kafka_client.get_topic_watermarks([opts.topic_name])[opts.topic_name]
-
-    print(f'''
-Consumed {consumed_count} messages from snapshot logging topic {opts.snapshot_logging_topic_name}.
-{relevant_count} were related to requested topic {opts.topic_name}.
-    ''')
-
-    if relevant_count:
         print(f'''
-{tabulate(display_table, headers)}
-
-Current retention-related configs for the topic are: {topic_level_retention_configs}.
-        
-Current topic watermarks are: {watermarks}.
+Consumed {consumed_count} messages from snapshot logging topic {opts.snapshot_logging_topic_name}.
+{relevant_count} were related to requested topics {opts.topic_names}.
         ''')
 
-    if last_start:
-        topic_starts_with_last_snapshot = True
-        for part, (low_wm, _) in enumerate(watermarks):
-            if low_wm != last_start['partition_watermarks_high'][str(part)]:
-                topic_starts_with_last_snapshot = False
-        if topic_starts_with_last_snapshot:
-            print('''
-The first message in all topic-partitions appears to coincide with the beginning of the most recent snapshot.
-            ''')
+        if not relevant_count:
             exit(0)
 
-        config_alter, restore_by_add, restore_by_delete = '', '', ''
-        delete_parts = [{"topic": opts.topic_name, "partition": int(part), "offset": wm}
-                        for part, wm in last_start['partition_watermarks_high'].items()]
-        delete_spec = json.dumps({"partitions": delete_parts}, indent=4)
-        if not topic_has_delete_cleanup_policy:
-            config_alter = (f'kafka-configs --bootstrap-server {opts.kafka_bootstrap_servers} '
-                            f'--alter --entity-type topics --entity-name {opts.topic_name} --add-config '
-                            f'cleanup.policy=delete,retention.ms=-1,retention.bytes=-1')
-            to_add = []
-            to_delete = []
-            for ret_con in RETENTION_CONFIG_NAMES:
-                if ret_con in topic_level_retention_configs:
-                    to_add.append(f'{ret_con}=[{topic_level_retention_configs[ret_con]}]')
+        display_table = sorted(display_table, key=lambda x: (x[0], x[1]))
+        print(tabulate(display_table, table_headers))
+
+        watermarks = kafka_client.get_topic_watermarks(topic_names)
+
+        for topic_name in topic_names:
+            all_topic_configs = kafka_client.get_topic_config(topic_name)
+            topic_has_delete_cleanup_policy = 'delete' in all_topic_configs['cleanup.policy'].value
+            topic_level_retention_configs = {
+                k: v.value for k, v in all_topic_configs.items()
+                if k in RETENTION_CONFIG_NAMES
+                and v.source == confluent_kafka.admin.ConfigSource.DYNAMIC_TOPIC_CONFIG.value
+            }
+
+            print(f'''
+            
+----- Topic {topic_name} -----
+Current retention-related configs for the topic are: {topic_level_retention_configs}.      
+Current topic watermarks are: {watermarks[topic_name]}.''')
+
+            if not last_starts[topic_name]:
+                print('No logged snapshot event history was found for this topic.')
+            else:
+                topic_starts_with_last_snapshot = True
+                for part, (low_wm, _) in enumerate(watermarks[topic_name]):
+                    if low_wm != last_starts[topic_name]['partition_watermarks_high'][str(part)]:
+                        topic_starts_with_last_snapshot = False
+                if topic_starts_with_last_snapshot:
+                    print('The first message in all topic-partitions appears to coincide with the beginning of the most recent snapshot.')
                 else:
-                    to_delete.append(ret_con)
-            restore_by_add = ''
-            if to_add:
-                restore_by_add = (f"kafka-configs --bootstrap-server {opts.kafka_bootstrap_servers} --alter "
-                                  f"--entity-type topics --entity-name {opts.topic_name} "
-                                  f"--add-config {','.join(to_add)}")
-            restore_by_delete = ''
-            if to_delete:
-                restore_by_delete = (f"kafka-configs --bootstrap-server {opts.kafka_bootstrap_servers} --alter "
-                                     f"--entity-type topics --entity-name {opts.topic_name} "
-                                     f"--delete-config {','.join(to_delete)}")
-
-        if not completion_seen_since_start:
-            print('''
-
+                    if not completions_seen_since_start[topic_name]:
+                        print('''
 --------------------------------------------------------------------------------------------------------------------------------------------------            
 *** NOTE: A snapshot completion has not been logged since the most recent start! Take note in considering whether to run the commands below... ***
 --------------------------------------------------------------------------------------------------------------------------------------------------
+                        ''')
+                    delete_parts = [{"topic": topic_name, "partition": int(part), "offset": wm}
+                                    for part, wm in last_starts[topic_name]['partition_watermarks_high'].items()]
+                    delete_spec = json.dumps({"partitions": delete_parts}, indent=4)
+                    if not topic_has_delete_cleanup_policy:
+                        extra_args_str = f' --{" --".join(opts.extra_kafka_cli_command_arg)}' if opts.extra_kafka_cli_command_arg else ''
+                        config_alter = (f'kafka-configs{extra_args_str} --bootstrap-server {opts.kafka_bootstrap_servers} '
+                                        f'--alter --entity-type topics --entity-name {topic_name} --add-config '
+                                        f'cleanup.policy=delete,retention.ms=-1,retention.bytes=-1')
+                        to_add = []
+                        to_delete = []
+                        for ret_con in RETENTION_CONFIG_NAMES:
+                            if ret_con in topic_level_retention_configs:
+                                to_add.append(f'{ret_con}=[{topic_level_retention_configs[ret_con]}]')
+                            else:
+                                to_delete.append(ret_con)
+                        restore_by_add = ''
+                        if to_add:
+                            restore_by_add = (f"kafka-configs{extra_args_str} --bootstrap-server {opts.kafka_bootstrap_servers} --alter "
+                                              f"--entity-type topics --entity-name {topic_name} "
+                                              f"--add-config {','.join(to_add)}")
+                        restore_by_delete = ''
+                        if to_delete:
+                            restore_by_delete = (f"kafka-configs{extra_args_str} --bootstrap-server {opts.kafka_bootstrap_servers} --alter "
+                                                 f"--entity-type topics --entity-name {topic_name} "
+                                                 f"--delete-config {','.join(to_delete)}")
 
-            ''')
-
-        print(f'''        
-The following sequence of Kafka CLI tool commands would allow you to delete all messages in the topic prior to the beginning of the most recent snapshot:
-
+                        commands = f'''
 {config_alter}
-cat << "EOF" > delete-records-{opts.topic_name}.json
+cat << "EOF" > delete-records-{topic_name}.json
 {delete_spec}
 EOF
-kafka-delete-records --bootstrap-server {opts.kafka_bootstrap_servers} --offset-json-file delete-records-{opts.topic_name}.json
+kafka-delete-records{extra_args_str} --bootstrap-server {opts.kafka_bootstrap_servers} --offset-json-file delete-records-{topic_name}.json
 {restore_by_add}
 {restore_by_delete}
-        ''')
+                        '''
+                        print(f'''The following sequence of Kafka CLI tool commands would allow you to delete all messages in the topic prior to the beginning of the most recent snapshot:
+                        
+{commands}''')
+                        if opts.script_output_file:
+                            opts.script_output_file.write(commands)
 
 
 if __name__ == "__main__":
