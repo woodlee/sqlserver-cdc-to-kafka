@@ -108,10 +108,8 @@ class KafkaClient(object):
         self._disable_writing = disable_writing
         self._creation_warned_topic_names: Set[str] = set()
 
-        if self._use_oauth:
-            # trigger initial oauth_cb calls
+        if self._use_oauth:  # trigger initial oauth_cb calls
             self._producer.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)
-            self._admin.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)
 
         if self._use_transactions:
             self._producer.init_transactions(constants.KAFKA_REQUEST_TIMEOUT_SECS)
@@ -242,12 +240,12 @@ class KafkaClient(object):
             return
 
         watermarks = self.get_topic_watermarks([topic_name])[topic_name]  # will be list of (low, hi) mark tuples
-        message_count = sum(x[1] for x in watermarks)
-        if not message_count:
+        last_offset = sum(x[1] for x in watermarks)
+        if not last_offset:
             logger.warning(
                 'consume_all: Requested topic %s contains no messages at present. Returning nothing.', topic_name)
             return
-        logger.debug('Progress topic %s contains %s messages', topic_name, message_count)
+        logger.debug('Progress topic %s ends at offset %s', topic_name, last_offset)
 
         consumer: confluent_kafka.Consumer = confluent_kafka.Consumer(self.consumer_config)
         if self._use_oauth:
@@ -374,8 +372,6 @@ class KafkaClient(object):
         logger.info('Creating Kafka topic "%s" with %s partitions, replication factor %s, and config: %s', topic_name,
                     partition_count, replication_factor, json.dumps(topic_config))
         topic = confluent_kafka.admin.NewTopic(topic_name, partition_count, replication_factor, config=topic_config)
-        if self._use_oauth:
-            self._admin.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)  # In case oauth token refresh is needed
         self._admin.create_topics([topic])[topic_name].result()
         time.sleep(constants.KAFKA_CONFIG_RELOAD_DELAY_SECS)
         self._refresh_cluster_metadata()
@@ -412,8 +408,6 @@ class KafkaClient(object):
     def get_topic_config(self, topic_name: str) -> Any:
         resource = confluent_kafka.admin.ConfigResource(
             restype=confluent_kafka.admin.ConfigResource.Type.TOPIC, name=topic_name)
-        if self._use_oauth:
-            self._admin.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)  # In case oauth token refresh is needed
         result = self._admin.describe_configs([resource])
         return result[resource].result()
 
