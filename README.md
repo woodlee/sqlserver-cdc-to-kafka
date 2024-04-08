@@ -20,7 +20,8 @@ You will need to have [installed the Microsoft ODBC Driver for SQL Server](https
 python -m cdc_kafka \
   --db-conn-string 'DRIVER=ODBC Driver 18 for SQL Server; SERVER=localhost; TrustServerCertificate=yes; DATABASE=MyTestDb; UID=sa; PWD=TestLocalPassword123' \
   --kafka-bootstrap-servers localhost:9092 \
-  --schema-registry-url http://localhost:8081
+  --schema-registry-url http://localhost:8081 \
+  --kafka-transactional-id local-c2k-test
 ```
 
 ### Via Docker

@@ -33,8 +33,8 @@ def run() -> None:
 
     if not (opts.schema_registry_url and opts.kafka_bootstrap_servers and opts.db_conn_string
             and opts.kafka_transactional_id):
-        raise Exception('Arguments schema_registry_url, kafka_bootstrap_servers, db_conn_string, and transactional_id '
-                        'are all required.')
+        raise Exception('Arguments schema_registry_url, kafka_bootstrap_servers, db_conn_string, and '
+                        'kafka_transactional_id are all required.')
 
     redo_snapshot_for_new_instance: bool = \
         opts.new_capture_instance_snapshot_handling == options.NEW_CAPTURE_INSTANCE_SNAPSHOT_HANDLING_BEGIN_NEW
@@ -42,11 +42,11 @@ def run() -> None:
         opts.new_capture_instance_overlap_handling == options.NEW_CAPTURE_INSTANCE_OVERLAP_HANDLING_REPUBLISH
 
     try:
-        with sql_query_subprocess.get_db_conn(
+        with (sql_query_subprocess.get_db_conn(
             opts.db_conn_string
         ) as db_conn, sql_query_subprocess.SQLQueryProcessor(
             opts.db_conn_string
-        ) as sql_query_processor:
+        ) as sql_query_processor):
             clock_syncer: clock_sync.ClockSync = clock_sync.ClockSync(db_conn)
 
             metrics_accumulator: accumulator.Accumulator = accumulator.Accumulator(
@@ -150,48 +150,54 @@ def run() -> None:
                     nonlocal last_slow_table_heartbeat_time
                     nonlocal last_capture_instance_check_time
 
-                    kafka_client.begin_transaction()
+                    do_metrics: bool = (helpers.naive_utcnow() - last_metrics_emission_time) > \
+                        constants.METRICS_REPORTING_INTERVAL
+                    do_heartbeats: bool = (helpers.naive_utcnow() - last_slow_table_heartbeat_time) > \
+                        constants.SLOW_TABLE_PROGRESS_HEARTBEAT_INTERVAL
+                    do_termination_check: bool = opts.terminate_on_capture_instance_change and \
+                        (helpers.naive_utcnow() - last_capture_instance_check_time) > \
+                        constants.CHANGED_CAPTURE_INSTANCES_CHECK_INTERVAL
 
-                    if (helpers.naive_utcnow() - last_metrics_emission_time) > constants.METRICS_REPORTING_INTERVAL:
-                        start_time = time.perf_counter()
-                        metrics = metrics_accumulator.end_and_get_values()
-                        for reporter in reporters:
-                            try:
-                                reporter.emit(metrics)
-                            except Exception as e:
-                                logger.exception('Caught exception while reporting metrics', exc_info=e)
-                        elapsed = (time.perf_counter() - start_time)
-                        logger.debug('Metrics reporting completed in %s ms', elapsed * 1000)
-                        metrics_accumulator.reset_and_start()
-                        last_metrics_emission_time = helpers.naive_utcnow()
+                    if do_metrics or do_heartbeats or do_termination_check:
+                        kafka_client.begin_transaction()
 
-                    if (helpers.naive_utcnow() - last_slow_table_heartbeat_time) > \
-                            constants.SLOW_TABLE_PROGRESS_HEARTBEAT_INTERVAL:
-                        for t in tables:
-                            if not queued_change_row_counts[t.topic_name]:
-                                last_topic_produce = last_topic_produces.get(t.topic_name)
-                                if not last_topic_produce or (helpers.naive_utcnow() - last_topic_produce) > \
-                                        2 * constants.SLOW_TABLE_PROGRESS_HEARTBEAT_INTERVAL:
-                                    logger.debug('Emitting heartbeat progress for slow table %s', t.fq_name)
-                                    progress_tracker.record_changes_progress(t.topic_name, t.max_polled_change_index)
-                        last_slow_table_heartbeat_time = helpers.naive_utcnow()
+                        if do_metrics:
+                            start_time = time.perf_counter()
+                            metrics = metrics_accumulator.end_and_get_values()
+                            for reporter in reporters:
+                                try:
+                                    reporter.emit(metrics)
+                                except Exception as e:
+                                    logger.exception('Caught exception while reporting metrics', exc_info=e)
+                            elapsed = (time.perf_counter() - start_time)
+                            logger.debug('Metrics reporting completed in %s ms', elapsed * 1000)
+                            metrics_accumulator.reset_and_start()
+                            last_metrics_emission_time = helpers.naive_utcnow()
 
-                    if opts.terminate_on_capture_instance_change and \
-                            (helpers.naive_utcnow() - last_capture_instance_check_time) > \
-                            constants.CHANGED_CAPTURE_INSTANCES_CHECK_INTERVAL:
-                        topic_to_max_polled_index_map:  Dict[str, change_index.ChangeIndex] = {
-                            t.topic_name: t.max_polled_change_index for t in tables
-                        }
-                        if should_terminate_due_to_capture_instance_change(
-                                db_conn, progress_tracker, opts.capture_instance_version_strategy,
-                                opts.capture_instance_version_regex, capture_instance_to_topic_map,
-                                capture_instances_by_fq_name, opts.table_include_regex,
-                                opts.table_exclude_regex, topic_to_max_polled_index_map):
-                            kafka_client.commit_transaction()
-                            return True
-                        last_capture_instance_check_time = helpers.naive_utcnow()
+                        if do_heartbeats:
+                            for t in tables:
+                                if not queued_change_row_counts[t.topic_name]:
+                                    last_topic_produce = last_topic_produces.get(t.topic_name)
+                                    if not last_topic_produce or (helpers.naive_utcnow() - last_topic_produce) > \
+                                            2 * constants.SLOW_TABLE_PROGRESS_HEARTBEAT_INTERVAL:
+                                        logger.debug('Emitting heartbeat progress for slow table %s', t.fq_name)
+                                        progress_tracker.record_changes_progress(t.topic_name, t.max_polled_change_index)
+                            last_slow_table_heartbeat_time = helpers.naive_utcnow()
 
-                    kafka_client.commit_transaction()
+                        if do_termination_check:
+                            topic_to_max_polled_index_map:  Dict[str, change_index.ChangeIndex] = {
+                                t.topic_name: t.max_polled_change_index for t in tables
+                            }
+                            if should_terminate_due_to_capture_instance_change(
+                                    db_conn, progress_tracker, opts.capture_instance_version_strategy,
+                                    opts.capture_instance_version_regex, capture_instance_to_topic_map,
+                                    capture_instances_by_fq_name, opts.table_include_regex,
+                                    opts.table_exclude_regex, topic_to_max_polled_index_map):
+                                kafka_client.commit_transaction()
+                                return True
+                            last_capture_instance_check_time = helpers.naive_utcnow()
+
+                        kafka_client.commit_transaction()
                     return False
 
                 logger.info('Beginning processing for %s tracked table(s).', len(tables))
@@ -200,10 +206,12 @@ def run() -> None:
                 # The above is all setup, now we come to the "hot loop":
 
                 row: 'parsed_row.ParsedRow'
+                lsn_limit: bytes = change_index.LOWEST_CHANGE_INDEX.lsn
 
                 while True:
                     snapshots_remain: bool = not all([t.snapshot_complete for t in tables])
-                    change_tables_lagging: bool = any([t.change_reads_are_lagging for t in tables])
+                    lagging_change_tables: List[tracked_tables.TrackedTable] = [
+                        t for t in tables if t.change_reads_are_lagging]
                     # ----- Poll for and produce snapshot data while change row queries run -----
 
                     if snapshots_remain:
@@ -229,7 +237,7 @@ def run() -> None:
                                             t.key_schema_id, t.value_schema_id, helpers.naive_utcnow(), row.key_dict
                                         ))
                                         snapshots_remain = not all([t.snapshot_complete for t in tables])
-                                    elif not change_tables_lagging:
+                                    elif not lagging_change_tables:
                                         t.enqueue_snapshot_query()   # NB: results may not be retrieved until next cycle
 
                                 if helpers.naive_utcnow() > next_cdc_poll_due_time:
@@ -249,7 +257,7 @@ def run() -> None:
                                     completion()
                                 kafka_client.commit_transaction()
 
-                            if change_tables_lagging:
+                            if lagging_change_tables:
                                 break
 
                         if poll_periodic_tasks():
@@ -257,7 +265,7 @@ def run() -> None:
 
                     # ----- Wait for next poll window (if needed) and get ceiling LSN for cycle -----
 
-                    if not change_tables_lagging:
+                    if not lagging_change_tables:
                         wait_time = (next_cdc_poll_allowed_time - helpers.naive_utcnow()).total_seconds()
                         if wait_time > 0:
                             time.sleep(wait_time)
@@ -266,17 +274,22 @@ def run() -> None:
                     if poll_periodic_tasks():
                         break
 
-                    with db_conn.cursor() as cursor:
-                        q, _ = sql_queries.get_max_lsn()
-                        cursor.execute(q)
-                        lsn_limit = cursor.fetchval()
+                    if lagging_change_tables and lsn_limit > change_index.LOWEST_CHANGE_INDEX.lsn:
+                        tables_to_poll = lagging_change_tables
+                        # Leave existing LSN limit in place to get through the glut in lagged tables first
+                    else:
+                        tables_to_poll = tables
+                        with db_conn.cursor() as cursor:
+                            q, _ = sql_queries.get_max_lsn()
+                            cursor.execute(q)
+                            lsn_limit = cursor.fetchval()
 
                     next_cdc_poll_allowed_time = (helpers.naive_utcnow() + constants.MIN_CDC_POLLING_INTERVAL)
                     next_cdc_poll_due_time = (helpers.naive_utcnow() + constants.MAX_CDC_POLLING_INTERVAL)
 
                     # ----- Query for change rows ----
 
-                    for t in tables:
+                    for t in tables_to_poll:
                         if queued_change_row_counts[t.topic_name] < opts.db_row_batch_size + 1:
                             t.enqueue_changes_query(lsn_limit)
 
@@ -285,7 +298,7 @@ def run() -> None:
                     if poll_periodic_tasks():
                         break
 
-                    for t in tables:
+                    for t in tables_to_poll:
                         for row in t.retrieve_changes_query_results():
                             queued_change_row_counts[t.topic_name] += 1
                             heapq.heappush(change_rows_queue, (row.change_idx, row))
@@ -294,6 +307,9 @@ def run() -> None:
 
                     if poll_periodic_tasks():
                         break
+
+                    if not change_rows_queue:
+                        continue
 
                     # ----- Produce change data to Kafka and commit progress -----
 
@@ -326,7 +342,6 @@ def run() -> None:
                                                  constants.DELETION_CHANGE_TOMBSTONE_MESSAGE)
 
                         progress_by_topic[row.destination_topic] = row.change_idx
-
                     for topic_name, progress_index in progress_by_topic.items():
                         progress_tracker.record_changes_progress(topic_name, progress_index)
                     kafka_client.commit_transaction()
