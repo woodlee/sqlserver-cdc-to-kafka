@@ -293,12 +293,14 @@ class TrackedTable(object):
         if self.snapshot_allowed and not self.snapshot_complete:
             if self._last_read_key_for_snapshot is None:
                 snap_query = sql_query_subprocess.SQLQueryRequest(self._snapshot_query_queue_name, None,
-                                                                  self._initial_snapshot_rows_query, [], [])
+                                                                  self._initial_snapshot_rows_query, [], [],
+                                                                  self._parse_db_row)
             else:
                 snap_query = sql_query_subprocess.SQLQueryRequest(self._snapshot_query_queue_name, None,
                                                                   self._snapshot_rows_query,
                                                                   self._snapshot_rows_query_param_types,
-                                                                  self._last_read_key_for_snapshot)
+                                                                  self._last_read_key_for_snapshot,
+                                                                  self._parse_db_row)
             self._sql_query_processor.enqueue_query(snap_query)
             self._snapshot_query_pending = True
 
@@ -309,7 +311,7 @@ class TrackedTable(object):
         params = (self.max_polled_change_index.lsn, self.max_polled_change_index.seqval, lsn_limit)
         changes_query = sql_query_subprocess.SQLQueryRequest(
             self._changes_query_queue_name, lsn_limit, self._change_rows_query,
-            self._change_rows_query_param_types, params)
+            self._change_rows_query_param_types, params, self._parse_db_row)
         self._sql_query_processor.enqueue_query(changes_query)
         self._changes_query_pending = True
 
@@ -321,7 +323,7 @@ class TrackedTable(object):
                 row_ctr = 0
                 last_row_read = None
                 for row in res.result_rows:
-                    last_row_read = self._parse_db_row(row)
+                    last_row_read = row
                     yield last_row_read
                     row_ctr += 1
                 self._metrics_accumulator.register_db_query(
@@ -351,7 +353,7 @@ class TrackedTable(object):
                 row_ctr = 0
                 last_row_read = None
                 for row in res.result_rows:
-                    last_row_read = self._parse_db_row(row)
+                    last_row_read = row
                     yield last_row_read
                     row_ctr += 1
                 self._metrics_accumulator.register_db_query(

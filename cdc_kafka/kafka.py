@@ -111,7 +111,7 @@ class KafkaClient(object):
         if self._use_oauth:  # trigger initial oauth_cb calls
             self._producer.poll(constants.KAFKA_OAUTH_CB_POLL_TIMEOUT)
 
-        if self._use_transactions:
+        if self._use_transactions and not self._disable_writing:
             self._producer.init_transactions(constants.KAFKA_REQUEST_TIMEOUT_SECS)
 
         self._cluster_metadata: confluent_kafka.admin.ClusterMetadata = self._get_cluster_metadata()
@@ -130,7 +130,8 @@ class KafkaClient(object):
     def __exit__(self, exc_type: Optional[Type[BaseException]], exc: Optional[BaseException],
                  traceback: Optional[TracebackType]) -> None:
         logger.info("Cleaning up Kafka resources...")
-        self._producer.flush(constants.KAFKA_FULL_FLUSH_TIMEOUT_SECS)
+        if not self._disable_writing:
+            self._producer.flush(constants.KAFKA_FULL_FLUSH_TIMEOUT_SECS)
         del self._admin
         del self._producer
         time.sleep(1)  # gives librdkafka threads more of a chance to exit properly before admin/producer are GC'd
@@ -153,6 +154,8 @@ class KafkaClient(object):
     def begin_transaction(self) -> None:
         if not self._use_transactions:
             raise Exception('This instance of KafkaClient was not configured to use transactions.')
+        if self._disable_writing:
+            return
         if logger.isEnabledFor(logging.DEBUG):
             current_frame = inspect.currentframe()
             if current_frame and current_frame.f_back:
@@ -163,6 +166,8 @@ class KafkaClient(object):
     def commit_transaction(self) -> None:
         if not self._use_transactions:
             raise Exception('This instance of KafkaClient was not configured to use transactions.')
+        if self._disable_writing:
+            return
         if logger.isEnabledFor(logging.DEBUG):
             current_frame = inspect.currentframe()
             if current_frame and current_frame.f_back:

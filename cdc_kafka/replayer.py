@@ -24,7 +24,7 @@ since it doesn't exist in the CDC feed/schema:
   --target-db-password '*****' \
   --target-db-database 'MyDatabase' \
   --target-db-table-schema 'dbo' \
-  --target-db-table-name 'Orders_copy'
+  --target-db-table-name 'Orders_copy' \
   --cols-to-not-sync 'OrderGuid'
 
 Python package requirements:
@@ -373,8 +373,9 @@ TRUNCATE TABLE {delete_temp_table_name};
 
                 cursor.execute('SELECT TOP 1 1 FROM sys.columns WHERE object_id = OBJECT_ID(:0) AND is_identity = 1',
                                (fq_target_table_name,))
+                has_identity_col: bool = bool(len(cursor.fetchall()))
                 set_identity_insert_if_needed = f'SET IDENTITY_INSERT {fq_target_table_name} ON; ' \
-                    if len(cursor.fetchall()) else ''
+                    if has_identity_col else ''
 
                 merge_match_predicates: str = ' AND '.join([f'tgt.[{c}] = src.[{c}]' for c in primary_key_field_names])
 
@@ -395,7 +396,7 @@ TRUNCATE TABLE {merge_temp_table_name};
                     '''
                 else:
                     merge_stmt = f'''
-    {set_identity_insert_if_needed}
+{set_identity_insert_if_needed}
 MERGE {fq_target_table_name} AS tgt
 USING {merge_temp_table_name} AS src 
     ON ({merge_match_predicates})
@@ -439,7 +440,9 @@ TRUNCATE TABLE {merge_temp_table_name};
                             inserts: List[Any] = []
                             merges: List[Any] = []
                             for _, (op, val) in queued_upserts.items():
-                                if op in ('Snapshot', 'Insert'):
+                                # CTDS unfortunately completely ignores values for target-table IDENTITY cols when doing
+                                # a bulk_insert, so in that case we have to fall back to the slower MERGE mechanism:
+                                if (not has_identity_col) and op in ('Snapshot', 'Insert'):
                                     inserts.append(val)
                                 else:
                                     merges.append(val)
