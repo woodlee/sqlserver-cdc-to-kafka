@@ -176,7 +176,8 @@ class KafkaClient(object):
         self._producer.commit_transaction()
 
     def produce(self, topic: str, key: Optional[Dict[str, Any]], key_schema_id: int, value: Optional[Dict[str, Any]],
-                value_schema_id: int, message_type: str, copy_to_unified_topics: Optional[List[str]] = None) -> None:
+                value_schema_id: int, message_type: str, copy_to_unified_topics: Optional[List[str]] = None,
+                extra_headers: Optional[Dict[str, str | bytes]] = None) -> None:
         if self._disable_writing:
             return
 
@@ -199,7 +200,7 @@ class KafkaClient(object):
                 self._producer.produce(
                     topic=topic, value=value_ser, key=key_ser,
                     on_delivery=lambda err, msg: self._delivery_callback(message_type, err, msg, key, value),
-                    headers={'cdc_to_kafka_message_type': message_type}
+                    headers={'cdc_to_kafka_message_type': message_type, **(extra_headers or {})}
                 )
                 break
             except BufferError:
@@ -223,7 +224,7 @@ class KafkaClient(object):
                             on_delivery=lambda err, msg: self._delivery_callback(
                                 constants.UNIFIED_TOPIC_CHANGE_MESSAGE, err, msg, key, value),
                             headers={'cdc_to_kafka_message_type': constants.UNIFIED_TOPIC_CHANGE_MESSAGE,
-                                     'cdc_to_kafka_original_topic': topic}
+                                     'cdc_to_kafka_original_topic': topic, **(extra_headers or {})}
                         )
                         break
                     except BufferError:

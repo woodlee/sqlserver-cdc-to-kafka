@@ -226,7 +226,8 @@ def run() -> None:
                                         kafka_client.produce(row.destination_topic, row.key_dict,
                                                              row.avro_key_schema_id, row.value_dict,
                                                              row.avro_value_schema_id,
-                                                             constants.SINGLE_TABLE_SNAPSHOT_MESSAGE)
+                                                             constants.SINGLE_TABLE_SNAPSHOT_MESSAGE,
+                                                             extra_headers=row.extra_headers)
                                         snapshot_progress_by_topic[row.destination_topic] = row.key_dict
                                     if t.snapshot_complete:
                                         progress_tracker.record_snapshot_progress(
@@ -332,7 +333,8 @@ def run() -> None:
                         kafka_client.produce(row.destination_topic, row.key_dict, row.avro_key_schema_id,
                                              row.value_dict, row.avro_value_schema_id,
                                              constants.SINGLE_TABLE_CHANGE_MESSAGE,
-                                             table_to_unified_topics_map.get(row.table_fq_name, []))
+                                             table_to_unified_topics_map.get(row.table_fq_name, []),
+                                             extra_headers=row.extra_headers)
                         last_topic_produces[row.destination_topic] = helpers.naive_utcnow()
 
                         if not opts.disable_deletion_tombstones and row.operation_name == \
