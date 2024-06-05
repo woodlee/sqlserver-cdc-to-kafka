@@ -1,16 +1,12 @@
 import hashlib
-import itertools
 import logging
 import uuid
-from typing import Tuple, Dict, List, Any, Callable, Optional, Generator, TYPE_CHECKING, Mapping, Sequence
+from typing import Tuple, List, Any, Optional, Generator, TYPE_CHECKING, Mapping, Sequence, Dict
 
-from avro.schema import Schema
-import bitarray
 import pyodbc
 
-from .avro import avro_transform_fn_from_sql_type
 from . import constants, change_index, options, sql_queries, sql_query_subprocess, parsed_row, \
-    helpers, avro, progress_tracking
+    helpers, progress_tracking
 
 if TYPE_CHECKING:
     from .metric_reporting import accumulator
@@ -20,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 class TrackedField(object):
     __slots__ = 'name', 'sql_type_name', 'change_table_ordinal', 'primary_key_ordinal', 'decimal_precision', \
-        'decimal_scale', 'transform_fn', 'truncate_after'
+        'decimal_scale', 'truncate_after'
 
     def __init__(self, name: str, sql_type_name: str, change_table_ordinal: int, primary_key_ordinal: int,
                  decimal_precision: int, decimal_scale: int, truncate_after: int = 0) -> None:
@@ -30,24 +26,22 @@ class TrackedField(object):
         self.primary_key_ordinal: int = primary_key_ordinal
         self.decimal_precision: int = decimal_precision
         self.decimal_scale: int = decimal_scale
-        self.transform_fn: Optional[Callable[[Any], Any]] = avro_transform_fn_from_sql_type(sql_type_name)
 
-        if truncate_after and self.sql_type_name not in constants.SQL_STRING_TYPES:
-            raise Exception(f'A truncation length was specified for field {name} but it does not appear to be a '
-                            f'string field (SQL type is {sql_type_name}).')
+        if truncate_after:
+            if self.sql_type_name not in constants.SQL_STRING_TYPES:
+                raise Exception(f'A truncation length was specified for field {name} but it does not appear to be a '
+                                f'string field (SQL type is {sql_type_name}).')
         self.truncate_after: int = truncate_after
 
 
 class TrackedTable(object):
     def __init__(self, db_conn: pyodbc.Connection, metrics_accumulator: 'accumulator.Accumulator',
-                 sql_query_processor: sql_query_subprocess.SQLQueryProcessor,
-                 schema_generator: avro.AvroSchemaGenerator, schema_name: str, table_name: str,
+                 sql_query_processor: sql_query_subprocess.SQLQueryProcessor, schema_name: str, table_name: str,
                  capture_instance_name: str, topic_name: str, min_lsn: bytes, snapshot_allowed: bool,
                  db_row_batch_size: int, progress_tracker: 'progress_tracking.ProgressTracker') -> None:
         self._db_conn: pyodbc.Connection = db_conn
         self._metrics_accumulator: 'accumulator.Accumulator' = metrics_accumulator
         self._sql_query_processor: sql_query_subprocess.SQLQueryProcessor = sql_query_processor
-        self._schema_generator: avro.AvroSchemaGenerator = schema_generator
         self.schema_name: str = schema_name
         self.table_name: str = table_name
         self.capture_instance_name: str = capture_instance_name
@@ -56,23 +50,20 @@ class TrackedTable(object):
         self.fq_name: str = f'{schema_name}.{table_name}'
         self.db_row_batch_size: int = db_row_batch_size
         self.progress_tracker: progress_tracking.ProgressTracker = progress_tracker
+        self.truncate_indexes: Dict[int, int] = {}
 
         # Most of the below properties are not set until sometime after `finalize_table` is called:
 
-        self.key_schema_id: int = -1
-        self.value_schema_id: int = -1
-        self.key_schema: Optional[Schema] = None
-        self.value_schema: Optional[Schema] = None
         self.key_fields: Tuple[TrackedField, ...] = tuple()
         self.value_fields: Tuple[TrackedField, ...] = tuple()
+        self.key_field_names: Tuple[str, ...] = tuple()
+        self.value_field_names: List[str] = []
+        self.key_field_source_table_ordinals: Tuple[int, ...] = tuple()
         self.max_polled_change_index: change_index.ChangeIndex = change_index.LOWEST_CHANGE_INDEX
         self.change_reads_are_lagging: bool = False
         self.snapshot_complete: bool = False
         self.min_lsn: bytes = min_lsn
 
-        self._key_field_names: Tuple[str, ...] = tuple()
-        self._key_field_source_table_ordinals: Tuple[int, ...] = tuple()
-        self._value_field_names: List[str] = []
         self._last_read_key_for_snapshot: Optional[Sequence[Any]] = None
         self._odbc_columns: Tuple[pyodbc.Row, ...] = tuple()
         self._change_rows_query: str = ''
@@ -94,16 +85,19 @@ class TrackedTable(object):
     def last_read_key_for_snapshot_display(self) -> Optional[str]:
         if not self._last_read_key_for_snapshot:
             return None
-        return ', '.join([f'{k}: {v}' for k, v in zip(self._key_field_names, self._last_read_key_for_snapshot)])
+        return ', '.join([f'{k}: {v}' for k, v in zip(self.key_field_names, self._last_read_key_for_snapshot)])
 
     def append_field(self, field: TrackedField) -> None:
+        field_ix: int = len(self._fields_added_pending_finalization)
         self._fields_added_pending_finalization.append(field)
+        if field.truncate_after:
+            self.truncate_indexes[field_ix] = field.truncate_after
 
     def get_source_table_count(self, low_key: Tuple[Any, ...], high_key: Tuple[Any, ...]) -> int:
         with self._db_conn.cursor() as cursor:
-            q, p = sql_queries.get_table_count(self.schema_name, self.table_name, self._key_field_names,
+            q, p = sql_queries.get_table_count(self.schema_name, self.table_name, self.key_field_names,
                                                self._odbc_columns)
-            cursor.setinputsizes(p)
+            cursor.setinputsizes(p)  # type: ignore[arg-type]
             cursor.execute(q, low_key + high_key)
             res: int = cursor.fetchval()
             return res
@@ -113,7 +107,7 @@ class TrackedTable(object):
             deletes, inserts, updates = 0, 0, 0
             q, p = sql_queries.get_change_table_count_by_operation(
                 helpers.quote_name(helpers.get_fq_change_table_name(self.capture_instance_name)))
-            cursor.setinputsizes(p)
+            cursor.setinputsizes(p)  # type: ignore[arg-type]
             cursor.execute(q, (highest_change_index.lsn, highest_change_index.seqval, highest_change_index.operation))
             for row in cursor.fetchall():
                 if row[1] == 1:
@@ -132,7 +126,6 @@ class TrackedTable(object):
         self, start_after_change_table_index: change_index.ChangeIndex,
         prior_change_table_max_index: Optional[change_index.ChangeIndex],
         start_from_key_for_snapshot: Optional[Mapping[str, Any]], lsn_gap_handling: str,
-        schema_id_getter: Optional[Callable[[str, Schema, Schema], Tuple[int, int]]] = None,
         allow_progress_writes: bool = False
     ) -> None:
         if self._finalized:
@@ -169,7 +162,7 @@ class TrackedTable(object):
 
         self.max_polled_change_index = start_after_change_table_index
         self.value_fields = tuple(sorted(self._fields_added_pending_finalization, key=lambda f: f.change_table_ordinal))
-        self._value_field_names = [f.name for f in self.value_fields]
+        self.value_field_names = [f.name for f in self.value_fields]
         self._fields_added_pending_finalization = []
 
         key_fields = [f for f in self.value_fields if f.primary_key_ordinal is not None]
@@ -181,22 +174,13 @@ class TrackedTable(object):
             self._has_pk = True
 
         self.key_fields = tuple(sorted(key_fields, key=lambda f: f.primary_key_ordinal))
-        self._key_field_names = tuple([kf.name for kf in self.key_fields])
-        self._key_field_source_table_ordinals = tuple([kf.change_table_ordinal for kf in self.key_fields])
-        self.key_schema = self._schema_generator.generate_key_schema(self.schema_name, self.table_name,
-                                                                     self.key_fields)
-        self.value_schema = self._schema_generator.generate_value_schema(self.schema_name, self.table_name,
-                                                                         self.value_fields)
-
-        if schema_id_getter:
-            self.key_schema_id, self.value_schema_id = schema_id_getter(self.topic_name, self.key_schema,
-                                                                        self.value_schema)
-
+        self.key_field_names = tuple([kf.name for kf in self.key_fields])
+        self.key_field_source_table_ordinals = tuple([kf.change_table_ordinal for kf in self.key_fields])
         capture_instance_name = helpers.get_fq_change_table_name(self.capture_instance_name)
 
         with self._db_conn.cursor() as cursor:
             q, p = sql_queries.get_change_table_index_cols()
-            cursor.setinputsizes(p)
+            cursor.setinputsizes(p)  # type: ignore[arg-type]
             cursor.execute(q, capture_instance_name)
             change_table_clustered_idx_cols = [r[0] for r in cursor.fetchall()]
 
@@ -212,14 +196,14 @@ class TrackedTable(object):
                             f'were: {change_table_clustered_idx_cols}')
 
         self._change_rows_query, self._change_rows_query_param_types = sql_queries.get_change_rows(
-            self.db_row_batch_size, helpers.quote_name(capture_instance_name), self._value_field_names,
+            self.db_row_batch_size, helpers.quote_name(capture_instance_name), self.value_field_names,
             change_table_clustered_idx_cols)
 
         if not self.snapshot_allowed:
             self.snapshot_complete = True
         else:
             columns_actually_on_base_table = {x[3] for x in self._odbc_columns}
-            columns_no_longer_on_base_table = set(self._value_field_names) - columns_actually_on_base_table
+            columns_no_longer_on_base_table = set(self.value_field_names) - columns_actually_on_base_table
 
             if columns_no_longer_on_base_table:
                 logger.warning('Some column(s) found in the capture instance appear to no longer be present on base '
@@ -228,14 +212,14 @@ class TrackedTable(object):
                                ', '.join(columns_no_longer_on_base_table))
             if self._has_pk:
                 self._snapshot_rows_query, self._snapshot_rows_query_param_types = sql_queries.get_snapshot_rows(
-                    self.db_row_batch_size, self.schema_name, self.table_name, self._value_field_names,
-                    columns_no_longer_on_base_table, self._key_field_names, False, self._odbc_columns)
+                    self.db_row_batch_size, self.schema_name, self.table_name, self.value_field_names,
+                    columns_no_longer_on_base_table, self.key_field_names, False, self._odbc_columns)
 
                 if start_from_key_for_snapshot == constants.SNAPSHOT_COMPLETION_SENTINEL:
                     self.snapshot_complete = True
                 elif start_from_key_for_snapshot:
                     key_min_tuple = tuple(self._get_min_key_value() or [])
-                    start_key_tuple = tuple([start_from_key_for_snapshot[kfn] for kfn in self._key_field_names])
+                    start_key_tuple = tuple([start_from_key_for_snapshot[kfn] for kfn in self.key_field_names])
 
                     if key_min_tuple and key_min_tuple == start_key_tuple:
                         self.snapshot_complete = True
@@ -244,27 +228,23 @@ class TrackedTable(object):
                                                                            constants.SNAPSHOT_COMPLETION_SENTINEL)
                     else:
                         if allow_progress_writes:
-                            start_key_dict = dict(zip(self._key_field_names, start_key_tuple))
-                            self.progress_tracker.log_snapshot_resumed(self.topic_name, self.fq_name,
-                                                                       self.key_schema_id, self.value_schema_id,
-                                                                       start_key_dict)
+                            start_key_dict = dict(zip(self.key_field_names, start_key_tuple))
+                            self.progress_tracker.log_snapshot_resumed(self.topic_name, self.fq_name, start_key_dict)
 
                         self._last_read_key_for_snapshot = start_key_tuple
                 else:
                     key_max = self._get_max_key_value()
                     if key_max:
-                        key_max_map = dict(zip(self._key_field_names, key_max))
+                        key_max_map = dict(zip(self.key_field_names, key_max))
                         logger.info('Table %s is starting a full snapshot, working back from max key %s',
                                     self.fq_name, key_max_map)
 
                         self._initial_snapshot_rows_query, _ = sql_queries.get_snapshot_rows(
-                            self.db_row_batch_size, self.schema_name, self.table_name, self._value_field_names,
-                            columns_no_longer_on_base_table, self._key_field_names, True, self._odbc_columns)
+                            self.db_row_batch_size, self.schema_name, self.table_name, self.value_field_names,
+                            columns_no_longer_on_base_table, self.key_field_names, True, self._odbc_columns)
 
                         if allow_progress_writes:
-                            self.progress_tracker.log_snapshot_started(self.topic_name, self.fq_name,
-                                                                       self.key_schema_id, self.value_schema_id,
-                                                                       key_max_map)
+                            self.progress_tracker.log_snapshot_started(self.topic_name, self.fq_name, key_max_map)
 
                         self._last_read_key_for_snapshot = None
                     else:
@@ -331,7 +311,7 @@ class TrackedTable(object):
                     last_read: str = '<none>'
                     if self._last_read_key_for_snapshot:
                         last_read = ', '.join([f'{k}: {v}' for k, v in
-                                               zip(self._key_field_names, self._last_read_key_for_snapshot)])
+                                               zip(self.key_field_names, self._last_read_key_for_snapshot)])
                     logger.info("SNAPSHOT COMPLETED for table %s. Last read key: (%s)", self.fq_name, last_read)
                     self._last_read_key_for_snapshot = None
                     self.snapshot_complete = True
@@ -414,68 +394,41 @@ class TrackedTable(object):
 
     def _parse_db_row(self, db_row: pyodbc.Row) -> parsed_row.ParsedRow:
         operation_id, event_db_time, lsn, seqval, update_mask, *table_cols = db_row
-        operation_name = constants.CDC_OPERATION_ID_TO_NAME[operation_id]
-
-        value_dict = {}
-        extra_headers = {}
-        for ix, fld in enumerate(self.value_fields):
-            val = table_cols[ix]
-            if fld.transform_fn:
-                val = fld.transform_fn(val)
-            # The '* 4' below is because that's the maximum possible byte length of a UTF-8 encoded character--just
-            # trying to optimize away the extra code inside the `if` block when possible:
-            if val and fld.truncate_after and len(val) * 4 > fld.truncate_after:
-                original_encoded_length = len(val.encode('utf-8'))
-                if original_encoded_length > fld.truncate_after:
-                    new_encoded_length, val = TrackedTable.cut_str_to_bytes(val, fld.truncate_after)
-                    extra_headers[f'cdc_to_kafka_truncated_field__{fld.name}'] = \
-                        f'{original_encoded_length},{new_encoded_length}'
-            value_dict[fld.name] = val
 
         if operation_id == constants.SNAPSHOT_OPERATION_ID:
-            row_kind = constants.SNAPSHOT_ROWS_KIND
             change_idx = change_index.LOWEST_CHANGE_INDEX
-            value_dict[constants.OPERATION_NAME] = constants.SNAPSHOT_OPERATION_NAME
-            value_dict[constants.LSN_NAME] = None
-            value_dict[constants.SEQVAL_NAME] = None
         else:
-            row_kind = constants.CHANGE_ROWS_KIND
             change_idx = change_index.ChangeIndex(lsn, seqval, operation_id)
-            value_dict.update(change_idx.to_avro_ready_dict())
 
-        if operation_id in (constants.PRE_UPDATE_OPERATION_ID, constants.POST_UPDATE_OPERATION_ID):
-            value_dict[constants.UPDATED_FIELDS_NAME] = self._updated_col_names_from_mask(update_mask)
-        else:
-            value_dict[constants.UPDATED_FIELDS_NAME] = self._value_field_names
+        extra_headers: Dict[str, str] = {}
 
-        value_dict[constants.EVENT_TIME_NAME] = event_db_time.isoformat()
+        for ix, max_length in self.truncate_indexes.items():
+            # The '* 4' below is because that's the maximum possible byte length of a UTF-8 encoded character--just
+            # trying to optimize away the extra code inside the `if` block when possible:
+            if table_cols[ix] and len(table_cols[ix]) * 4 > max_length:
+                original_encoded_length = len(table_cols[ix].encode('utf-8'))
+                if original_encoded_length > max_length:
+                    new_encoded_length, table_cols[ix] = TrackedTable.cut_str_to_bytes(table_cols[ix], max_length)
+                    extra_headers[f'cdc_to_kafka_truncated_field__{self.value_field_names[ix]}'] = \
+                        f'{original_encoded_length},{new_encoded_length}'
 
         ordered_key_field_values: List[Any]
         if self._has_pk:
-            ordered_key_field_values = [table_cols[kfo - 1] for kfo in self._key_field_source_table_ordinals]
+            ordered_key_field_values = [table_cols[kfo - 1] for kfo in self.key_field_source_table_ordinals]
         else:
             # CAUTION: this strategy for handling PK-less tables means that if columns are added or removed from the
             # capture instance in the future, the key value computed for the same source table row will change:
             m = hashlib.md5()
-            m.update(str(zip(self._value_field_names, table_cols)).encode('utf8'))
+            m.update(str(zip(self.value_field_names, table_cols)).encode('utf8'))
             row_hash = str(uuid.uuid5(uuid.UUID(bytes=m.digest()), self.fq_name))
             ordered_key_field_values = [row_hash]
 
-        key_dict: Dict[str, Any] = dict(zip(self._key_field_names, ordered_key_field_values))
-
-        return parsed_row.ParsedRow(self.fq_name, row_kind, operation_name, event_db_time, change_idx,
-                                    tuple(ordered_key_field_values), self.topic_name, self.key_schema_id,
-                                    self.value_schema_id, key_dict, value_dict, extra_headers)
-
-    def _updated_col_names_from_mask(self, cdc_update_mask: bytes) -> List[str]:
-        arr = bitarray.bitarray()
-        arr.frombytes(cdc_update_mask)
-        arr.reverse()
-        return list(itertools.compress(self._value_field_names, arr))
+        return parsed_row.ParsedRow(self.topic_name, operation_id, update_mask, event_db_time, change_idx,
+                                    tuple(ordered_key_field_values), table_cols, extra_headers)
 
     def _get_max_key_value(self) -> Optional[Tuple[Any, ...]]:
         with self._db_conn.cursor() as cursor:
-            q, _ = sql_queries.get_max_key_value(self.schema_name, self.table_name, self._key_field_names)
+            q, _ = sql_queries.get_max_key_value(self.schema_name, self.table_name, self.key_field_names)
             cursor.execute(q)
             row: pyodbc.Row | None = cursor.fetchone()
             if row:
@@ -484,7 +437,7 @@ class TrackedTable(object):
 
     def _get_min_key_value(self) -> Optional[Tuple[Any, ...]]:
         with self._db_conn.cursor() as cursor:
-            q, _ = sql_queries.get_min_key_value(self.schema_name, self.table_name, self._key_field_names)
+            q, _ = sql_queries.get_min_key_value(self.schema_name, self.table_name, self.key_field_names)
             cursor.execute(q)
             row: pyodbc.Row | None = cursor.fetchone()
             if row:

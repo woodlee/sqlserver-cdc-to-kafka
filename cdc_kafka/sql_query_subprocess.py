@@ -30,7 +30,7 @@ class SQLQueryResult(NamedTuple):
     reflected_query_request_metadata: Any
     query_executed_utc: datetime.datetime
     query_took_sec: float
-    result_rows: List[pyodbc.Row | parsed_row.ParsedRow]
+    result_rows: List[parsed_row.ParsedRow]
     query_params: Sequence[Any]
 
 
@@ -116,7 +116,7 @@ class SQLQueryProcessor(object):
                     start_time = time.perf_counter()
                     with db_conn.cursor() as cursor:
                         if request.query_param_types is not None:
-                            cursor.setinputsizes(request.query_param_types)
+                            cursor.setinputsizes(request.query_param_types)  # type: ignore[arg-type]
                         retry_count = 0
                         while True:
                             try:
@@ -146,10 +146,12 @@ class SQLQueryProcessor(object):
                         SQLQueryResult(request.queue_name, request.query_metadata_to_reflect, query_executed_utc,
                                        query_took_sec, result_rows, request.query_params)
                     )
-        except (KeyboardInterrupt, pyodbc.OperationalError) as exc:
+        except pyodbc.OperationalError as exc:
             # 08S01 is the error code for "Communication link failure" which may be raised in response to KeyboardInterrupt
-            if exc is pyodbc.OperationalError and not exc.args[0].startswith('08S01'):
+            if not exc.args[0].startswith('08S01'):
                 raise exc
+        except KeyboardInterrupt:
+            pass
         except Exception as exc:
             logger.exception('SQL querier thread raised an exception.', exc_info=exc)
         finally:

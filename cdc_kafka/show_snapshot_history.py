@@ -6,8 +6,7 @@ from typing import List, Any, Dict
 import confluent_kafka
 from tabulate import tabulate
 
-from cdc_kafka import kafka, kafka_oauth
-from . import constants
+from . import kafka, constants, options
 from .metric_reporting import accumulator
 
 logger = logging.getLogger(__name__)
@@ -21,18 +20,14 @@ RETENTION_CONFIG_NAMES = (
 
 
 def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument('--topic-names', required=True)
-    p.add_argument('--schema-registry-url', required=True)
-    p.add_argument('--kafka-bootstrap-servers', required=True)
-    p.add_argument('--snapshot-logging-topic-name', required=True)
-    p.add_argument('--extra-kafka-consumer-config', type=json.loads, default={})
-    p.add_argument('--script-output-file', type=argparse.FileType('w'))
-    p.add_argument('--extra-kafka-cli-command-arg', nargs='*')
+    def add_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument('--topic-names', required=True)
+        p.add_argument('--script-output-file', type=argparse.FileType('w'))
+        p.add_argument('--extra-kafka-cli-command-arg', nargs='*')
 
-    kafka_oauth.add_kafka_oauth_arg(p)
-    opts, _ = p.parse_known_args()
-    topic_names: List[str] = opts.topic_names.split(',')
+    opts, _, serializer = options.get_options_and_metrics_reporters(add_args)
+    print(opts.topic_names)
+    topic_names: List[str] = [x.strip() for x in opts.topic_names.strip().split(',') if x.strip()]
     display_table: List[List[str]] = []
     completions_seen_since_start: Dict[str, bool] = {tn: False for tn in topic_names}
     last_starts: Dict[str, Dict[str, Any]] = {tn: {} for tn in topic_names}
@@ -52,11 +47,11 @@ def main() -> None:
         "Value schema ID",
     ]
 
-    with kafka.KafkaClient(accumulator.NoopAccumulator(), opts.kafka_bootstrap_servers, opts.schema_registry_url,
+    with kafka.KafkaClient(accumulator.NoopAccumulator(), opts.kafka_bootstrap_servers,
                            opts.extra_kafka_consumer_config, {}, disable_writing=True) as kafka_client:
         for msg in kafka_client.consume_all(opts.snapshot_logging_topic_name):
-            # noinspection PyTypeChecker,PyArgumentList
-            log = dict(msg.value())
+            deser_msg = serializer.deserialize(msg)
+            log = deser_msg.value_dict or {}
             consumed_count += 1
             if log['topic_name'] not in topic_names:
                 continue
@@ -82,7 +77,7 @@ def main() -> None:
 
         print(f'''
 Consumed {consumed_count} messages from snapshot logging topic {opts.snapshot_logging_topic_name}.
-{relevant_count} were related to requested topics {opts.topic_names}.
+{relevant_count} were related to requested topics {topic_names}.
         ''')
 
         if not relevant_count:

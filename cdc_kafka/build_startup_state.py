@@ -1,4 +1,5 @@
 import collections
+import copy
 import datetime
 import logging
 import re
@@ -8,7 +9,8 @@ import pyodbc
 from tabulate import tabulate
 
 from . import sql_query_subprocess, tracked_tables, sql_queries, kafka, progress_tracking, change_index, \
-    constants, helpers, options, avro
+    constants, helpers, options
+from .serializers.avro import AvroSchemaGenerator
 from .metric_reporting import accumulator
 
 logger = logging.getLogger(__name__)
@@ -18,8 +20,7 @@ def build_tracked_tables_from_cdc_metadata(
     db_conn: pyodbc.Connection, metrics_accumulator: accumulator.Accumulator, topic_name_template: str,
     snapshot_table_include_config: str, snapshot_table_exclude_config: str, truncate_fields: Dict[str, int],
     capture_instance_names: List[str], db_row_batch_size: int,
-    sql_query_processor: sql_query_subprocess.SQLQueryProcessor,
-    schema_generator: avro.AvroSchemaGenerator, progress_tracker: progress_tracking.ProgressTracker
+    sql_query_processor: sql_query_subprocess.SQLQueryProcessor, progress_tracker: progress_tracking.ProgressTracker
 ) -> List[tracked_tables.TrackedTable]:
     result: List[tracked_tables.TrackedTable] = []
 
@@ -57,8 +58,8 @@ def build_tracked_tables_from_cdc_metadata(
             schema_name=schema_name, table_name=table_name, capture_instance_name=capture_instance_name)
 
         tracked_table = tracked_tables.TrackedTable(
-            db_conn,  metrics_accumulator, sql_query_processor, schema_generator, schema_name, table_name,
-            capture_instance_name, topic_name, min_lsn, can_snapshot, db_row_batch_size, progress_tracker)
+            db_conn,  metrics_accumulator, sql_query_processor, schema_name, table_name, capture_instance_name,
+            topic_name, min_lsn, can_snapshot, db_row_batch_size, progress_tracker)
 
         for (change_table_ordinal, column_name, sql_type_name, _, primary_key_ordinal, decimal_precision,
              decimal_scale, _) in fields:
@@ -74,11 +75,10 @@ def build_tracked_tables_from_cdc_metadata(
 
 def determine_start_points_and_finalize_tables(
         kafka_client: kafka.KafkaClient, db_conn: pyodbc.Connection, tables: Iterable[tracked_tables.TrackedTable],
-        schema_generator: avro.AvroSchemaGenerator, progress_tracker: progress_tracking.ProgressTracker,
-        lsn_gap_handling: str, partition_count: int, replication_factor: int,
-        extra_topic_config: Dict[str, str | int], validation_mode: bool = False,
-        redo_snapshot_for_new_instance: bool = False, publish_duplicate_changes_from_new_instance: bool = False,
-        report_progress_only: bool = False
+        progress_tracker: progress_tracking.ProgressTracker, lsn_gap_handling: str, new_follow_start_point: str,
+        partition_count: int, replication_factor: int, extra_topic_config: Dict[str, str | int],
+        validation_mode: bool = False, redo_snapshot_for_new_instance: bool = False,
+        publish_duplicate_changes_from_new_instance: bool = False, report_progress_only: bool = False
 ) -> None:
     if validation_mode:
         for table in tables:
@@ -93,6 +93,11 @@ def determine_start_points_and_finalize_tables(
 
     snapshot_progress: Optional[progress_tracking.ProgressEntry]
     changes_progress: Optional[progress_tracking.ProgressEntry]
+
+    with db_conn.cursor() as cursor:
+        q, _ = sql_queries.get_max_lsn()
+        cursor.execute(q)
+        db_max_lsn = cursor.fetchval()
 
     for table in tables:
         kafka_client.begin_transaction()
@@ -126,8 +131,8 @@ def determine_start_points_and_finalize_tables(
                 if redo_snapshot_for_new_instance:
                     old_capture_instance_name = helpers.get_capture_instance_name(snapshot_progress.change_table_name)
                     new_capture_instance_name = helpers.get_capture_instance_name(fq_change_table_name)
-                    if ddl_change_requires_new_snapshot(db_conn, schema_generator, old_capture_instance_name,
-                                                        new_capture_instance_name, table.fq_name):
+                    if ddl_change_requires_new_snapshot(db_conn, old_capture_instance_name, new_capture_instance_name,
+                                                        table.fq_name):
                         logger.info('Will start new snapshot.')
                         snapshot_progress = None
                     else:
@@ -160,8 +165,13 @@ def determine_start_points_and_finalize_tables(
                 else:
                     logger.info('Will NOT republish any change rows duplicated by the new capture instance.')
 
+        new_table_starting_index = copy.copy(change_index.LOWEST_CHANGE_INDEX)
+        if new_follow_start_point == options.NEW_FOLLOW_START_POINT_LATEST:
+            new_table_starting_index.lsn = db_max_lsn
+        if not (changes_progress and changes_progress.change_index):
+            logger.info('Beginning follow of new table %s from LSN %s', table.fq_name, new_table_starting_index)
         starting_change_index: change_index.ChangeIndex = \
-            (changes_progress and changes_progress.change_index) or change_index.LOWEST_CHANGE_INDEX
+            (changes_progress and changes_progress.change_index) or new_table_starting_index
         starting_snapshot_index: Optional[Mapping[str, str | int]] = None
         if snapshot_progress:
             starting_snapshot_index = snapshot_progress.snapshot_index
@@ -171,7 +181,7 @@ def determine_start_points_and_finalize_tables(
                                  options.LSN_GAP_HANDLING_IGNORE)
         else:
             table.finalize_table(starting_change_index, prior_change_table_max_index, starting_snapshot_index,
-                                 lsn_gap_handling, kafka_client.register_schemas, allow_progress_writes=True)
+                                 lsn_gap_handling, allow_progress_writes=True)
 
         if not table.snapshot_allowed:
             snapshot_state = '<not doing>'
@@ -194,9 +204,9 @@ def determine_start_points_and_finalize_tables(
                 'low key column values):\n%s\n%s tables total.', display_table, len(prior_progress_log_table_data))
 
 
-def ddl_change_requires_new_snapshot(db_conn: pyodbc.Connection, schema_generator: avro.AvroSchemaGenerator,
-                                     old_capture_instance_name: str, new_capture_instance_name: str,
-                                     source_table_fq_name: str, resnapshot_for_column_drops: bool = True) -> bool:
+def ddl_change_requires_new_snapshot(db_conn: pyodbc.Connection, old_capture_instance_name: str,
+                                     new_capture_instance_name: str, source_table_fq_name: str,
+                                     resnapshot_for_column_drops: bool = True) -> bool:
     with db_conn.cursor() as cursor:
         cursor.execute(f'SELECT TOP 1 1 FROM [{constants.CDC_DB_SCHEMA_NAME}].[change_tables] '
                        f'WHERE capture_instance = ?', old_capture_instance_name)
@@ -239,21 +249,44 @@ def ddl_change_requires_new_snapshot(db_conn: pyodbc.Connection, schema_generato
         for changed_col_name in changed_col_names:
             old_col = old_cols[changed_col_name]
             new_col = new_cols[changed_col_name]
-            # Even if the DB col type changed, a resnapshot is really only needed if the corresponding Avro type
-            # changes. An example would be a column "upgrading" from SMALLINT to INT:
-            db_schema, db_table = source_table_fq_name.split('.')
-            old_avro_type = schema_generator.get_record_field_schema(
-                db_schema, db_table, changed_col_name, old_col['sql_type_name'], old_col['decimal_precision'],
-                old_col['decimal_scale'], True)
-            new_avro_type = schema_generator.get_record_field_schema(
-                db_schema, db_table, changed_col_name, new_col['sql_type_name'], new_col['decimal_precision'],
-                new_col['decimal_scale'], True)
-            if old_col['is_computed'] != new_col['is_computed'] or old_avro_type != new_avro_type:
-                logger.info('Requiring re-snapshot for %s due to a data type change for column %s (type: %s, '
+
+            if old_col['is_computed'] != new_col['is_computed']:
+                logger.info('Requiring re-snapshot for %s due to an is_computed change for column %s (type: %s, '
                             'is_computed: %s --> type: %s, is_computed: %s).', source_table_fq_name, changed_col_name,
                             old_col['sql_type_name'], old_col['is_computed'], new_col['sql_type_name'],
                             new_col['is_computed'])
                 return True
+
+            # Even if the DB col type changed, a resnapshot is really only needed if the corresponding serialization
+            # schema changes. An example where we can skip a re-snapshot would be a column "upgrading" from SMALLINT
+            # to INT:
+
+            # noinspection PyProtectedMember
+            if AvroSchemaGenerator._instance:  # Will only exist if process was configured for Avro serialization
+                db_schema, db_table = source_table_fq_name.split('.')
+                # noinspection PyProtectedMember
+                old_avro_type = AvroSchemaGenerator._instance.get_record_field_schema(
+                    db_schema, db_table, changed_col_name, old_col['sql_type_name'], old_col['decimal_precision'],
+                    old_col['decimal_scale'], True)
+                # noinspection PyProtectedMember
+                new_avro_type = AvroSchemaGenerator._instance.get_record_field_schema(
+                    db_schema, db_table, changed_col_name, new_col['sql_type_name'], new_col['decimal_precision'],
+                    new_col['decimal_scale'], True)
+                if old_avro_type != new_avro_type:
+                    logger.info('Requiring re-snapshot for %s due to an Avro schema change for column %s (type: %s, '
+                                'is_computed: %s --> type: %s, is_computed: %s).', source_table_fq_name,
+                                changed_col_name, old_col['sql_type_name'], old_col['is_computed'],
+                                new_col['sql_type_name'], new_col['is_computed'])
+                    return True
+            else:
+                # TODO - not yet supporting all the situations we could in this non-Avro case. Add nuance!
+                if not (old_col['sql_type_name'].lower().endswith('int') and
+                        new_col['sql_type_name'].lower().endswith('int')):
+                    logger.info('Requiring re-snapshot for %s due to a data type change for column %s (type: %s, '
+                                'is_computed: %s --> type: %s, is_computed: %s).', source_table_fq_name,
+                                changed_col_name, old_col['sql_type_name'], old_col['is_computed'],
+                                new_col['sql_type_name'], new_col['is_computed'])
+                    return True
 
         for added_col_name in added_col_names:
             col_info = new_cols[added_col_name]
@@ -271,7 +304,7 @@ def ddl_change_requires_new_snapshot(db_conn: pyodbc.Connection, schema_generato
 
         # Gets the names of columns that appear in the first position of one or more unfiltered, non-disabled indexes:
         q, p = sql_queries.get_indexed_cols()
-        cursor.setinputsizes(p)
+        cursor.setinputsizes(p)  # type: ignore[arg-type]
         cursor.execute(q, source_table_fq_name)
         indexed_cols: Set[str] = {row[0] for row in cursor.fetchall()}
         recently_added_cols: Optional[Set[str]] = None
@@ -294,7 +327,7 @@ def ddl_change_requires_new_snapshot(db_conn: pyodbc.Connection, schema_generato
                     cols_with_too_old_changes: Set[str] = set()
                     cols_with_new_enough_changes: Set[str] = set()
                     q, p = sql_queries.get_ddl_history_for_capture_table()
-                    cursor.setinputsizes(p)
+                    cursor.setinputsizes(p)  # type: ignore[arg-type]
                     cursor.execute(q, helpers.get_fq_change_table_name(old_capture_instance_name))
                     alter_re = re.compile(
                         r'\W*alter\s+table\s+(?P<table>[\w\.\[\]]+)\s+add\s+(?P<column>[\w\.\[\]]+)\s+(?P<spec>.*)',

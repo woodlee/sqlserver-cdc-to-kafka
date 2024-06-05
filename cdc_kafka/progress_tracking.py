@@ -1,192 +1,36 @@
 import datetime
-import json
 import logging
-from typing import Dict, Tuple, Any, Optional, Mapping, TypeVar, Type
-
-import confluent_kafka.avro
+from typing import Dict, Tuple, Any, Optional, Mapping, TypeVar, Type, TYPE_CHECKING
 
 from . import constants, helpers, tracked_tables
 from .change_index import ChangeIndex
+from .serializers import SerializerAbstract, DeserializedMessage
 
-from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .kafka import KafkaClient
     import confluent_kafka
 
 logger = logging.getLogger(__name__)
 
-PROGRESS_TRACKING_SCHEMA_VERSION = '2'
-PROGRESS_TRACKING_AVRO_KEY_SCHEMA = confluent_kafka.avro.loads(json.dumps({
-    "name": f"{constants.AVRO_SCHEMA_NAMESPACE}__progress_tracking_v{PROGRESS_TRACKING_SCHEMA_VERSION}__key",
-    "namespace": constants.AVRO_SCHEMA_NAMESPACE,
-    "type": "record",
-    "fields": [
-        {
-            "name": "topic_name",
-            "type": "string"
-        },
-        {
-            "name": "progress_kind",
-            "type": {
-                "type": "enum",
-                "name": "progress_kind",
-                "symbols": [
-                    constants.CHANGE_ROWS_KIND,
-                    constants.SNAPSHOT_ROWS_KIND
-                ]
-            }
-        }
-    ]
-}))
-PROGRESS_TRACKING_AVRO_VALUE_SCHEMA = confluent_kafka.avro.loads(json.dumps({
-    "name": f"{constants.AVRO_SCHEMA_NAMESPACE}__progress_tracking_v{PROGRESS_TRACKING_SCHEMA_VERSION}__value",
-    "namespace": constants.AVRO_SCHEMA_NAMESPACE,
-    "type": "record",
-    "fields": [
-        {
-            "name": "source_table_name",
-            "type": "string"
-        },
-        {
-            "name": "change_table_name",
-            "type": "string"
-        },
-        # ------------------------------------------------------------------------------------------------
-        # These next two are defunct/deprecated as of v4 but remain here to ease the upgrade transition
-        # for anyone with existing progress recorded by earlier versions:
-        {
-            "name": "last_ack_partition",
-            "type": ["null", "int"]
-        },
-        {
-            "name": "last_ack_offset",
-            "type": ["null", "long"]
-        },
-        # ------------------------------------------------------------------------------------------------
-        {
-            "name": "last_ack_position",
-            "type": [
-                {
-                    "type": "record",
-                    "name": f"{constants.CHANGE_ROWS_KIND}_progress",
-                    "namespace": constants.AVRO_SCHEMA_NAMESPACE,
-                    "fields": [
-                        {
-                            "name": constants.LSN_NAME,
-                            "type": "string",
-                        },
-                        {
-                            "name": constants.SEQVAL_NAME,
-                            "type": "string",
-                        },
-                        {
-                            "name": constants.OPERATION_NAME,
-                            "type": {
-                                "type": "enum",
-                                "name": constants.OPERATION_NAME,
-                                "symbols": list(constants.CDC_OPERATION_NAME_TO_ID.keys())
-                            }
-                        }
-                    ]
-                },
-                {
-                    "type": "record",
-                    "name": f"{constants.SNAPSHOT_ROWS_KIND}_progress",
-                    "namespace": constants.AVRO_SCHEMA_NAMESPACE,
-                    "fields": [
-                        {
-                            "name": "key_fields",
-                            "type": {
-                                "type": "map",
-                                "values": ["string", "long"]
-                            }
-                        }
-                    ]
-                }
-            ]
-        }
-    ]
-}))
-
-SNAPSHOT_LOGGING_SCHEMA_VERSION = '1'
-SNAPSHOT_LOGGING_AVRO_VALUE_SCHEMA = confluent_kafka.avro.loads(json.dumps({
-    "name": f"{constants.AVRO_SCHEMA_NAMESPACE}__snapshot_logging_v{SNAPSHOT_LOGGING_SCHEMA_VERSION}__value",
-    "namespace": constants.AVRO_SCHEMA_NAMESPACE,
-    "type": "record",
-    "fields": [
-        {
-            "name": "topic_name",
-            "type": "string"
-        },
-        {
-            "name": "table_name",
-            "type": "string"
-        },
-        {
-            "name": "action",
-            "type": "string"
-        },
-        {
-            "name": "process_hostname",
-            "type": "string"
-        },
-        {
-            "name": "event_time_utc",
-            "type": "string"
-        },
-        {
-            "name": "key_schema_id",
-            "type": ["null", "long"]
-        },
-        {
-            "name": "value_schema_id",
-            "type": ["null", "long"]
-        },
-        {
-            "name": "partition_watermarks_low",
-            "type": ["null", {
-                "type": "map",
-                "values": "long"
-            }]
-        },
-        {
-            "name": "partition_watermarks_high",
-            "type": ["null", {
-                "type": "map",
-                "values": "long"
-            }]
-        },
-        {
-            "name": "starting_snapshot_index",
-            "type": ["null", {
-                "type": "map",
-                "values": ["string", "long"]
-            }]
-        },
-        {
-            "name": "ending_snapshot_index",
-            "type": ["null", {
-                "type": "map",
-                "values": ["string", "long"]
-            }]
-        }
-    ]
-}))
 
 ProgressEntryType = TypeVar('ProgressEntryType', bound='ProgressEntry')
 
 
 class ProgressEntry(object):
     @classmethod
-    def from_message(cls: Type[ProgressEntryType], message: 'confluent_kafka.Message') -> ProgressEntryType:
+    def from_message(cls: Type[ProgressEntryType], message: DeserializedMessage) -> ProgressEntryType:
         # noinspection PyTypeChecker,PyArgumentList
-        k, v = dict(message.key()), dict(message.value())
+        k, v = message.key_dict, message.value_dict
+
+        if k is None or v is None:
+            raise Exception("Malformed message received by ProgressEntry.from_message")
+
         kind: str = k['progress_kind']
 
         if kind not in (constants.CHANGE_ROWS_KIND, constants.SNAPSHOT_ROWS_KIND):
             raise Exception(f"Unrecognized progress kind from message: {kind}")
 
-        msg_coordinates = helpers.format_coordinates(message)
+        msg_coordinates = helpers.format_coordinates(message.raw_msg)
 
         if kind == constants.SNAPSHOT_ROWS_KIND:
             return cls(kind, k['topic_name'], v['source_table_name'], v['change_table_name'],
@@ -194,7 +38,7 @@ class ProgressEntry(object):
 
         else:
             return cls(kind, k['topic_name'], v['source_table_name'], v['change_table_name'],
-                       None, ChangeIndex.from_avro_ready_dict(v['last_ack_position']), msg_coordinates)
+                       None, ChangeIndex.from_dict(v['last_ack_position']), msg_coordinates)
 
     def __init__(self, progress_kind: str, topic_name: str, source_table_name: str, change_table_name: str,
                  snapshot_index: Optional[Mapping[str, str | int]] = None,
@@ -218,10 +62,12 @@ class ProgressEntry(object):
         }
 
     @property
-    def value(self) -> Dict[str, Any]:
+    def value(self) -> Optional[Dict[str, Any]]:
+        if not (self.change_index or self.snapshot_index):
+            return None
         pos: Dict[str, Any]
         if self.change_index:
-            pos = self.change_index.to_avro_ready_dict()
+            pos = self.change_index.as_dict()
         else:
             pos = {'key_fields': self.snapshot_index}
         return {
@@ -238,22 +84,16 @@ class ProgressEntry(object):
 class ProgressTracker(object):
     _instance = None
 
-    def __init__(self, kafka_client: 'KafkaClient', progress_topic_name: str, process_hostname: str,
-                 snapshot_logging_topic_name: Optional[str] = None) -> None:
+    def __init__(self, kafka_client: 'KafkaClient', serializer: SerializerAbstract, progress_topic_name: str,
+                 process_hostname: str, snapshot_logging_topic_name: Optional[str] = None) -> None:
         if ProgressTracker._instance is not None:
             raise Exception('ProgressTracker class should be used as a singleton.')
 
         self._kafka_client: 'KafkaClient' = kafka_client
+        self._serializer: SerializerAbstract = serializer
         self._progress_topic_name: str = progress_topic_name
         self._process_hostname: str = process_hostname
         self._snapshot_logging_topic_name: Optional[str] = snapshot_logging_topic_name
-        self._progress_key_schema_id, self._progress_value_schema_id = kafka_client.register_schemas(
-            progress_topic_name, PROGRESS_TRACKING_AVRO_KEY_SCHEMA, PROGRESS_TRACKING_AVRO_VALUE_SCHEMA)
-        if snapshot_logging_topic_name:
-            _, self._snapshot_logging_schema_id = kafka_client.register_schemas(
-                snapshot_logging_topic_name, None, SNAPSHOT_LOGGING_AVRO_VALUE_SCHEMA)
-        else:
-            self._snapshot_logging_schema_id = 0
         self._last_recorded_progress_by_topic: Dict[str, ProgressEntry] = {}
         self._topic_to_source_table_map: Dict[str, str] = {}
         self._topic_to_change_table_map: Dict[str, str] = {}
@@ -277,12 +117,12 @@ class ProgressTracker(object):
             change_index=change_index
         )
 
+        key, value = self._serializer.serialize_progress_tracking_message(progress_entry)
+
         self._kafka_client.produce(
             topic=self._progress_topic_name,
-            key=progress_entry.key,
-            key_schema_id=self._progress_key_schema_id,
-            value=progress_entry.value,
-            value_schema_id=self._progress_value_schema_id,
+            key=key,
+            value=value,
             message_type=constants.CHANGE_PROGRESS_MESSAGE
         )
 
@@ -297,17 +137,16 @@ class ProgressTracker(object):
             snapshot_index=snapshot_index
         )
 
+        key, value = self._serializer.serialize_progress_tracking_message(progress_entry)
+
         self._kafka_client.produce(
             topic=self._progress_topic_name,
-            key=progress_entry.key,
-            key_schema_id=self._progress_key_schema_id,
-            value=progress_entry.value,
-            value_schema_id=self._progress_value_schema_id,
+            key=key,
+            value=value,
             message_type=constants.SNAPSHOT_PROGRESS_MESSAGE
         )
 
     def _log_snapshot_event(self, topic_name: str, table_name: str, action: str,
-                            key_schema_id: Optional[int] = None, value_schema_id: Optional[int] = None,
                             event_time: Optional[datetime.datetime] = None,
                             starting_snapshot_index: Optional[Mapping[str, str | int]] = None,
                             ending_snapshot_index: Optional[Mapping[str, str | int]] = None) -> None:
@@ -332,38 +171,31 @@ class ProgressTracker(object):
             "process_hostname": self._process_hostname,
             "starting_snapshot_index": starting_snapshot_index,
             "table_name": table_name,
-            "topic_name": topic_name,
-            "key_schema_id": key_schema_id,
-            "value_schema_id": value_schema_id
+            "topic_name": topic_name
         }
 
         logger.debug('Logging snapshot event: %s', msg)
-
+        _, value = self._serializer.serialize_snapshot_logging_message(msg)
         self._kafka_client.produce(
             topic=self._snapshot_logging_topic_name,
             key=None,
-            key_schema_id=0,
-            value=msg,
-            value_schema_id=self._snapshot_logging_schema_id,
+            value=value,
             message_type=constants.SNAPSHOT_LOGGING_MESSAGE
         )
 
-    def log_snapshot_started(self, topic_name: str, table_name: str, key_schema_id: int, value_schema_id: int,
+    def log_snapshot_started(self, topic_name: str, table_name: str,
                              starting_snapshot_index: Mapping[str, str | int]) -> None:
         return self._log_snapshot_event(topic_name, table_name, constants.SNAPSHOT_LOG_ACTION_STARTED,
-                                        key_schema_id=key_schema_id, value_schema_id=value_schema_id,
                                         starting_snapshot_index=starting_snapshot_index)
 
-    def log_snapshot_resumed(self, topic_name: str, table_name: str, key_schema_id: int, value_schema_id: int,
+    def log_snapshot_resumed(self, topic_name: str, table_name: str,
                              starting_snapshot_index: Mapping[str, str | int]) -> None:
         return self._log_snapshot_event(topic_name, table_name, constants.SNAPSHOT_LOG_ACTION_RESUMED,
-                                        key_schema_id=key_schema_id, value_schema_id=value_schema_id,
                                         starting_snapshot_index=starting_snapshot_index)
 
-    def log_snapshot_completed(self, topic_name: str, table_name: str, key_schema_id: int, value_schema_id: int,
-                               event_time: datetime.datetime, ending_snapshot_index: Mapping[str, str | int]) -> None:
+    def log_snapshot_completed(self, topic_name: str, table_name: str, event_time: datetime.datetime,
+                               ending_snapshot_index: Mapping[str, str | int]) -> None:
         return self._log_snapshot_event(topic_name, table_name, constants.SNAPSHOT_LOG_ACTION_COMPLETED,
-                                        key_schema_id=key_schema_id, value_schema_id=value_schema_id,
                                         event_time=event_time, ending_snapshot_index=ending_snapshot_index)
 
     def log_snapshot_progress_reset(self, topic_name: str, table_name: str, is_auto_reset: bool,
@@ -395,39 +227,28 @@ class ProgressTracker(object):
 
     # the keys in the returned dictionary are tuples of (topic_name, progress_kind)
     def get_prior_progress(self) -> Dict[Tuple[str, str], ProgressEntry]:
-        result: Dict[Tuple[str, str], ProgressEntry] = {}
-        messages: Dict[Tuple[str, str], confluent_kafka.Message] = {}
+        raw_msgs: Dict[bytes | str | None, confluent_kafka.Message] = {}
 
         progress_msg_ctr = 0
         for progress_msg in self._kafka_client.consume_all(self._progress_topic_name):
             progress_msg_ctr += 1
-            # noinspection PyTypeChecker
-            msg_key = dict(progress_msg.key())
-            result_key = (msg_key['topic_name'], msg_key['progress_kind'])
-
             # noinspection PyArgumentList
             if progress_msg.value() is None:
-                if result_key in result:
-                    del result[result_key]
+                if progress_msg.key() is not None and progress_msg.key() in raw_msgs:
+                    del raw_msgs[progress_msg.key()]
                 continue
-
-            curr_entry = ProgressEntry.from_message(message=progress_msg)
-            prior_entry = result.get(result_key)
-            if (prior_entry and prior_entry.change_index and curr_entry and curr_entry.change_index and
-                    prior_entry.change_index > curr_entry.change_index):
-                prior_message = messages[result_key]
-                logger.error(
-                    'WARNING: Progress topic %s contains unordered entries for %s! Prior: p%s:o%s (%s), '
-                    'pos %s; Current: p%s:o%s (%s), pos %s', self._progress_topic_name, result_key,
-                    prior_message.partition(), prior_message.offset(),
-                    datetime.datetime.fromtimestamp(prior_message.timestamp()[1] / 1000, datetime.UTC),
-                    prior_entry.change_index, progress_msg.partition(), progress_msg.offset(),
-                    datetime.datetime.fromtimestamp(progress_msg.timestamp()[1] / 1000, datetime.UTC),
-                    curr_entry.change_index)
-            result[result_key] = curr_entry  # last read for a given key will win
-            messages[result_key] = progress_msg
+            raw_msgs[progress_msg.key()] = progress_msg
 
         logger.info('Read %s prior progress messages from Kafka topic %s', progress_msg_ctr, self._progress_topic_name)
+
+        result: Dict[Tuple[str, str], ProgressEntry] = {}
+        for msg in raw_msgs.values():
+            deser_msg = self._serializer.deserialize(msg)
+            if deser_msg.key_dict is None:
+                raise Exception('Unexpected state: None value from deserializing progress message key')
+            result[(deser_msg.key_dict['topic_name'], deser_msg.key_dict['progress_kind'])] = \
+                ProgressEntry.from_message(message=deser_msg)
+
         return result
 
     def reset_progress(self, topic_name: str, kind_to_reset: str, source_table_name: str, is_auto_reset: bool,
@@ -436,22 +257,26 @@ class ProgressTracker(object):
         matched = False
 
         if kind_to_reset in (constants.CHANGE_ROWS_KIND, constants.ALL_PROGRESS_KINDS):
-            key = {
-                'topic_name': topic_name,
-                'progress_kind': constants.CHANGE_ROWS_KIND,
-            }
-            self._kafka_client.produce(self._progress_topic_name, key, self._progress_key_schema_id, None,
-                                       self._progress_value_schema_id, constants.PROGRESS_DELETION_TOMBSTONE_MESSAGE)
+            progress_entry = ProgressEntry(constants.CHANGE_ROWS_KIND, topic_name, '', '')
+            key, _ = self._serializer.serialize_progress_tracking_message(progress_entry)
+            self._kafka_client.produce(
+                topic=self._progress_topic_name,
+                key=key,
+                value=None,
+                message_type=constants.PROGRESS_DELETION_TOMBSTONE_MESSAGE
+            )
             logger.info('Deleted existing change rows progress records for topic %s.', topic_name)
             matched = True
 
         if kind_to_reset in (constants.SNAPSHOT_ROWS_KIND, constants.ALL_PROGRESS_KINDS):
-            key = {
-                'topic_name': topic_name,
-                'progress_kind': constants.SNAPSHOT_ROWS_KIND,
-            }
-            self._kafka_client.produce(self._progress_topic_name, key, self._progress_key_schema_id, None,
-                                       self._progress_value_schema_id, constants.PROGRESS_DELETION_TOMBSTONE_MESSAGE)
+            progress_entry = ProgressEntry(constants.SNAPSHOT_ROWS_KIND, topic_name, '', '')
+            key, _ = self._serializer.serialize_progress_tracking_message(progress_entry)
+            self._kafka_client.produce(
+                topic=self._progress_topic_name,
+                key=key,
+                value=None,
+                message_type=constants.PROGRESS_DELETION_TOMBSTONE_MESSAGE
+            )
             logger.info('Deleted existing snapshot progress records for topic %s.', topic_name)
             self.maybe_create_snapshot_logging_topic()
             self.log_snapshot_progress_reset(topic_name, source_table_name, is_auto_reset,
