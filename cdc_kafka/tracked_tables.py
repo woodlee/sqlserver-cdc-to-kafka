@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 class TrackedField(object):
     __slots__ = 'name', 'sql_type_name', 'change_table_ordinal', 'primary_key_ordinal', 'decimal_precision', \
-        'decimal_scale', 'transform_fn'
+        'decimal_scale', 'transform_fn', 'truncate_after'
 
     def __init__(self, name: str, sql_type_name: str, change_table_ordinal: int, primary_key_ordinal: int,
                  decimal_precision: int, decimal_scale: int, truncate_after: int = 0) -> None:
@@ -32,17 +32,10 @@ class TrackedField(object):
         self.decimal_scale: int = decimal_scale
         self.transform_fn: Optional[Callable[[Any], Any]] = avro_transform_fn_from_sql_type(sql_type_name)
 
-        if truncate_after:
-            if self.sql_type_name not in constants.SQL_STRING_TYPES:
-                raise Exception(f'A truncation length was specified for field {name} but it does not appear to be a '
-                                f'string field (SQL type is {sql_type_name}).')
-
-            if self.transform_fn:
-                orig_transform = self.transform_fn
-                # TODO: this prevents orig_transform from ever receiving a None argument; is that okay??
-                self.transform_fn = lambda x: orig_transform(x)[:int(truncate_after)] if x is not None else x
-            else:
-                self.transform_fn = lambda x: x[:int(truncate_after)] if x is not None else x
+        if truncate_after and self.sql_type_name not in constants.SQL_STRING_TYPES:
+            raise Exception(f'A truncation length was specified for field {name} but it does not appear to be a '
+                            f'string field (SQL type is {sql_type_name}).')
+        self.truncate_after: int = truncate_after
 
 
 class TrackedTable(object):
@@ -383,12 +376,61 @@ class TrackedTable(object):
             cursor.execute(q)
             return cursor.fetchval() or 0
 
+    @staticmethod
+    def cut_str_to_bytes(s: str, max_bytes: int) -> Tuple[int, str]:
+        # Mostly copied from https://github.com/halloleo/unicut/blob/master/truncate.py
+        def safe_b_of_i(b, i):
+            try:
+                return b[i]
+            except IndexError:
+                return 0
+
+        if s == '' or max_bytes < 1:
+            return 0, ''
+
+        b = s[:max_bytes].encode('utf-8')[:max_bytes]
+
+        if b[-1] & 0b10000000:
+            last_11x_index = [
+                i
+                for i in range(-1, -5, -1)
+                if safe_b_of_i(b, i) & 0b11000000 == 0b11000000
+            ][0]
+
+            last_11x = b[last_11x_index]
+            last_char_length = 1
+            if not last_11x & 0b00100000:
+                last_char_length = 2
+            elif not last_11x & 0b0010000:
+                last_char_length = 3
+            elif not last_11x & 0b0001000:
+                last_char_length = 4
+
+            if last_char_length > -last_11x_index:
+                # remove the incomplete character
+                b = b[:last_11x_index]
+
+        return len(b), b.decode('utf-8')
+
     def _parse_db_row(self, db_row: pyodbc.Row) -> parsed_row.ParsedRow:
         operation_id, event_db_time, lsn, seqval, update_mask, *table_cols = db_row
         operation_name = constants.CDC_OPERATION_ID_TO_NAME[operation_id]
 
-        value_dict = {fld.name: fld.transform_fn(table_cols[ix]) if fld.transform_fn else table_cols[ix]
-                      for ix, fld in enumerate(self.value_fields)}
+        value_dict = {}
+        extra_headers = {}
+        for ix, fld in enumerate(self.value_fields):
+            val = table_cols[ix]
+            if fld.transform_fn:
+                val = fld.transform_fn(val)
+            # The '* 4' below is because that's the maximum possible byte length of a UTF-8 encoded character--just
+            # trying to optimize away the extra code inside the `if` block when possible:
+            if val and fld.truncate_after and len(val) * 4 > fld.truncate_after:
+                original_encoded_length = len(val.encode('utf-8'))
+                if original_encoded_length > fld.truncate_after:
+                    new_encoded_length, val = TrackedTable.cut_str_to_bytes(val, fld.truncate_after)
+                    extra_headers[f'cdc_to_kafka_truncated_field__{fld.name}'] = \
+                        f'{original_encoded_length},{new_encoded_length}'
+            value_dict[fld.name] = val
 
         if operation_id == constants.SNAPSHOT_OPERATION_ID:
             row_kind = constants.SNAPSHOT_ROWS_KIND
@@ -423,7 +465,7 @@ class TrackedTable(object):
 
         return parsed_row.ParsedRow(self.fq_name, row_kind, operation_name, event_db_time, change_idx,
                                     tuple(ordered_key_field_values), self.topic_name, self.key_schema_id,
-                                    self.value_schema_id, key_dict, value_dict)
+                                    self.value_schema_id, key_dict, value_dict, extra_headers)
 
     def _updated_col_names_from_mask(self, cdc_update_mask: bytes) -> List[str]:
         arr = bitarray.bitarray()
