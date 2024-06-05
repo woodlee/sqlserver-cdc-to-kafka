@@ -29,7 +29,6 @@ logger = logging.getLogger(__name__)
 
 AvroSerializerType = TypeVar('AvroSerializerType', bound='AvroSerializer')
 
-ALWAYS_COMPARE_CANONICAL = False
 COMPARE_CANONICAL_EVERY_NTH = 100  # TODO 100_000
 AVRO_SCHEMA_NAMESPACE = "cdc_to_kafka"
 
@@ -546,8 +545,7 @@ class AvroSerializer(SerializerAbstract):
         serialized_value: bytes = value_writer.getvalue()
         value_writer.close()
 
-        if (ALWAYS_COMPARE_CANONICAL or self._canonical_compare_ctr.get(row.destination_topic, 0) %
-                COMPARE_CANONICAL_EVERY_NTH == 0):
+        if self._canonical_compare_ctr.get(row.destination_topic, 0) % COMPARE_CANONICAL_EVERY_NTH == 0:
             self.compare_canonical(metadata, row, serialized_key, serialized_value)
 
         self._canonical_compare_ctr[row.destination_topic] += 1
