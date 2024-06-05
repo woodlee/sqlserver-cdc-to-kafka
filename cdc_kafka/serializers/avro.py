@@ -10,7 +10,7 @@ import logging
 import os
 import struct
 import time
-from typing import Tuple, TypeVar, Type, List, Any, Dict, Callable, Set, Literal, Sequence, Optional
+from typing import Tuple, TypeVar, Type, List, Any, Dict, Callable, Literal, Sequence, Optional
 
 import confluent_kafka.avro
 from avro.errors import AvroOutOfScaleException

@@ -461,7 +461,7 @@ TRUNCATE TABLE {merge_temp_table_name};
                                 logger.debug('Rolling %s inserts into %s merges', len(inserts), len(merges))
                                 merges += inserts
                                 inserts = []
-                            import pdb;pdb.set_trace()
+
                             if inserts:
                                 start_time = time.perf_counter()
                                 db_conn.bulk_insert(fq_target_table_name, inserts)

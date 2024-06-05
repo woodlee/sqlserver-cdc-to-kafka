@@ -359,9 +359,9 @@ class TrackedTable(object):
     @staticmethod
     def cut_str_to_bytes(s: str, max_bytes: int) -> Tuple[int, str]:
         # Mostly copied from https://github.com/halloleo/unicut/blob/master/truncate.py
-        def safe_b_of_i(b, i):
+        def safe_b_of_i(encoded: bytes, i: int) -> int:
             try:
-                return b[i]
+                return encoded[i]
             except IndexError:
                 return 0
 
@@ -400,7 +400,7 @@ class TrackedTable(object):
         else:
             change_idx = change_index.ChangeIndex(lsn, seqval, operation_id)
 
-        extra_headers: Dict[str, str] = {}
+        extra_headers: Dict[str, str | bytes] = {}
 
         for ix, max_length in self.truncate_indexes.items():
             # The '* 4' below is because that's the maximum possible byte length of a UTF-8 encoded character--just
