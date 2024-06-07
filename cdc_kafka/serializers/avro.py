@@ -574,7 +574,7 @@ class AvroSerializer(SerializerAbstract):
             arr.reverse()
             value_dict[constants.UPDATED_FIELDS_NAME] = list(itertools.compress(metadata.value_field_names, arr))
         else:
-            value_dict[constants.UPDATED_FIELDS_NAME] = metadata.value_field_names
+            value_dict[constants.UPDATED_FIELDS_NAME] = list(metadata.value_field_names)
 
         value_dict[constants.EVENT_TIME_NAME] = row.event_db_time.isoformat()
         dates_transformed = {k: v.isoformat() for k, v in value_dict.items() if type(v) is datetime.datetime}
