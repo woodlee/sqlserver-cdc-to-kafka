@@ -335,7 +335,7 @@ def ddl_change_requires_new_snapshot(db_conn: pyodbc.Connection, old_capture_ins
                     for (ddl_command, age_seconds) in cursor.fetchall():
                         match = alter_re.match(ddl_command)
                         if match and match.groupdict().get('column'):
-                            col_name_lower = match.groupdict()['column'].lower()
+                            col_name_lower = match.groupdict()['column'].lower().strip('[]')
                             if age_seconds > constants.MAX_AGE_TO_PRESUME_ADDED_COL_IS_NULL_SECONDS:
                                 cols_with_too_old_changes.add(col_name_lower)
                             else:
