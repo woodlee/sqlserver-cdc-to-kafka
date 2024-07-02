@@ -1,6 +1,6 @@
 import abc
 import datetime
-from typing import List, Any, Dict, Optional
+from typing import List, Optional
 
 import confluent_kafka
 import pyodbc
@@ -28,12 +28,13 @@ class AccumulatorAbstract(abc.ABC):
     def register_db_query(self, seconds_elapsed: float, db_query_kind: str, retrieved_row_count: int) -> None: pass
 
     @abc.abstractmethod
-    def register_kafka_produce(self, seconds_elapsed: float, original_value: Optional[Dict[str, Any]],
-                               message_type: str) -> None: pass
+    def register_kafka_produce(self, seconds_elapsed: float, message_type: str,
+                               event_datetime: Optional[datetime.datetime] = None, change_lsn: Optional[bytes] = None,
+                               operation_id: Optional[int] = None) -> None: pass
 
     @abc.abstractmethod
-    def kafka_delivery_callback(self, message_type: str, message: confluent_kafka.Message,
-                                original_key: Dict[str, Any], original_value: Optional[Dict[str, Any]]) -> None: pass
+    def kafka_delivery_callback(self, message: confluent_kafka.Message,
+                                event_datetime: datetime.datetime) -> None: pass
 
 
 class NoopAccumulator(AccumulatorAbstract):
@@ -42,10 +43,11 @@ class NoopAccumulator(AccumulatorAbstract):
     def register_sleep(self, sleep_time_seconds: float) -> None: pass
     def register_db_query(self, seconds_elapsed: float, db_query_kind: str, retrieved_row_count: int) -> None: pass
 
-    def register_kafka_produce(self, seconds_elapsed: float, original_value: Optional[Dict[str, Any]],
-                               message_type: str) -> None: pass
-    def kafka_delivery_callback(self, message_type: str, message: confluent_kafka.Message,
-                                original_key: Dict[str, Any], original_value: Optional[Dict[str, Any]]) -> None: pass
+    def register_kafka_produce(self, seconds_elapsed: float, message_type: str,
+                               event_datetime: Optional[datetime.datetime] = None, change_lsn: Optional[bytes] = None,
+                               operation_id: Optional[int] = None) -> None: pass
+    def kafka_delivery_callback(self, message: confluent_kafka.Message,
+                                event_datetime: datetime.datetime) -> None: pass
 
 
 class Accumulator(AccumulatorAbstract):
@@ -75,8 +77,8 @@ class Accumulator(AccumulatorAbstract):
         self._db_snapshot_queries_count: int = 0
         self._db_snapshot_queries_total_time_sec: float = 0
         self._db_snapshot_rows_retrieved_count: int = 0
-        self._change_lsns_produced: sortedcontainers.SortedList = sortedcontainers.SortedList()
-        self._change_db_tran_end_times_produced: sortedcontainers.SortedList = sortedcontainers.SortedList()
+        self._change_lsns_produced: sortedcontainers.SortedList[bytes] = sortedcontainers.SortedList()
+        self._change_db_tran_end_times_produced: sortedcontainers.SortedList[datetime.datetime] = sortedcontainers.SortedList()
         self._e2e_latencies_sec: List[float] = []
         self._kafka_produces_total_time_sec: float = 0
         self._kafka_delivery_acks_count: int = 0
@@ -115,12 +117,12 @@ class Accumulator(AccumulatorAbstract):
         m.interval_delta_sec = interval_delta_sec
 
         m.earliest_change_lsn_produced = \
-            (self._change_lsns_produced and self._change_lsns_produced[0]) or None
+            (self._change_lsns_produced and f'0x{self._change_lsns_produced[0].hex()}') or None
         m.earliest_change_db_tran_end_time_produced = \
             (self._change_db_tran_end_times_produced and self._change_db_tran_end_times_produced[0]) \
             or None
         m.latest_change_lsn_produced = \
-            (self._change_lsns_produced and self._change_lsns_produced[-1]) or None
+            (self._change_lsns_produced and f'0x{self._change_lsns_produced[-1].hex()}') or None
         m.latest_change_db_tran_end_time_produced = \
             (self._change_db_tran_end_times_produced and self._change_db_tran_end_times_produced[-1]) \
             or None
@@ -193,8 +195,9 @@ class Accumulator(AccumulatorAbstract):
         else:
             raise Exception(f'Accumulator.register_db_query does not recognize db_query_kind "{db_query_kind}".')
 
-    def register_kafka_produce(self, seconds_elapsed: float, original_value: Optional[Dict[str, Any]],
-                               message_type: str) -> None:
+    def register_kafka_produce(self, seconds_elapsed: float, message_type: str,
+                               event_datetime: Optional[datetime.datetime] = None, change_lsn: Optional[bytes] = None,
+                               operation_id: Optional[int] = None) -> None:
         self._kafka_produces_total_time_sec += seconds_elapsed
 
         if message_type in (constants.CHANGE_PROGRESS_MESSAGE, constants.SNAPSHOT_PROGRESS_MESSAGE,
@@ -206,34 +209,28 @@ class Accumulator(AccumulatorAbstract):
             self._messages_copied_to_unified_topics += 1
         elif message_type == constants.SINGLE_TABLE_SNAPSHOT_MESSAGE:
             self._produced_snapshot_records_count += 1
-        elif message_type == constants.SINGLE_TABLE_CHANGE_MESSAGE and original_value:
-            self._change_lsns_produced.add(original_value[constants.LSN_NAME])
-            self._change_db_tran_end_times_produced.add(original_value[constants.EVENT_TIME_NAME])
-            operation_name = original_value[constants.OPERATION_NAME]
-            if operation_name == constants.DELETE_OPERATION_NAME:
+        elif message_type == constants.SINGLE_TABLE_CHANGE_MESSAGE:
+            if change_lsn:
+                self._change_lsns_produced.add(change_lsn)
+            if event_datetime:
+                self._change_db_tran_end_times_produced.add(event_datetime)
+            if operation_id == constants.DELETE_OPERATION_ID:
                 self._produced_delete_changes_count += 1
-            elif operation_name == constants.INSERT_OPERATION_NAME:
+            elif operation_id == constants.INSERT_OPERATION_ID:
                 self._produced_insert_changes_count += 1
-            elif operation_name == constants.POST_UPDATE_OPERATION_NAME:
+            elif operation_id == constants.POST_UPDATE_OPERATION_ID:
                 self._produced_update_changes_count += 1
             else:
-                raise Exception(f'Accumulator.register_kafka_produce does not recognize operation name: '
-                                f'"{operation_name}".')
+                raise Exception(f'Accumulator.register_kafka_produce does not recognize operation ID: '
+                                f'"{operation_id}".')
         elif message_type == constants.SNAPSHOT_LOGGING_MESSAGE:
             pass
         else:
             raise Exception(f'Accumulator.register_kafka_produce does not recognize message type: "{message_type}".')
 
-    def kafka_delivery_callback(self, message_type: str, message: confluent_kafka.Message,
-                                original_key: Optional[Dict[str, Any]],
-                                original_value: Optional[Dict[str, Any]]) -> None:
+    def kafka_delivery_callback(self, message: confluent_kafka.Message,
+                                event_datetime: datetime.datetime) -> None:
         self._kafka_delivery_acks_count += 1
-
-        if message_type not in (constants.SINGLE_TABLE_CHANGE_MESSAGE, constants.UNIFIED_TOPIC_CHANGE_MESSAGE):
-            return
-
-        if not original_value:
-            return
 
         timestamp_type, timestamp = message.timestamp()
         if timestamp_type != confluent_kafka.TIMESTAMP_CREATE_TIME:
@@ -241,7 +238,6 @@ class Accumulator(AccumulatorAbstract):
         else:
             produce_datetime = datetime.datetime.fromtimestamp(timestamp / 1000.0, datetime.UTC).replace(tzinfo=None)
 
-        event_time = datetime.datetime.fromisoformat(original_value[constants.EVENT_TIME_NAME])
-        db_commit_time = self._clock_syncer.db_time_to_utc(event_time)
+        db_commit_time = self._clock_syncer.db_time_to_utc(event_datetime)
         e2e_latency = (produce_datetime - db_commit_time).total_seconds()
         self._e2e_latencies_sec.append(e2e_latency)

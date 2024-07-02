@@ -2,7 +2,6 @@ import argparse
 import importlib
 import os
 from abc import ABC, abstractmethod
-
 from typing import TypeVar, Type, Tuple, Optional
 
 KafkaOauthProviderAbstractType = TypeVar('KafkaOauthProviderAbstractType', bound='KafkaOauthProviderAbstract')

@@ -1,7 +1,6 @@
 import argparse
 import datetime
 from abc import ABC, abstractmethod
-
 from typing import TYPE_CHECKING, Optional, TypeVar, Type
 
 if TYPE_CHECKING:

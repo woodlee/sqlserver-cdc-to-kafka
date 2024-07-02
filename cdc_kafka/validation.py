@@ -6,9 +6,8 @@ import logging
 from typing import List, Iterable, Dict, Tuple, Any, Optional, TYPE_CHECKING, Set, Mapping, Sequence
 from uuid import UUID
 
-import confluent_kafka
-
 from . import constants, change_index, kafka, helpers
+from .serializers import SerializerAbstract, DeserializedMessage
 
 if TYPE_CHECKING:
     from . import tracked_tables, progress_tracking
@@ -42,7 +41,7 @@ class SQLServerUUID(object):
         return str(self.uuid).upper()
 
 
-def extract_key_tuple(table: 'tracked_tables.TrackedTable', message: Mapping[str, str | int]) -> Tuple[Any, ...]:
+def extract_key_tuple(table: 'tracked_tables.TrackedTable', message: Mapping[str, Any]) -> Tuple[Any, ...]:
     key_bits: List[Any] = []
     for kf in table.key_fields:
         if kf.sql_type_name == 'uniqueidentifier':
@@ -107,25 +106,37 @@ class TableMessagesSummary(object):
             'missing_offsets': self.missing_offsets,
         })
 
-    def process_message(self, message: confluent_kafka.Message) -> None:
+    def process_message(self, message: DeserializedMessage) -> None:
         self.total_count += 1
+        raw_partition = message.raw_msg.partition()
+        if raw_partition is None:
+            raise Exception('Unexpected state: None value for message partition.')
+        else:
+            partition: int = raw_partition
 
-        if message.partition() not in self._last_processed_offset_by_partition:
-            self._last_processed_offset_by_partition[message.partition()] = -1
+        raw_offset = message.raw_msg.offset()
+        if raw_offset is None:
+            raise Exception('Unexpected state: None value for message offset.')
+        else:
+            offset: int = raw_offset
 
-        self.missing_offsets += (message.offset() - self._last_processed_offset_by_partition[message.partition()] - 1)
-        self._last_processed_offset_by_partition[message.partition()] = message.offset()
+        if partition not in self._last_processed_offset_by_partition:
+            self._last_processed_offset_by_partition[partition] = -1
+
+        self.missing_offsets += (offset - self._last_processed_offset_by_partition[partition] - 1)
+        self._last_processed_offset_by_partition[partition] = offset
 
         # noinspection PyArgumentList
-        if message.value() is None:
+        if not message.raw_msg.value():
             self.tombstone_count += 1
             return
 
-        # noinspection PyTypeChecker,PyArgumentList
-        message_body = dict(message.value())
-        key = extract_key_tuple(self.table, message_body)
-        coordinates = helpers.format_coordinates(message)
-        operation_name = message_body[constants.OPERATION_NAME]
+        if message.value_dict is None:
+            raise Exception('Unexpected state')
+
+        key = extract_key_tuple(self.table, message.value_dict)
+        coordinates = helpers.format_coordinates(message.raw_msg)
+        operation_name = message.value_dict[constants.OPERATION_NAME]
 
         if operation_name == constants.SNAPSHOT_OPERATION_NAME:
             self.snapshot_count += 1
@@ -134,19 +145,19 @@ class TableMessagesSummary(object):
                 self.min_snapshot_key_seen = key
             if self.max_snapshot_key_seen is None or key > self.max_snapshot_key_seen:
                 self.max_snapshot_key_seen = key
-            if message.partition() in self._last_snapshot_key_seen_for_partition and \
-                    self._last_snapshot_key_seen_for_partition[message.partition()] < key:
+            if partition in self._last_snapshot_key_seen_for_partition and \
+                    self._last_snapshot_key_seen_for_partition[partition] < key:
                 self.snapshot_key_order_regressions_count += 1
                 logger.debug(
                     "Snapshot key order regression for %s: value %s at coordinates %s --> value %s at coordinates %s",
                     self.table.fq_name,
-                    self._last_snapshot_key_seen_for_partition[message.partition()],
-                    self._last_snapshot_coordinates_seen_for_partition[message.partition()],
+                    self._last_snapshot_key_seen_for_partition[partition],
+                    self._last_snapshot_coordinates_seen_for_partition[partition],
                     key,
                     coordinates
                 )
-            self._last_snapshot_coordinates_seen_for_partition[message.partition()] = coordinates
-            self._last_snapshot_key_seen_for_partition[message.partition()] = key
+            self._last_snapshot_coordinates_seen_for_partition[partition] = coordinates
+            self._last_snapshot_key_seen_for_partition[partition] = key
             return
 
         if operation_name == constants.DELETE_OPERATION_NAME:
@@ -155,7 +166,7 @@ class TableMessagesSummary(object):
 
         self.keys_seen_in_changes.add(key)
 
-        msg_change_index = change_index.ChangeIndex.from_avro_ready_dict(message_body)
+        msg_change_index = change_index.ChangeIndex.from_dict(message.value_dict)
         if msg_change_index.lsn < self.table.min_lsn:
             # the live change table has been truncated and no longer has this entry
             return
@@ -170,17 +181,17 @@ class TableMessagesSummary(object):
             self.unknown_operation_count += 1
             return
 
-        change_idx = change_index.ChangeIndex.from_avro_ready_dict(message_body)
+        change_idx = change_index.ChangeIndex.from_dict(message.value_dict)
         if self.min_change_index_seen is None or change_idx < self.min_change_index_seen:
             self.min_change_index_seen = change_idx
         if self.max_change_index_seen is None or change_idx > self.max_change_index_seen:
             self.max_change_index_seen = change_idx
-            self.max_change_index_seen_coordinates = helpers.format_coordinates(message)
-        if message.partition() in self._last_change_index_seen_for_partition and \
-                self._last_change_index_seen_for_partition[message.partition()] > change_idx:
+            self.max_change_index_seen_coordinates = helpers.format_coordinates(message.raw_msg)
+        if partition in self._last_change_index_seen_for_partition and \
+                self._last_change_index_seen_for_partition[partition] > change_idx:
             self.change_index_order_regressions_count += 1
-        self._last_change_index_seen_for_partition[message.partition()] = change_idx
-        event_time = datetime.datetime.fromisoformat(message_body[constants.EVENT_TIME_NAME])
+        self._last_change_index_seen_for_partition[partition] = change_idx
+        event_time = datetime.datetime.fromisoformat(message.value_dict[constants.EVENT_TIME_NAME])
         if self.latest_change_seen is None or event_time > self.latest_change_seen:
             self.latest_change_seen = event_time
         return
@@ -188,11 +199,12 @@ class TableMessagesSummary(object):
 
 class Validator(object):
     def __init__(self, kafka_client: 'kafka.KafkaClient', tables: Iterable['tracked_tables.TrackedTable'],
-                 progress_tracker: 'progress_tracking.ProgressTracker',
+                 progress_tracker: 'progress_tracking.ProgressTracker', serializer: SerializerAbstract,
                  unified_topic_to_tables_map: Dict[str, List['tracked_tables.TrackedTable']]) -> None:
         self._kafka_client: 'kafka.KafkaClient' = kafka_client
         self._tables_by_name: Dict[str, 'tracked_tables.TrackedTable'] = {t.fq_name: t for t in tables}
         self._progress_tracker: 'progress_tracking.ProgressTracker' = progress_tracker
+        self._serializer: SerializerAbstract = serializer
         self._unified_topic_to_tables_map: Dict[str, List['tracked_tables.TrackedTable']] = unified_topic_to_tables_map
 
     def run(self) -> None:
@@ -214,13 +226,13 @@ class Validator(object):
                 unified_topic_name, unified_topic_tables, watermarks_by_topic[unified_topic_name])
 
         total_tables = len(self._tables_by_name)
-        for table_name, table in self._tables_by_name.items():
-            logger.info('Processing table %s (%d/%d)', table_name, len(summaries_by_single_table) + 1, total_tables)
-            summaries_by_single_table[table_name] = self._process_single_table_topic(
+        for source_topic_name, table in self._tables_by_name.items():
+            logger.info('Processing table %s (%d/%d)', source_topic_name, len(summaries_by_single_table) + 1, total_tables)
+            summaries_by_single_table[source_topic_name] = self._process_single_table_topic(
                 table, watermarks_by_topic[table.topic_name])
 
-        for table_name, summary in summaries_by_single_table.items():
-            table = self._tables_by_name[table_name]
+        for source_topic_name, summary in summaries_by_single_table.items():
+            table = self._tables_by_name[source_topic_name]
             failures, warnings, infos = [], [], []
 
             progress_entry = progress.get((table.topic_name, constants.SNAPSHOT_ROWS_KIND))
@@ -331,16 +343,16 @@ class Validator(object):
                 failures.append(f'Found {db_update_rows} update entries in DB change table but {summary.update_count} '
                                 f'in Kafka topic')
 
-            print(f'\nSummary for table {table_name} in single-table topic {table.topic_name}:')
+            print(f'\nSummary for table {source_topic_name} in single-table topic {table.topic_name}:')
             for info in infos:
-                print(f'    INFO: {info} ({table_name})')
+                print(f'    INFO: {info} ({source_topic_name})')
             if not (warnings or failures):
-                print(f'    OK: No problems! ({table_name})')
+                print(f'    OK: No problems! ({source_topic_name})')
             else:
                 for warning in warnings:
-                    print(f'    WARN: {warning} ({table_name})')
+                    print(f'    WARN: {warning} ({source_topic_name})')
                 for failure in failures:
-                    print(f'    FAIL: {failure} ({table_name})')
+                    print(f'    FAIL: {failure} ({source_topic_name})')
 
             if failures:
                 db_data = json.dumps({
@@ -358,24 +370,24 @@ class Validator(object):
             warnings = ut_result['warnings']
             failures = ut_result['failures']
 
-            for table_name, table_summary in ut_result['table_summaries'].items():
+            for source_topic_name, table_summary in ut_result['table_summaries'].items():
                 if table_summary.latest_change_seen is None:
-                    warnings.append(f'For table {table_name}: No change entries found!')
+                    warnings.append(f'For source topic {source_topic_name}: No change entries found!')
                 elif (helpers.naive_utcnow() - table_summary.latest_change_seen) > datetime.timedelta(days=1):
-                    warnings.append(f'For table {table_name}: Last change entry seen in Kafka was dated '
+                    warnings.append(f'For source topic {source_topic_name}: Last change entry seen in Kafka was dated '
                                     f'{table_summary.latest_change_seen}.')
                 if table_summary.change_index_order_regressions_count:
                     failures.append(
-                        f'For table {table_name}: Kafka topic contained '
+                        f'For source topic {source_topic_name}: Kafka topic contained '
                         f'{table_summary.change_index_order_regressions_count} regressions in change index ordering.')
                 if table_summary.unknown_operation_count:
                     failures.append(
-                        f'For table {table_name}: Topic contained {table_summary.unknown_operation_count} messages '
-                        f'with an unknown operation type.')
+                        f'For source topic {source_topic_name}: Topic contained {table_summary.unknown_operation_count} '
+                        f'messages with an unknown operation type.')
                 if table_summary.snapshot_count:
                     failures.append(
-                        f'For table {table_name}: Topic contained {table_summary.snapshot_count} unexpected snapshot '
-                        f'records.')
+                        f'For source topic {source_topic_name}: Topic contained {table_summary.snapshot_count} '
+                        f'unexpected snapshot records.')
 
             for warning in warnings:
                 print(f'    WARN: {warning}')
@@ -389,7 +401,8 @@ class Validator(object):
         for msg in self._kafka_client.consume_bounded(
                 table.topic_name, constants.VALIDATION_MAXIMUM_SAMPLE_SIZE_PER_TOPIC, captured_watermarks):
             msg_count += 1
-            table_summary.process_message(msg)
+            deser_msg = self._serializer.deserialize(msg)
+            table_summary.process_message(deser_msg)
         logger.info('Validation: consumed %s records from topic %s', msg_count, table.topic_name)
         return table_summary
 
@@ -397,7 +410,7 @@ class Validator(object):
                                captured_watermarks: List[Tuple[int, int]]) -> Dict[str, Any]:
         logger.info('Validation: consuming records from unified topic %s', topic_name)
 
-        table_summaries: Dict[str, TableMessagesSummary] = {t.fq_name: TableMessagesSummary(t) for t in expected_tables}
+        table_summaries: Dict[str, TableMessagesSummary] = {t.topic_name: TableMessagesSummary(t) for t in expected_tables}
         warnings: List[str] = []
         failures: List[str] = []
         sample_regression_indices: List[str] = []
@@ -412,16 +425,27 @@ class Validator(object):
         for msg in self._kafka_client.consume_bounded(
                 topic_name, constants.VALIDATION_MAXIMUM_SAMPLE_SIZE_PER_TOPIC, captured_watermarks):
             total_messages_read += 1
+            deser_msg = self._serializer.deserialize(msg)
 
             # noinspection PyArgumentList
-            if msg.value() is None:
+            if not msg.value():
                 tombstones_count += 1
                 continue
 
             # noinspection PyTypeChecker,PyArgumentList
-            msg_val = dict(msg.value())
-            msg_table = msg_val.pop('__avro_schema_name').replace('_cdc__value', '').replace('_', '.', 1)
-            msg_change_index = change_index.ChangeIndex.from_avro_ready_dict(msg_val)
+            raw_headers = msg.headers()
+            if raw_headers is None:
+                raise Exception('Unexpected state: Headers missing from unified topic message')
+            msg_table_topic_raw = dict(raw_headers)['cdc_to_kafka_original_topic']
+            if type(msg_table_topic_raw) is str:
+                msg_table_topic = msg_table_topic_raw
+            elif type(msg_table_topic_raw) is bytes:
+                msg_table_topic = msg_table_topic_raw.decode('utf-8')
+            else:
+                raise Exception("Unexpected data type in headers")
+            if deser_msg.value_dict is None:
+                raise Exception('Unexpected state: Missing value_dict from unified topic message')
+            msg_change_index = change_index.ChangeIndex.from_dict(deser_msg.value_dict)
 
             if prior_read_change_index is not None and prior_read_change_index > msg_change_index:
                 if len(sample_regression_indices) < 10:
@@ -431,13 +455,13 @@ class Validator(object):
                     lsn_regressions_count += 1
 
             prior_read_change_index = msg_change_index
-            prior_read_partition = msg.partition()
-            prior_read_offset = msg.offset()
+            prior_read_partition = msg.partition() or prior_read_partition
+            prior_read_offset = msg.offset() or prior_read_offset
 
-            if msg_table in table_summaries:
-                table_summaries[msg_table].process_message(msg)
+            if msg_table_topic in table_summaries:
+                table_summaries[msg_table_topic].process_message(deser_msg)
             else:
-                unexpected_table_msg_counts[msg_table] += 1
+                unexpected_table_msg_counts[msg_table_topic] += 1
 
         if lsn_regressions_count:
             failures.append(f'{lsn_regressions_count} LSN ordering regressions encountered, with examples '
@@ -447,7 +471,7 @@ class Validator(object):
             failures.append(f'{tombstones_count} unexpected deletion tombstones encountered')
 
         if unexpected_table_msg_counts:
-            warnings.append(f'Topic contained messages from unanticipated source tables: '
+            warnings.append(f'Topic contained messages from unanticipated source topics: '
                             f'{json.dumps(unexpected_table_msg_counts)}')
 
         return {

@@ -3,11 +3,11 @@ import importlib
 import json
 import os
 import socket
+from typing import Tuple, List, Optional, Callable
 
-from typing import Tuple, List
 from . import constants, kafka_oauth
 from .metric_reporting import reporter_base
-
+from .serializers import SerializerAbstract
 
 # String constants for options with discrete choices:
 CAPTURE_INSTANCE_VERSION_STRATEGY_REGEX = 'regex'
@@ -15,6 +15,8 @@ CAPTURE_INSTANCE_VERSION_STRATEGY_CREATE_DATE = 'create_date'
 LSN_GAP_HANDLING_RAISE_EXCEPTION = 'raise_exception'
 LSN_GAP_HANDLING_BEGIN_NEW_SNAPSHOT = 'begin_new_snapshot'
 LSN_GAP_HANDLING_IGNORE = 'ignore'
+NEW_FOLLOW_START_POINT_EARLIEST = 'earliest'
+NEW_FOLLOW_START_POINT_LATEST = 'latest'
 NEW_CAPTURE_INSTANCE_SNAPSHOT_HANDLING_BEGIN_NEW = 'begin_new_snapshot'
 NEW_CAPTURE_INSTANCE_SNAPSHOT_HANDLING_IGNORE = 'ignore'
 NEW_CAPTURE_INSTANCE_OVERLAP_HANDLING_REPUBLISH = 'republish_from_new_instance'
@@ -32,7 +34,9 @@ def str2bool(v: str) -> bool:
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
 
-def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List[reporter_base.ReporterBase]]:
+def get_options_and_metrics_reporters(
+        arg_adder: Optional[Callable[[argparse.ArgumentParser, ], None]] = None) -> Tuple[
+            argparse.Namespace, List[reporter_base.ReporterBase], SerializerAbstract]:
     p = argparse.ArgumentParser()
 
     # Required
@@ -43,10 +47,6 @@ def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List[report
     p.add_argument('--kafka-bootstrap-servers',
                    default=os.environ.get('KAFKA_BOOTSTRAP_SERVERS'),
                    help='Host and port for your Kafka cluster, e.g. "localhost:9092"')
-
-    p.add_argument('--schema-registry-url',
-                   default=os.environ.get('SCHEMA_REGISTRY_URL'),
-                   help='URL to your Confluent Schema Registry, e.g. "http://localhost:8081"')
 
     p.add_argument('--kafka-transactional-id',
                    default=os.environ.get('KAFKA_TRANSACTIONAL_ID'),
@@ -153,6 +153,18 @@ def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List[report
                         f"the LSN of the latest change published to Kafka. Defaults to "
                         f"`{LSN_GAP_HANDLING_RAISE_EXCEPTION}`")
 
+    p.add_argument('--new-follow-start-point',
+                   choices=(NEW_FOLLOW_START_POINT_EARLIEST, NEW_FOLLOW_START_POINT_LATEST),
+                   default=os.environ.get('NEW_FOLLOW_START_POINT', NEW_FOLLOW_START_POINT_LATEST),
+                   help=f"Controls how much change data history to read from SQL Server capture tables, for any tables "
+                        f"that are being followed by this process for the first time. Value "
+                        f"`{NEW_FOLLOW_START_POINT_EARLIEST}` will pull all existing data from the capture tables; "
+                        f"value `{NEW_FOLLOW_START_POINT_EARLIEST}` will only process change data added after this "
+                        f"process starts following the table. Note that use of `{NEW_FOLLOW_START_POINT_EARLIEST}` "
+                        f"with unified topics may lead to LSN regressions in the sequence of unified topic messages "
+                        f"in the case where new tables are added to a previously-tracked set. This setting does not "
+                        f"affect the behavior of table snapshots. Defaults to `{NEW_FOLLOW_START_POINT_LATEST}`")
+
     p.add_argument('--unified-topics',
                    default=os.environ.get('UNIFIED_TOPICS', {}), type=json.loads,
                    help=f'A string that is a JSON object mapping topic names to various configuration parameters as '
@@ -202,6 +214,12 @@ def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List[report
                    help="Runs count validations between messages in the Kafka topic and rows in the change and "
                         "source tables, then quits. Respects the table inclusion/exclusion regexes.")
 
+    p.add_argument('--message-serializer',
+                   default=os.environ.get('MESSAGE_SERIALIZER',
+                                          'cdc_kafka.serializers.avro.AvroSerializer'),
+                   help="The serializer class (from this project's `serializers` module) used to serialize messages"
+                        "sent to Kafka.")
+
     p.add_argument('--metrics-reporters',
                    default=os.environ.get('METRICS_REPORTERS',
                                           'cdc_kafka.metric_reporting.stdout_reporter.StdoutReporter'),
@@ -235,20 +253,13 @@ def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List[report
     p.add_argument('--truncate-fields',
                    default=os.environ.get('TRUNCATE_FIELDS', {}), type=json.loads,
                    help='Optional JSON object that maps schema.table.column names to an integer max number of '
-                        'characters that should be copied into the Kafka message for that field\'s values. The schema, '
-                        'table, and column names are case-insensitive. Example: `{"dbo.order.gift_note": 65536}`. '
-                        'Note that this truncates based on _character_ length, not _byte_ length!')
-
-    p.add_argument('--avro-type-spec-overrides',
-                   default=os.environ.get('AVRO_TYPE_SPEC_OVERRIDES', {}), type=json.loads,
-                   help='Optional JSON object that maps schema.table.column names to a string or object indicating the '
-                        'Avro schema type specification you want to use for the field. This will override the default '
-                        'mapping of SQL types to Avro types otherwise used and found in avro.py. Note that setting '
-                        'this only changes the generated schema and will NOT affect the way values are passed to the '
-                        'Avro serialization library, so any overriding type specified should be compatible with the '
-                        'SQL/Python types of the actual data. Example: `{"dbo.order.orderid": "long"}` could be used '
-                        'to specify the use of an Avro `long` type for a source DB column that is only a 32-bit INT, '
-                        'perhaps in preparation for a future DB column change.')
+                        'UTF-8 encoded bytes that should be serialized into the Kafka message for that field\'s '
+                        'values. Only applicable to string types; will raise an exception if used for non-strings. '
+                        'Truncation respects UTF-8 character boundaries and will not break in the middle of 2- or '
+                        '4-byte characters. The schema, table, and column names are case-insensitive. Example: '
+                        '`{"dbo.order.gift_note": 65536}`. When a field is truncated via this mechanism, a Kafka '
+                        'message header of the form key: `cdc_to_kafka_truncated_field__<column_name>`, value '
+                        '`<original_byte_length>,<truncated_byte_length>` will be added to the message.')
 
     p.add_argument('--terminate-on-capture-instance-change',
                    type=str2bool, nargs='?', const=True,
@@ -268,25 +279,14 @@ def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List[report
                         "then exits without changing any state. Can be handy for validating other configuration such "
                         "as the regexes used to control which tables are followed and/or snapshotted.")
 
-    p.add_argument('--always-use-avro-longs',
-                   type=str2bool, nargs='?', const=True,
-                   default=str2bool(os.environ.get('ALWAYS_USE_AVRO_LONGS', '0')),
-                   help="Defaults to False. If set to True, Avro schemas produced/registered by this process will "
-                        "use the Avro `long` type instead of the `int` type for fields corresponding to SQL Server "
-                        "INT, SMALLINT, or TINYINT columns. This can be used to future-proof in cases where the column "
-                        "size may need to be upgraded in the future, at the potential cost of increased storage or "
-                        "memory space needs in consuming processes. Note that if this change is made for existing "
-                        "topics, the schema registration attempt will violate Avro FORWARD compatibility checks (the "
-                        "default used by this process), meaning that you may need to manually override the schema "
-                        "registry compatibility level for any such topics first.")
-
     p.add_argument('--db-row-batch-size',
                    type=int,
                    default=os.environ.get('DB_ROW_BATCH_SIZE', 2000),
                    help="Maximum number of rows to retrieve in a single change data or snapshot query. Default 2000.")
 
     kafka_oauth.add_kafka_oauth_arg(p)
-
+    if arg_adder:
+        arg_adder(p)
     opts, _ = p.parse_known_args()
 
     reporter_classes: List[reporter_base.ReporterBase] = []
@@ -305,4 +305,12 @@ def get_options_and_metrics_reporters() -> Tuple[argparse.Namespace, List[report
         for reporter_class in reporter_classes:
             reporters.append(reporter_class.construct_with_options(opts))
 
-    return opts, reporters
+    package_module, class_name = opts.message_serializer.rsplit('.', 1)
+    module = importlib.import_module(package_module)
+    serializer_class: SerializerAbstract = getattr(module, class_name)
+    serializer_class.add_arguments(p)
+    opts, _ = p.parse_known_args()
+    disable_writes: bool = opts.run_validations or opts.report_progress_only
+    serializer = serializer_class.construct_with_options(opts, disable_writes)
+
+    return opts, reporters, serializer

@@ -44,14 +44,15 @@ import socket
 import time
 from datetime import datetime, UTC
 from multiprocessing.synchronize import Event as EventClass
-from typing import Set, Any, List, Dict, Tuple, NamedTuple
+from typing import Set, Any, List, Dict, Tuple, NamedTuple, Optional
 
-import ctds
+import ctds  # type: ignore[import-untyped]
 from confluent_kafka import Consumer, KafkaError, TopicPartition, Message, OFFSET_BEGINNING
+from confluent_kafka.admin import TopicMetadata
 from confluent_kafka.serialization import SerializationContext, MessageField
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroDeserializer
-from faster_fifo import Queue
+from faster_fifo import Queue  # type: ignore[import-not-found]
 
 from cdc_kafka import kafka_oauth
 
@@ -246,6 +247,8 @@ def main() -> None:
                    default=os.environ.get('TARGET_DB_TABLE_NAME'))
     p.add_argument('--cols-to-not-sync',
                    default=os.environ.get('COLS_TO_NOT_SYNC', ''))
+    p.add_argument('--primary-key-fields-override',
+                   default=os.environ.get('PRIMARY_KEY_FIELDS_OVERRIDE', ''))
     p.add_argument('--progress-tracking-namespace',
                    default=os.environ.get('PROGRESS_TRACKING_NAMESPACE', 'default'))
     p.add_argument('--progress-tracking-table-schema',
@@ -287,7 +290,7 @@ def main() -> None:
     delete_temp_table_name: str = temp_table_base_name + '_delete'
     merge_temp_table_name: str = temp_table_base_name + '_merge'
     cols_to_not_sync: set[str] = set([c.strip().lower() for c in opts.cols_to_not_sync.split(',')])
-    cols_to_not_sync.remove('')
+    cols_to_not_sync.discard('')
     proc_id: str = f'{socket.getfqdn()}+{int(datetime.now().timestamp())}'
     stop_event: EventClass = mp.Event()
     # For faster_fifo the ctor arg here is the queue byte size, not its item count size:
@@ -305,15 +308,19 @@ def main() -> None:
                     target=consumer_process, name='consumer', args=(opts, stop_event, queue, progress, proc_id, logger))
                 consumer_subprocess.start()
 
-                cursor.execute(f'''
-SELECT [COLUMN_NAME]
-FROM [INFORMATION_SCHEMA].[KEY_COLUMN_USAGE]
-WHERE OBJECTPROPERTY(OBJECT_ID([CONSTRAINT_SCHEMA] + '.' + QUOTENAME([CONSTRAINT_NAME])), 'IsPrimaryKey') = 1
-AND [TABLE_SCHEMA] = :0 
-AND [TABLE_NAME] = :1
-ORDER BY [ORDINAL_POSITION]
-                ''', (opts.target_db_table_schema, opts.target_db_table_name))
-                primary_key_field_names: List[str] = [r[0] for r in cursor.fetchall()]
+                primary_key_field_names: List[str]
+                if opts.primary_key_fields_override.strip():
+                    primary_key_field_names = [x.strip() for x in opts.primary_key_fields_override.split(',')]
+                else:
+                    cursor.execute(f'''
+    SELECT [COLUMN_NAME]
+    FROM [INFORMATION_SCHEMA].[KEY_COLUMN_USAGE]
+    WHERE OBJECTPROPERTY(OBJECT_ID([CONSTRAINT_SCHEMA] + '.' + QUOTENAME([CONSTRAINT_NAME])), 'IsPrimaryKey') = 1
+    AND [TABLE_SCHEMA] = :0
+    AND [TABLE_NAME] = :1
+    ORDER BY [ORDINAL_POSITION]
+                    ''', (opts.target_db_table_schema, opts.target_db_table_name))
+                    primary_key_field_names = [r[0] for r in cursor.fetchall()]
 
                 field_names: List[str] = []
                 datetime_field_names: set[str] = set()
@@ -442,7 +449,7 @@ TRUNCATE TABLE {merge_temp_table_name};
                             for _, (op, val) in queued_upserts.items():
                                 # CTDS unfortunately completely ignores values for target-table IDENTITY cols when doing
                                 # a bulk_insert, so in that case we have to fall back to the slower MERGE mechanism:
-                                if (not has_identity_col) and op in ('Snapshot', 'Insert'):
+                                if (not has_identity_col) and op == 'Insert':  # in ('Snapshot', 'Insert'): -- Snapshots can hit PK collisions! :(
                                     inserts.append(val)
                                 else:
                                     merges.append(val)
@@ -559,7 +566,12 @@ def consumer_process(opts: argparse.Namespace, stop_event: EventClass, queue: Qu
     start_offset_by_partition: Dict[int, int] = {
         p.source_topic_partition: p.last_handled_message_offset + 1 for p in progress
     }
-    partitions: List[int] = consumer.list_topics(topic=opts.replay_topic).topics[opts.replay_topic].partitions
+    topics_meta: Dict[str, TopicMetadata] | None = consumer.list_topics(
+        topic=opts.replay_topic).topics  # type: ignore[call-arg]
+    if topics_meta is None:
+        raise Exception(f'No partitions found for topic {opts.replay_topic}')
+    else:
+        partitions = list((topics_meta[opts.replay_topic].partitions or {}).keys())
     topic_partitions: List[TopicPartition] = [TopicPartition(
         opts.replay_topic, p, start_offset_by_partition.get(p, OFFSET_BEGINNING)
     ) for p in partitions]
@@ -580,19 +592,28 @@ def consumer_process(opts: argparse.Namespace, stop_event: EventClass, queue: Qu
         if msg_ctr % 5_000 == 0:
             logger.debug(f'Reached %s, apx queue depth %s', format_coordinates(msg), queue.qsize())
 
-        if msg.error():
+        err = msg.error()
+        if err:
             # noinspection PyProtectedMember
-            if msg.error().code() == KafkaError._PARTITION_EOF:
+            if err.code() == KafkaError._PARTITION_EOF:
                 break
             else:
                 raise Exception(msg.error())
 
-        # noinspection PyArgumentList,PyTypeChecker
-        msg_key: Dict[str, Any] = avro_deserializer(
-            msg.key(), SerializationContext(msg.topic(), MessageField.KEY))
-        # noinspection PyArgumentList,PyTypeChecker
-        msg_val: Dict[str, Any] = avro_deserializer(
-            msg.value(), SerializationContext(msg.topic(), MessageField.VALUE))
+        topic = msg.topic()
+        if topic is None:
+            raise Exception('Unexpected None value for message topic()')
+
+        msg_key: Optional[Dict[str, Any]] = None
+        raw_key = msg.key()
+        if raw_key is not None:
+            # noinspection PyNoneFunctionAssignment
+            msg_key = avro_deserializer(raw_key, SerializationContext(topic, MessageField.KEY))  # type: ignore[func-returns-value, arg-type]
+        msg_val: Optional[Dict[str, Any]] = None
+        raw_val = msg.value()
+        if raw_val is not None:
+            # noinspection PyNoneFunctionAssignment
+            msg_val = avro_deserializer(raw_val, SerializationContext(topic, MessageField.VALUE))  # type: ignore[func-returns-value, arg-type]
 
         queue.put((msg.partition(), msg.offset(), msg.timestamp()[1], msg_key, msg_val))
 

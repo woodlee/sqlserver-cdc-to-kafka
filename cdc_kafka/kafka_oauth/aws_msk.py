@@ -4,7 +4,7 @@ import logging
 import os
 from typing import Tuple, TypeVar, Type, Optional
 
-from aws_msk_iam_sasl_signer import MSKAuthTokenProvider
+from aws_msk_iam_sasl_signer import MSKAuthTokenProvider  # type: ignore[import-untyped]
 
 from . import KafkaOauthProviderAbstract
 

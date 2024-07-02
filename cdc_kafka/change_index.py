@@ -50,24 +50,24 @@ class ChangeIndex(object):
 
     # Converts from binary LSN/seqval to a string representation that is more friendly to some things that may
     # consume this data. The stringified form is also "SQL query ready" for pasting into SQL Server queries.
-    def to_avro_ready_dict(self) -> Dict[str, str]:
+    def as_dict(self) -> Dict[str, str]:
         return {
             constants.LSN_NAME: f'0x{self.lsn.hex()}',
             constants.SEQVAL_NAME: f'0x{self.seqval.hex()}',
             constants.OPERATION_NAME: constants.CDC_OPERATION_ID_TO_NAME[self.operation]
         }
 
+    @staticmethod
+    def from_dict(source_dict: Dict[str, Any]) -> 'ChangeIndex':
+        return ChangeIndex(
+            int(source_dict[constants.LSN_NAME][2:], 16).to_bytes(10, "big"),
+            int(source_dict[constants.SEQVAL_NAME][2:], 16).to_bytes(10, "big"),
+            constants.CDC_OPERATION_NAME_TO_ID[source_dict[constants.OPERATION_NAME]]
+        )
+
     @property
     def is_probably_heartbeat(self) -> bool:
         return self.seqval == HIGHEST_CHANGE_INDEX.seqval and self.operation == HIGHEST_CHANGE_INDEX.operation
-
-    @staticmethod
-    def from_avro_ready_dict(avro_dict: Dict[str, Any]) -> 'ChangeIndex':
-        return ChangeIndex(
-            int(avro_dict[constants.LSN_NAME][2:], 16).to_bytes(10, "big"),
-            int(avro_dict[constants.SEQVAL_NAME][2:], 16).to_bytes(10, "big"),
-            constants.CDC_OPERATION_NAME_TO_ID[avro_dict[constants.OPERATION_NAME]]
-        )
 
 
 LOWEST_CHANGE_INDEX = ChangeIndex(b'\x00' * 10, b'\x00' * 10, 0)

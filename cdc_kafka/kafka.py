@@ -1,18 +1,14 @@
 import collections
+import datetime
 import inspect
-import io
 import json
 import logging
 import socket
-import struct
 import time
 from types import TracebackType
-from typing import List, Dict, Tuple, Any, Callable, Generator, Optional, Iterable, Set, Type
+from typing import List, Dict, Tuple, Any, Generator, Optional, Set, Type
 
-from avro.schema import Schema
 import confluent_kafka.admin
-import confluent_kafka.avro
-import fastavro
 
 from . import constants, kafka_oauth
 
@@ -27,9 +23,8 @@ class KafkaClient(object):
     _instance = None
 
     def __init__(self, metrics_accumulator: 'accumulator.AccumulatorAbstract', bootstrap_servers: str,
-                 schema_registry_url: str, extra_kafka_consumer_config: Dict[str, str | int],
-                 extra_kafka_producer_config: Dict[str, str | int], disable_writing: bool = False,
-                 transactional_id: Optional[str] = None) -> None:
+                 extra_kafka_consumer_config: Dict[str, str | int], extra_kafka_producer_config: Dict[str, str | int],
+                 disable_writing: bool = False, transactional_id: Optional[str] = None) -> None:
         if KafkaClient._instance is not None:
             raise Exception('KafkaClient class should be used as a singleton.')
 
@@ -95,16 +90,7 @@ class KafkaClient(object):
             self._use_transactions = True
 
         self._producer: confluent_kafka.Producer = confluent_kafka.Producer(producer_config)
-        self._schema_registry: confluent_kafka.avro.CachedSchemaRegistryClient = \
-            confluent_kafka.avro.CachedSchemaRegistryClient(schema_registry_url)
         self._admin: confluent_kafka.admin.AdminClient = confluent_kafka.admin.AdminClient(admin_config)
-        self._avro_serializer: confluent_kafka.avro.MessageSerializer = \
-            confluent_kafka.avro.MessageSerializer(self._schema_registry)
-        self._avro_decoders: Dict[int, Callable[[io.BytesIO], Dict[str, Any]]] = dict()
-        self._schema_ids_to_names: Dict[int, str] = dict()
-        self._delivery_callbacks: Dict[str, List[Callable[
-            [str, confluent_kafka.Message, Optional[Dict[str, Any]], Optional[Dict[str, Any]]], None
-        ]]] = collections.defaultdict(list)
         self._disable_writing = disable_writing
         self._creation_warned_topic_names: Set[str] = set()
 
@@ -137,19 +123,13 @@ class KafkaClient(object):
         time.sleep(1)  # gives librdkafka threads more of a chance to exit properly before admin/producer are GC'd
         logger.info("Done.")
 
-    def register_delivery_callback(self, for_message_types: Iterable[str],
-                                   callback: Callable[[str, confluent_kafka.Message, Optional[Dict[str, Any]],
-                                                       Optional[Dict[str, Any]]], None]) -> None:
-        for message_type in for_message_types:
-            if message_type not in constants.ALL_KAFKA_MESSAGE_TYPES:
-                raise Exception('Unrecognized message type: %s', message_type)
-            self._delivery_callbacks[message_type].append(callback)
-
     # a return of None indicates the topic does not exist
     def get_topic_partition_count(self, topic_name: str) -> int:
+        if self._cluster_metadata.topics is None:
+            raise Exception('Unexpected state: no topic metadata')
         if topic_name not in self._cluster_metadata.topics:
             return 0
-        return len(self._cluster_metadata.topics[topic_name].partitions)
+        return len(self._cluster_metadata.topics[topic_name].partitions or [])
 
     def begin_transaction(self) -> None:
         if not self._use_transactions:
@@ -175,31 +155,24 @@ class KafkaClient(object):
                 logger.debug('Kafka transaction commit from %s', f'{previous_frame[0]}, line {previous_frame[1]}')
         self._producer.commit_transaction()
 
-    def produce(self, topic: str, key: Optional[Dict[str, Any]], key_schema_id: int, value: Optional[Dict[str, Any]],
-                value_schema_id: int, message_type: str, copy_to_unified_topics: Optional[List[str]] = None,
+    def produce(self, topic: str, key: Optional[bytes], value: Optional[bytes], message_type: str,
+                copy_to_unified_topics: Optional[List[str]] = None, event_datetime: Optional[datetime.datetime] = None,
+                change_lsn: Optional[bytes] = None, operation_id: Optional[int] = None,
                 extra_headers: Optional[Dict[str, str | bytes]] = None) -> None:
         if self._disable_writing:
             return
 
         start_time = time.perf_counter()
-        if key is None:
-            key_ser = None
-        else:
-            key_ser = self._avro_serializer.encode_record_with_schema_id(key_schema_id, key, True)
 
-        if value is None:  # a deletion tombstone probably
-            value_ser = None
+        if event_datetime:
+            delivery_cb = lambda _, msg: self._metrics_accumulator.kafka_delivery_callback(msg, event_datetime)
         else:
-            value_ser = self._avro_serializer.encode_record_with_schema_id(value_schema_id, value, False)
+            delivery_cb = None
 
         while True:
             try:
-                # the callback function receives the binary-serialized payload, so instead of specifying it
-                # directly as the delivery callback we wrap it in a lambda that also captures and passes the
-                # original not-yet-serialized key and value so that we don't have to re-deserialize it later:
                 self._producer.produce(
-                    topic=topic, value=value_ser, key=key_ser,
-                    on_delivery=lambda err, msg: self._delivery_callback(message_type, err, msg, key, value),
+                    topic=topic, value=value, key=key, on_delivery=delivery_cb,
                     headers={'cdc_to_kafka_message_type': message_type, **(extra_headers or {})}
                 )
                 break
@@ -210,8 +183,9 @@ class KafkaClient(object):
                 logger.error('The following exception occurred producing to topic %s', topic)
                 raise
 
-        elapsed = (time.perf_counter() - start_time)
-        self._metrics_accumulator.register_kafka_produce(elapsed, value, message_type)
+        elapsed = time.perf_counter() - start_time
+        self._metrics_accumulator.register_kafka_produce(elapsed, message_type, event_datetime,
+                                                         change_lsn, operation_id)
 
         if copy_to_unified_topics:
             for unified_topic in copy_to_unified_topics:
@@ -220,9 +194,7 @@ class KafkaClient(object):
                 while True:
                     try:
                         self._producer.produce(
-                            topic=unified_topic, value=value_ser, key=key_ser,
-                            on_delivery=lambda err, msg: self._delivery_callback(
-                                constants.UNIFIED_TOPIC_CHANGE_MESSAGE, err, msg, key, value),
+                            topic=unified_topic, value=value, key=key, on_delivery=delivery_cb,
                             headers={'cdc_to_kafka_message_type': constants.UNIFIED_TOPIC_CHANGE_MESSAGE,
                                      'cdc_to_kafka_original_topic': topic, **(extra_headers or {})}
                         )
@@ -234,8 +206,9 @@ class KafkaClient(object):
                         logger.error('The following exception occurred producing to topic %s', unified_topic)
                         raise
 
-                elapsed = (time.perf_counter() - start_time)
-                self._metrics_accumulator.register_kafka_produce(elapsed, value, constants.UNIFIED_TOPIC_CHANGE_MESSAGE)
+                elapsed = time.perf_counter() - start_time
+                self._metrics_accumulator.register_kafka_produce(elapsed, constants.UNIFIED_TOPIC_CHANGE_MESSAGE,
+                                                                 event_datetime, change_lsn, operation_id)
 
     def consume_all(self, topic_name: str) -> Generator[confluent_kafka.Message, None, None]:
         part_count = self.get_topic_partition_count(topic_name)
@@ -271,8 +244,9 @@ class KafkaClient(object):
                 continue
             if msg.error():
                 # noinspection PyProtectedMember
-                if msg.error().code() == confluent_kafka.KafkaError._PARTITION_EOF:
-                    finished_parts[msg.partition()] = True
+                if (msg.error().code() == confluent_kafka.KafkaError._PARTITION_EOF  # type: ignore[union-attr]
+                        and msg.partition() is not None):
+                    finished_parts[msg.partition()] = True  # type: ignore[index]
                     if all(finished_parts):
                         break
                     continue
@@ -283,7 +257,6 @@ class KafkaClient(object):
             if ctr % 100000 == 0:
                 logger.debug('consume_all has yielded %s messages so far from topic %s', ctr, topic_name)
 
-            self._set_decoded_msg(msg)
             yield msg
 
         consumer.close()
@@ -322,15 +295,16 @@ class KafkaClient(object):
                 continue
             if msg.error():
                 # noinspection PyProtectedMember
-                if msg.error().code() == confluent_kafka.KafkaError._PARTITION_EOF:
-                    finished_parts[msg.partition()] = True
+                if (msg.error().code() == confluent_kafka.KafkaError._PARTITION_EOF  # type: ignore[union-attr]
+                        and msg.partition() is not None):
+                    finished_parts[msg.partition()] = True  # type: ignore[index]
                     if all(finished_parts):
                         break
                     continue
                 else:
                     raise confluent_kafka.KafkaException(msg.error())
-            if msg.offset() > boundary_watermarks[msg.partition()][1]:
-                finished_parts[msg.partition()] = True
+            if msg.offset() > boundary_watermarks[msg.partition()][1]:  # type: ignore[index, operator]
+                finished_parts[msg.partition()] = True  # type: ignore[index]
                 if all(finished_parts):
                     break
                 continue
@@ -339,30 +313,9 @@ class KafkaClient(object):
             if ctr % 100000 == 0:
                 logger.debug('consume_bounded has yielded %s messages so far from topic %s', ctr, topic_name)
 
-            self._set_decoded_msg(msg)
             yield msg
 
         consumer.close()
-
-    def _set_decoded_msg(self, msg: confluent_kafka.Message) -> None:
-        # noinspection PyArgumentList
-        for msg_part, setter in ((msg.key(), msg.set_key), (msg.value(), msg.set_value)):
-            if msg_part is not None:
-                payload = io.BytesIO(msg_part)
-                _, schema_id = struct.unpack('>bI', payload.read(5))
-                if schema_id not in self._avro_decoders:
-                    self._set_decoder(schema_id)
-                decoder = self._avro_decoders[schema_id]
-                to_set = decoder(payload)
-                to_set['__avro_schema_name'] = self._schema_ids_to_names[schema_id]
-                setter(to_set)
-                payload.close()
-
-    def _set_decoder(self, schema_id: int) -> None:
-        reg_schema = self._schema_registry.get_by_id(schema_id)
-        schema = fastavro.parse_schema(reg_schema.to_json())
-        self._schema_ids_to_names[schema_id] = reg_schema.name
-        self._avro_decoders[schema_id] = lambda p: fastavro.schemaless_reader(p, schema)
 
     def create_topic(self, topic_name: str, partition_count: int, replication_factor: Optional[int] = None,
                      extra_config: Optional[Dict[str, str | int]] = None) -> None:
@@ -370,14 +323,17 @@ class KafkaClient(object):
             return
 
         if not replication_factor:
+            if self._cluster_metadata.brokers is None:
+                raise Exception('Unexpected state: no brokers metadata')
             replication_factor = min(len(self._cluster_metadata.brokers), 3)
 
         extra_config = extra_config or {}
         topic_config = {**{'cleanup.policy': 'compact'}, **extra_config}
+        topic_config_str = {k: str(v) for k, v in topic_config.items()}
 
         logger.info('Creating Kafka topic "%s" with %s partitions, replication factor %s, and config: %s', topic_name,
-                    partition_count, replication_factor, json.dumps(topic_config))
-        topic = confluent_kafka.admin.NewTopic(topic_name, partition_count, replication_factor, config=topic_config)
+                    partition_count, replication_factor, json.dumps(topic_config_str))
+        topic = confluent_kafka.admin.NewTopic(topic_name, partition_count, replication_factor, config=topic_config_str)
         self._admin.create_topics([topic])[topic_name].result()
         time.sleep(constants.KAFKA_CONFIG_RELOAD_DELAY_SECS)
         self._refresh_cluster_metadata()
@@ -413,59 +369,9 @@ class KafkaClient(object):
 
     def get_topic_config(self, topic_name: str) -> Any:
         resource = confluent_kafka.admin.ConfigResource(
-            restype=confluent_kafka.admin.ConfigResource.Type.TOPIC, name=topic_name)
+            restype=confluent_kafka.admin.ConfigResource.Type.TOPIC, name=topic_name)  # type: ignore[attr-defined]
         result = self._admin.describe_configs([resource])
         return result[resource].result()
-
-    # returns (key schema ID, value schema ID)
-    def register_schemas(self, topic_name: str, key_schema: Optional[Schema], value_schema: Schema,
-                         key_schema_compatibility_level: str = constants.DEFAULT_KEY_SCHEMA_COMPATIBILITY_LEVEL,
-                         value_schema_compatibility_level: str = constants.DEFAULT_VALUE_SCHEMA_COMPATIBILITY_LEVEL) \
-            -> Tuple[int, int]:
-        # TODO: it turns out that if you try to re-register a schema that was previously registered but later superseded
-        # (e.g. in the case of adding and then later deleting a column), the schema registry will accept that and return
-        # you the previously-registered schema ID without updating the `latest` version associated with the registry
-        # subject, or verifying that the change is Avro-compatible. It seems like the way to handle this, per
-        # https://github.com/confluentinc/schema-registry/issues/1685, would be to detect the condition and delete the
-        # subject-version-number of that schema before re-registering it. Since subject-version deletion is not
-        # available in the `CachedSchemaRegistryClient` we use here--and since this is a rare case--I'm explicitly
-        # choosing to punt on it for the moment. The Confluent lib does now have a newer `SchemaRegistryClient` class
-        # which supports subject-version deletion, but changing this code to use it appears to be a non-trivial task.
-
-        key_subject, value_subject = topic_name + '-key', topic_name + '-value'
-        registered = False
-
-        if key_schema:
-            key_schema_id, current_key_schema, _ = self._schema_registry.get_latest_schema(key_subject)
-            if (current_key_schema is None or current_key_schema != key_schema) and not self._disable_writing:
-                logger.info('Key schema for subject %s does not exist or is outdated; registering now.', key_subject)
-                key_schema_id = self._schema_registry.register(key_subject, key_schema)
-                logger.debug('Schema registered for subject %s: %s', key_subject, key_schema)
-                if current_key_schema is None:
-                    time.sleep(constants.KAFKA_CONFIG_RELOAD_DELAY_SECS)
-                    self._schema_registry.update_compatibility(key_schema_compatibility_level, key_subject)
-                registered = True
-        else:
-            key_schema_id = 0
-
-        value_schema_id, current_value_schema, _ = self._schema_registry.get_latest_schema(value_subject)
-        if (current_value_schema is None or current_value_schema != value_schema) and not self._disable_writing:
-            logger.info('Value schema for subject %s does not exist or is outdated; registering now.', value_subject)
-            value_schema_id = self._schema_registry.register(value_subject, value_schema)
-            logger.debug('Schema registered for subject %s: %s', value_subject, value_schema)
-            if current_value_schema is None:
-                time.sleep(constants.KAFKA_CONFIG_RELOAD_DELAY_SECS)
-                self._schema_registry.update_compatibility(value_schema_compatibility_level, value_subject)
-            registered = True
-
-        if registered:
-            # some older versions of the Confluent schema registry have a bug that leads to duplicate schema IDs in
-            # some circumstances; delay a bit if we actually registered a new schema, to give the registry a chance
-            # to become consistent (see https://github.com/confluentinc/schema-registry/pull/1003 and linked issues
-            # for context):
-            time.sleep(constants.KAFKA_CONFIG_RELOAD_DELAY_SECS)
-
-        return key_schema_id, value_schema_id
 
     def _refresh_cluster_metadata(self) -> None:
         self._cluster_metadata = self._get_cluster_metadata()
@@ -477,14 +383,6 @@ class KafkaClient(object):
         if metadata is None:
             raise Exception(f'Cluster metadata request to Kafka timed out')
         return metadata
-
-    def _delivery_callback(self, message_type: str, err: confluent_kafka.KafkaError, message: confluent_kafka.Message,
-                           original_key: Optional[Dict[str, Any]], original_value: Optional[Dict[str, Any]]) -> None:
-        if err is not None:
-            raise confluent_kafka.KafkaException(f'Delivery error on topic {message.topic()}: {err}')
-
-        for cb in self._delivery_callbacks[message_type]:
-            cb(message_type, message, original_key, original_value)
 
     @staticmethod
     def _raise_kafka_error(err: confluent_kafka.KafkaError) -> None:

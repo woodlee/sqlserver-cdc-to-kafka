@@ -3,10 +3,9 @@ import json
 import logging
 import os
 import pathlib
+from typing import TYPE_CHECKING, TypeVar, Type
 
 from . import reporter_base
-
-from typing import TYPE_CHECKING, TypeVar, Type
 
 if TYPE_CHECKING:
     from .metrics import Metrics
