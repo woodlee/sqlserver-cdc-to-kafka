@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 AvroSerializerType = TypeVar('AvroSerializerType', bound='AvroSerializer')
 
-COMPARE_CANONICAL_EVERY_NTH = 100  # TODO 100_000
+COMPARE_CANONICAL_EVERY_NTH = 50_000
 AVRO_SCHEMA_NAMESPACE = "cdc_to_kafka"
 
 PROGRESS_TRACKING_SCHEMA_VERSION = '2'

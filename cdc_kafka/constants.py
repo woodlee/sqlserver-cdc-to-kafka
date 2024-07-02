@@ -4,7 +4,7 @@ from typing import Literal
 # Timing intervals
 
 MIN_CDC_POLLING_INTERVAL = datetime.timedelta(seconds=3)
-MAX_CDC_POLLING_INTERVAL = datetime.timedelta(seconds=60)  # TODO
+MAX_CDC_POLLING_INTERVAL = datetime.timedelta(seconds=10)
 METRICS_REPORTING_INTERVAL = datetime.timedelta(seconds=20)
 CHANGED_CAPTURE_INSTANCES_CHECK_INTERVAL = datetime.timedelta(seconds=60)
 SLOW_TABLE_PROGRESS_HEARTBEAT_INTERVAL = datetime.timedelta(minutes=3)
