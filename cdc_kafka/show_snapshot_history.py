@@ -4,6 +4,7 @@ import logging
 from typing import List, Any, Dict
 
 import confluent_kafka
+
 from tabulate import tabulate
 
 from . import kafka, constants, options
@@ -89,7 +90,14 @@ Consumed {consumed_count} messages from snapshot logging topic {opts.snapshot_lo
         watermarks = kafka_client.get_topic_watermarks(topic_names)
 
         for topic_name in topic_names:
-            all_topic_configs = kafka_client.get_topic_config(topic_name)
+            try:
+                all_topic_configs = kafka_client.get_topic_config(topic_name)
+            except confluent_kafka.KafkaException as e:
+                if e.args[0].code() == confluent_kafka.KafkaError.UNKNOWN_TOPIC_OR_PART:
+                    print(f'Topic {topic_name} does not seem to exist; skipping.')
+                    continue
+                else:
+                    raise
             topic_has_delete_cleanup_policy = 'delete' in all_topic_configs['cleanup.policy'].value
             topic_level_retention_configs = {
                 k: v.value for k, v in all_topic_configs.items()
