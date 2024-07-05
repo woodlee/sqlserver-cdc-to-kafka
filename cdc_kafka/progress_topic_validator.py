@@ -2,16 +2,15 @@ import argparse
 import collections
 import copy
 import datetime
-import json
 import logging
 import os
 import re
 from typing import Dict, Optional, Set
 
-import confluent_kafka
 from tabulate import tabulate
 
-from cdc_kafka import kafka, constants, progress_tracking, options, helpers, kafka_oauth
+from . import kafka, constants, progress_tracking, options, helpers
+from .serializers import DeserializedMessage
 from .metric_reporting import accumulator
 
 logger = logging.getLogger(__name__)
@@ -21,8 +20,8 @@ class TopicProgressInfo(object):
     def __init__(self) -> None:
         self.change_progress_count: int = 0
         self.snapshot_progress_count: int = 0
-        self.last_change_progress: Optional[confluent_kafka.Message] = None
-        self.last_snapshot_progress: Optional[confluent_kafka.Message] = None
+        self.last_change_progress: Optional[DeserializedMessage] = None
+        self.last_snapshot_progress: Optional[DeserializedMessage] = None
         self.distinct_change_tables: Set[str] = set()
         self.reset_count: int = 0
         self.evolution_count: int = 0
@@ -31,31 +30,19 @@ class TopicProgressInfo(object):
 
 
 def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument('--topics-to-include-regex',
-                   default=os.environ.get('TOPICS_TO_INCLUDE_REGEX', '.*'))
-    p.add_argument('--topics-to-exclude-regex',
-                   default=os.environ.get('TOPICS_TO_EXCLUDE_REGEX'))
-    p.add_argument('--schema-registry-url',
-                   default=os.environ.get('SCHEMA_REGISTRY_URL'))
-    p.add_argument('--kafka-bootstrap-servers',
-                   default=os.environ.get('KAFKA_BOOTSTRAP_SERVERS'))
-    p.add_argument('--progress-topic-name',
-                   default=os.environ.get('PROGRESS_TOPIC_NAME', '_cdc_to_kafka_progress'))
-    p.add_argument('--extra-kafka-consumer-config',
-                   default=os.environ.get('EXTRA_KAFKA_CONSUMER_CONFIG', {}), type=json.loads)
-    kafka_oauth.add_kafka_oauth_arg(p)
-    p.add_argument('--show-all',
-                   type=options.str2bool, nargs='?', const=True,
-                   default=options.str2bool(os.environ.get('SHOW_ALL', '0')))
-    opts, _ = p.parse_known_args()
+    def add_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument('--topics-to-include-regex',
+                       default=os.environ.get('TOPICS_TO_INCLUDE_REGEX', '.*'))
+        p.add_argument('--topics-to-exclude-regex',
+                       default=os.environ.get('TOPICS_TO_EXCLUDE_REGEX'))
+        p.add_argument('--show-all',
+                       type=options.str2bool, nargs='?', const=True,
+                       default=options.str2bool(os.environ.get('SHOW_ALL', '0')))
 
-    if not (opts.schema_registry_url and opts.kafka_bootstrap_servers):
-        raise Exception('Arguments schema_registry_url and kafka_bootstrap_servers are required.')
+    opts, _, serializer = options.get_options_and_metrics_reporters(add_args)
 
     with kafka.KafkaClient(accumulator.NoopAccumulator(), opts.kafka_bootstrap_servers,
-                           opts.schema_registry_url, opts.extra_kafka_consumer_config, {},
-                           disable_writing=True) as kafka_client:
+                           opts.extra_kafka_consumer_config, {}, disable_writing=True) as kafka_client:
         if kafka_client.get_topic_partition_count(opts.progress_topic_name) is None:
             logger.error('Progress topic %s not found.', opts.progress_topic_name)
             exit(1)
@@ -78,8 +65,11 @@ def main() -> None:
                 logger.info('Read %s messages so far; last was %s', msg_ctr, helpers.format_coordinates(msg))
 
             # noinspection PyTypeChecker
-            msg_key = dict(msg.key())
-            topic, kind = msg_key['topic_name'], msg_key['progress_kind']
+            deser_msg = serializer.deserialize(msg)
+            if deser_msg.key_dict is None:
+                continue
+
+            topic, kind = deser_msg.key_dict['topic_name'], deser_msg.key_dict['progress_kind']
 
             if not topic_include_re.match(topic):
                 continue
@@ -89,22 +79,22 @@ def main() -> None:
             prior = copy.copy(topic_info.get(topic))
 
             # noinspection PyArgumentList
-            if msg.value() is None:
+            if not deser_msg.value_dict:
                 logger.warning('%s progress for topic %s reset at %s', kind, topic, helpers.format_coordinates(msg))
                 topic_info[topic].reset_count += 1
                 continue
 
             # noinspection PyTypeChecker,PyArgumentList
-            current_change_table = dict(msg.value())['change_table_name']
+            current_change_table = deser_msg.value_dict['change_table_name']
             topic_info[topic].distinct_change_tables.add(current_change_table)
-            current_pe = progress_tracking.ProgressEntry.from_message(msg)
+            current_pe = progress_tracking.ProgressEntry.from_message(deser_msg)
 
             if kind == constants.CHANGE_ROWS_KIND:
                 if not current_pe.change_index:
                     raise Exception('Unexpected state.')
                 current_change_index = current_pe.change_index
                 topic_info[topic].change_progress_count += 1
-                topic_info[topic].last_change_progress = msg
+                topic_info[topic].last_change_progress = deser_msg
                 if current_change_index.is_probably_heartbeat:
                     topic_info[topic].heartbeat_count += 1
 
@@ -117,7 +107,7 @@ def main() -> None:
                             current_change_index.is_probably_heartbeat:
                         topic_info[topic].problem_count += 1
                         logger.warning('Duplicate change entry for topic %s between %s and %s', topic,
-                                       helpers.format_coordinates(prior.last_change_progress),
+                                       helpers.format_coordinates(prior.last_change_progress.raw_msg),
                                        helpers.format_coordinates(msg))
                     if prior_change_index > current_change_index:
                         topic_info[topic].problem_count += 1
@@ -126,7 +116,7 @@ Unordered change entry for topic %s
     Prior  : progress message %s, index %s
     Current: progress message %s, index %s
 '''
-                        logger.error(log_msg, topic, helpers.format_coordinates(prior.last_change_progress),
+                        logger.error(log_msg, topic, helpers.format_coordinates(prior.last_change_progress.raw_msg),
                                      prior_change_index, helpers.format_coordinates(msg), current_change_index)
 
             if kind == constants.SNAPSHOT_ROWS_KIND:
@@ -134,7 +124,7 @@ Unordered change entry for topic %s
                     raise Exception('Unexpected state.')
                 current_snapshot_index = current_pe.snapshot_index
                 topic_info[topic].snapshot_progress_count += 1
-                topic_info[topic].last_snapshot_progress = msg
+                topic_info[topic].last_snapshot_progress = deser_msg
 
                 if prior and prior.last_snapshot_progress:
                     prior_pe = progress_tracking.ProgressEntry.from_message(prior.last_snapshot_progress)
@@ -157,7 +147,8 @@ Unordered snapshot entry for topic %s
     Prior  : progress message %s, index %s
     Current: progress message %s, index %s
 '''
-                            logger.error(log_msg, topic, helpers.format_coordinates(prior.last_snapshot_progress),
+                            logger.error(log_msg, topic,
+                                         helpers.format_coordinates(prior.last_snapshot_progress.raw_msg),
                                          prior_pe.snapshot_index, helpers.format_coordinates(msg),
                                          current_pe.snapshot_index)
 
@@ -178,12 +169,13 @@ Unordered snapshot entry for topic %s
         table = [[k,
                   v.change_progress_count,
                   v.snapshot_progress_count,
-                  'yes' if (progress_tracking.ProgressEntry.from_message(v.last_snapshot_progress).snapshot_index ==
+                  'yes' if (v.last_snapshot_progress and
+                            progress_tracking.ProgressEntry.from_message(v.last_snapshot_progress).snapshot_index ==
                             constants.SNAPSHOT_COMPLETION_SENTINEL) else 'no',
                   len(v.distinct_change_tables),
-                  datetime.datetime.fromtimestamp(v.last_snapshot_progress.timestamp()[1] / 1000,
+                  datetime.datetime.fromtimestamp(v.last_snapshot_progress.raw_msg.timestamp()[1] / 1000,
                                                   datetime.UTC) if v.last_snapshot_progress else None,
-                  datetime.datetime.fromtimestamp(v.last_change_progress.timestamp()[1] / 1000,
+                  datetime.datetime.fromtimestamp(v.last_change_progress.raw_msg.timestamp()[1] / 1000,
                                                   datetime.UTC) if v.last_change_progress else None,
                   v.reset_count,
                   v.problem_count,

@@ -12,12 +12,13 @@ from typing import Dict, Optional, List, Tuple
 import pyodbc
 
 from . import clock_sync, kafka, tracked_tables, constants, options, validation, change_index, progress_tracking, \
-    sql_query_subprocess, sql_queries, helpers, avro
+    sql_query_subprocess, sql_queries, helpers
 from .build_startup_state import build_tracked_tables_from_cdc_metadata, determine_start_points_and_finalize_tables, \
     get_latest_capture_instances_by_fq_name, CaptureInstanceMetadata
 from .metric_reporting import accumulator
 
 from typing import TYPE_CHECKING
+
 if TYPE_CHECKING:
     from . import parsed_row
 
@@ -27,13 +28,13 @@ logger = logging.getLogger(__name__)
 def run() -> None:
     logger.info('Starting...')
     opts: argparse.Namespace
-    opts, reporters = options.get_options_and_metrics_reporters()
+    opts, reporters, serializer = options.get_options_and_metrics_reporters()
+    disable_writes: bool = opts.run_validations or opts.report_progress_only
 
     logger.debug('Parsed configuration: %s', json.dumps(vars(opts)))
 
-    if not (opts.schema_registry_url and opts.kafka_bootstrap_servers and opts.db_conn_string
-            and opts.kafka_transactional_id):
-        raise Exception('Arguments schema_registry_url, kafka_bootstrap_servers, db_conn_string, and '
+    if not (opts.kafka_bootstrap_servers and opts.db_conn_string and opts.kafka_transactional_id):
+        raise Exception('Arguments kafka_bootstrap_servers, db_conn_string, and '
                         'kafka_transactional_id are all required.')
 
     redo_snapshot_for_new_instance: bool = \
@@ -52,9 +53,6 @@ def run() -> None:
             metrics_accumulator: accumulator.Accumulator = accumulator.Accumulator(
                 db_conn, clock_syncer, opts.metrics_namespace, opts.process_hostname)
 
-            schema_generator: avro.AvroSchemaGenerator = avro.AvroSchemaGenerator(
-                opts.always_use_avro_longs, opts.avro_type_spec_overrides)
-
             capture_instances_by_fq_name: Dict[str, CaptureInstanceMetadata] = get_latest_capture_instances_by_fq_name(
                 db_conn, opts.capture_instance_version_strategy, opts.capture_instance_version_regex,
                 opts.table_include_regex, opts.table_exclude_regex)
@@ -67,34 +65,33 @@ def run() -> None:
                                                  for ci in capture_instances_by_fq_name.values()]
 
             with kafka.KafkaClient(
-                metrics_accumulator, opts.kafka_bootstrap_servers, opts.schema_registry_url,
-                opts.extra_kafka_consumer_config, opts.extra_kafka_producer_config,
-                disable_writing=opts.run_validations or opts.report_progress_only,
-                transactional_id=opts.kafka_transactional_id
+                    metrics_accumulator, opts.kafka_bootstrap_servers, opts.extra_kafka_consumer_config,
+                    opts.extra_kafka_producer_config, disable_writing=disable_writes,
+                    transactional_id=opts.kafka_transactional_id
             ) as kafka_client:
                 progress_tracker = progress_tracking.ProgressTracker(
-                    kafka_client, opts.progress_topic_name, opts.process_hostname, opts.snapshot_logging_topic_name
+                    kafka_client, serializer, opts.progress_topic_name, opts.process_hostname,
+                    opts.snapshot_logging_topic_name
                 )
-                kafka_client.register_delivery_callback((
-                    constants.SINGLE_TABLE_CHANGE_MESSAGE, constants.UNIFIED_TOPIC_CHANGE_MESSAGE,
-                    constants.SINGLE_TABLE_SNAPSHOT_MESSAGE, constants.DELETION_CHANGE_TOMBSTONE_MESSAGE
-                ), metrics_accumulator.kafka_delivery_callback)
 
                 tables: List[tracked_tables.TrackedTable] = build_tracked_tables_from_cdc_metadata(
                     db_conn, metrics_accumulator, opts.topic_name_template, opts.snapshot_table_include_regex,
-                    opts.snapshot_table_exclude_regex, opts.truncate_fields, capture_instance_names, opts.db_row_batch_size,
-                    sql_query_processor, schema_generator, progress_tracker)
+                    opts.snapshot_table_exclude_regex, opts.truncate_fields, capture_instance_names,
+                    opts.db_row_batch_size, sql_query_processor, progress_tracker)
 
-                capture_instance_to_topic_map: Dict[str, str] = {
-                    t.capture_instance_name: t.topic_name for t in tables}
+                capture_instance_to_topic_map: Dict[str, str] = {t.capture_instance_name: t.topic_name for t in tables}
 
                 determine_start_points_and_finalize_tables(
-                    kafka_client, db_conn, tables, schema_generator, progress_tracker, opts.lsn_gap_handling,
+                    kafka_client, db_conn, tables, progress_tracker, opts.lsn_gap_handling, opts.new_follow_start_point,
                     opts.partition_count, opts.replication_factor, opts.extra_topic_config, opts.run_validations,
-                    redo_snapshot_for_new_instance, publish_duplicate_changes_from_new_instance, opts.report_progress_only)
+                    redo_snapshot_for_new_instance, publish_duplicate_changes_from_new_instance,
+                    opts.report_progress_only)
 
                 if opts.report_progress_only:
                     exit(0)
+
+                for table in tables:
+                    serializer.register_table(table)
 
                 table_to_unified_topics_map: Dict[str, List[str]] = collections.defaultdict(list)
                 unified_topic_to_tables_map: Dict[str, List[tracked_tables.TrackedTable]] = collections.defaultdict(list)
@@ -108,7 +105,7 @@ def run() -> None:
                         matched_tables = [table for table in tables if compiled_regex.match(table.fq_name)]
                         if matched_tables:
                             for matched_table in matched_tables:
-                                table_to_unified_topics_map[matched_table.fq_name].append(unified_topic_name)
+                                table_to_unified_topics_map[matched_table.topic_name].append(unified_topic_name)
                                 unified_topic_to_tables_map[unified_topic_name].append(matched_table)
                             part_count = kafka_client.get_topic_partition_count(unified_topic_name)
                             if part_count:
@@ -130,7 +127,7 @@ def run() -> None:
                 # those and the source DB data. It takes a while; probably don't run this on very large datasets!
                 if opts.run_validations:
                     validator: validation.Validator = validation.Validator(
-                        kafka_client, tables, progress_tracker, unified_topic_to_tables_map)
+                        kafka_client, tables, progress_tracker, serializer, unified_topic_to_tables_map)
                     validator.run()
                     exit(0)
 
@@ -222,20 +219,25 @@ def run() -> None:
 
                             for t in tables:
                                 if not t.snapshot_complete:
+                                    last_row_retrieved: Optional[parsed_row.ParsedRow] = None
                                     for row in t.retrieve_snapshot_query_results():
-                                        kafka_client.produce(row.destination_topic, row.key_dict,
-                                                             row.avro_key_schema_id, row.value_dict,
-                                                             row.avro_value_schema_id,
-                                                             constants.SINGLE_TABLE_SNAPSHOT_MESSAGE,
-                                                             extra_headers=row.extra_headers)
-                                        snapshot_progress_by_topic[row.destination_topic] = row.key_dict
+                                        key_ser, value_ser = serializer.serialize_table_data_message(row)
+                                        kafka_client.produce(row.destination_topic, key_ser, value_ser,
+                                                             constants.SINGLE_TABLE_SNAPSHOT_MESSAGE, None,
+                                                             row.event_db_time, None,
+                                                             constants.SNAPSHOT_OPERATION_ID, row.extra_headers)
+                                        last_row_retrieved = row
+                                    if last_row_retrieved:
+                                        key_as_dict = dict(zip(t.key_field_names,
+                                                               last_row_retrieved.ordered_key_field_values))
+                                        snapshot_progress_by_topic[last_row_retrieved.destination_topic] = key_as_dict
                                     if t.snapshot_complete:
                                         progress_tracker.record_snapshot_progress(
                                             t.topic_name, constants.SNAPSHOT_COMPLETION_SENTINEL)
                                         snapshot_progress_by_topic.pop(row.destination_topic, None)
                                         completions_to_log.append(functools.partial(
                                             progress_tracker.log_snapshot_completed, t.topic_name, t.fq_name,
-                                            t.key_schema_id, t.value_schema_id, helpers.naive_utcnow(), row.key_dict
+                                            helpers.naive_utcnow(), key_as_dict
                                         ))
                                         snapshots_remain = not all([t.snapshot_complete for t in tables])
                                     elif not lagging_change_tables:
@@ -329,18 +331,17 @@ def run() -> None:
                                             f'a bug. Fix it! Prior: {last_produced_row}, current: {row}')
                         last_produced_row = row
                         queued_change_row_counts[row.destination_topic] -= 1
-
-                        kafka_client.produce(row.destination_topic, row.key_dict, row.avro_key_schema_id,
-                                             row.value_dict, row.avro_value_schema_id,
+                        key_ser, value_ser = serializer.serialize_table_data_message(row)
+                        kafka_client.produce(row.destination_topic, key_ser, value_ser,
                                              constants.SINGLE_TABLE_CHANGE_MESSAGE,
-                                             table_to_unified_topics_map.get(row.table_fq_name, []),
-                                             extra_headers=row.extra_headers)
+                                             table_to_unified_topics_map.get(row.destination_topic, []),
+                                             row.event_db_time, row.change_idx.lsn,
+                                             row.operation_id, row.extra_headers)
                         last_topic_produces[row.destination_topic] = helpers.naive_utcnow()
 
-                        if not opts.disable_deletion_tombstones and row.operation_name == \
-                                constants.DELETE_OPERATION_NAME:
-                            kafka_client.produce(row.destination_topic, row.key_dict, row.avro_key_schema_id,
-                                                 None, row.avro_value_schema_id,
+                        if not opts.disable_deletion_tombstones and row.operation_id == \
+                                constants.DELETE_OPERATION_ID:
+                            kafka_client.produce(row.destination_topic, key_ser, None,
                                                  constants.DELETION_CHANGE_TOMBSTONE_MESSAGE)
 
                         progress_by_topic[row.destination_topic] = row.change_idx
