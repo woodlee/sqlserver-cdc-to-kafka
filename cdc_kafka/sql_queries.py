@@ -251,7 +251,7 @@ SELECT TOP ({batch_size})
     , ct.__$update_mask AS {constants.UPDATED_FIELDS_NAME}
     , {select_column_specs}
 FROM ct 
-INNER JOIN [{constants.CDC_DB_SCHEMA_NAME}].[lsn_time_mapping] AS ltm WITH (NOLOCK) ON (ct.__$start_lsn = ltm.start_lsn)
+INNER JOIN [{constants.CDC_DB_SCHEMA_NAME}].[lsn_time_mapping] AS ltm WITH (NOLOCK, FORCESEEK) ON (ct.__$start_lsn = ltm.start_lsn)
 WHERE ct.__$operation = 1 OR ct.__$operation = 2 OR ct.__$operation = 4
 ORDER BY {order_spec}
     ''', [(pyodbc.SQL_BINARY, 10, None)] * 3
