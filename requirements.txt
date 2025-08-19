@@ -1,5 +1,5 @@
 avro==1.11.3
-aws-msk-iam-sasl-signer-python==1.0.1
+aws-msk-iam-sasl-signer-python==1.0.2
 bitarray==2.9.2
 confluent-kafka==2.3.0
 Jinja2==3.1.3
