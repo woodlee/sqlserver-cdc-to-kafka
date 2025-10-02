@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 
 """
-A tool for populating a table that has been pre-created in a SQL Server DB based on data from a topic that was
-produced by CDC-to-Kafka.
+A tool for populating one or more tables that have been pre-created in a SQL Server DB based on data from Kafka
+topics produced by CDC-to-Kafka. The script can replay a single topic to a single table (legacy mode) or replay
+multiple topics to their corresponding tables in parallel (new mode).
 
 One example use case would be to create a copy of an existing table (initially with a different name of course) on the
 same DB from which a CDC-to-Kafka topic is produced, in order to rearrange indexes, types, etc. on the new copy of the
 table. We're using this now to upgrade some INT columns to `BIGINT`s on a few tables that are nearing the 2^31 row
 count. When the copy is ready, tables can be renamed so that applications begin using the new table.
 
-An example invocation follows. This assumes you have already created the Orders_copy table, with changes as desired,
-in the DB, and that you have created the CdcTableCopier DB user there as well, presumably with limited permissions
-to work only with the Orders_copy table. In this example we assume that 'OrderGuid' is a new column that exists
-on the new _copy table only (perhaps populated by a default), and therefore we are not trying to sync that column
-since it doesn't exist in the CDC feed/schema:
+EXAMPLE 1: Single topic replay (legacy mode)
+This assumes you have already created the Orders_copy table, with changes as desired, in the DB, and that you have
+created the CdcTableCopier DB user there as well, presumably with limited permissions to work only with the
+Orders_copy table. In this example we assume that 'OrderGuid' is a new column that exists on the new _copy table
+only (perhaps populated by a default), and therefore we are not trying to sync that column since it doesn't exist
+in the CDC feed/schema:
 
 ./replayer.py \
   --replay-topic 'dbo_Orders_cdc' \
@@ -26,6 +28,23 @@ since it doesn't exist in the CDC feed/schema:
   --target-db-table-schema 'dbo' \
   --target-db-table-name 'Orders_copy' \
   --cols-to-not-sync 'OrderGuid'
+
+EXAMPLE 2: Multiple topics replay in parallel (new mode)
+This example replays three topics in parallel to their corresponding tables. The topic-to-table mapping is provided
+as a JSON object:
+
+./replayer.py \
+  --topic-to-table-map '{
+    "dbo_Orders_cdc": {"schema": "dbo", "table": "Orders_copy"},
+    "dbo_Customers_cdc": {"schema": "dbo", "table": "Customers_copy", "cols_to_not_sync": "CustomerGuid"},
+    "dbo_Products_cdc": {"schema": "dbo", "table": "Products_copy"}
+  }' \
+  --kafka-bootstrap-servers 'localhost:9092' \
+  --schema-registry-url 'http://localhost:8081' \
+  --target-db-server 'localhost' \
+  --target-db-user 'CdcTableCopier' \
+  --target-db-password '*****' \
+  --target-db-database 'MyDatabase'
 
 Python package requirements:
     confluent-kafka[avro]==2.3.0
@@ -218,62 +237,18 @@ def format_coordinates(msg: Message) -> str:
            f'time {datetime.fromtimestamp(msg.timestamp()[1] / 1000, UTC)}'
 
 
-def main() -> None:
-    p = argparse.ArgumentParser()
+class ReplayConfig(NamedTuple):
+    replay_topic: str
+    target_db_table_schema: str
+    target_db_table_name: str
+    cols_to_not_sync: str
+    primary_key_fields_override: str
 
-    # Config for data source
-    p.add_argument('--replay-topic',
-                   default=os.environ.get('REPLAY_TOPIC'))
-    p.add_argument('--kafka-bootstrap-servers',
-                   default=os.environ.get('KAFKA_BOOTSTRAP_SERVERS'))
-    p.add_argument('--schema-registry-url',
-                   default=os.environ.get('SCHEMA_REGISTRY_URL'))
-    p.add_argument('--extra-kafka-consumer-config',
-                   default=os.environ.get('EXTRA_KAFKA_CONSUMER_CONFIG', {}), type=json.loads)
-    kafka_oauth.add_kafka_oauth_arg(p)
 
-    # Config for data target / progress tracking
-    p.add_argument('--target-db-server',
-                   default=os.environ.get('TARGET_DB_SERVER'))
-    p.add_argument('--target-db-user',
-                   default=os.environ.get('TARGET_DB_USER'))
-    p.add_argument('--target-db-password',
-                   default=os.environ.get('TARGET_DB_PASSWORD'))
-    p.add_argument('--target-db-database',
-                   default=os.environ.get('TARGET_DB_DATABASE'))
-    p.add_argument('--target-db-table-schema',
-                   default=os.environ.get('TARGET_DB_TABLE_SCHEMA'))
-    p.add_argument('--target-db-table-name',
-                   default=os.environ.get('TARGET_DB_TABLE_NAME'))
-    p.add_argument('--cols-to-not-sync',
-                   default=os.environ.get('COLS_TO_NOT_SYNC', ''))
-    p.add_argument('--primary-key-fields-override',
-                   default=os.environ.get('PRIMARY_KEY_FIELDS_OVERRIDE', ''))
-    p.add_argument('--progress-tracking-namespace',
-                   default=os.environ.get('PROGRESS_TRACKING_NAMESPACE', 'default'))
-    p.add_argument('--progress-tracking-table-schema',
-                   default=os.environ.get('PROGRESS_TRACKING_TABLE_SCHEMA', 'dbo'))
-    p.add_argument('--progress-tracking-table-name',
-                   default=os.environ.get('PROGRESS_TRACKING_TABLE_NAME', 'CdcKafkaReplayerProgress'))
-
-    # Config for process behavior and tuning
-    p.add_argument('--delete-batch-size', type=int,
-                   default=os.environ.get('DELETE_BATCH_SIZE', 2000))
-    p.add_argument('--upsert-batch-size', type=int,
-                   default=os.environ.get('UPSERT_BATCH_SIZE', 5000))
-    p.add_argument('--max-commit-latency-seconds', type=int,
-                   default=os.environ.get('MAX_COMMIT_LATENCY_SECONDS', 10))
-    p.add_argument('--consumed-messages-limit', type=int,
-                   default=os.environ.get('CONSUMED_MESSAGES_LIMIT', 0))
-
-    opts, _ = p.parse_known_args()
-
-    if not (opts.replay_topic and opts.kafka_bootstrap_servers and opts.schema_registry_url and
-            opts.target_db_server and opts.target_db_user and opts.target_db_password and opts.target_db_database and
-            opts.target_db_table_schema and opts.target_db_table_name):
-        raise Exception('Arguments replay_topic, kafka_bootstrap_servers, schema_registry_url, target_db_server, '
-                        'target_db_user, target_db_password, target_db_database, target_db_table_schema, and '
-                        'target_db_table_name are all required.')
+def replay_worker(config: ReplayConfig, opts: argparse.Namespace) -> None:
+    """Worker process that replays a single topic to a single table."""
+    logger.info(f"Starting replay worker for topic '{config.replay_topic}' -> "
+                f"[{config.target_db_table_schema}].[{config.target_db_table_name}]")
 
     msg_ctr: int = 0
     delete_cnt: int = 0
@@ -285,32 +260,39 @@ def main() -> None:
     last_consume_by_partition: Dict[int, Tuple[int, int]] = {}
     queued_deletes: Set[Any] = set()
     queued_upserts: Dict[Any, Tuple[str, List[Any]]] = {}
-    fq_target_table_name: str = f'[{opts.target_db_table_schema.strip()}].[{opts.target_db_table_name.strip()}]'
-    temp_table_base_name: str = f'#replayer_{opts.target_db_table_schema.strip()}_{opts.target_db_table_name.strip()}'
+    fq_target_table_name: str = f'[{config.target_db_table_schema.strip()}].[{config.target_db_table_name.strip()}]'
+    temp_table_base_name: str = f'#replayer_{config.target_db_table_schema.strip()}_{config.target_db_table_name.strip()}'
     delete_temp_table_name: str = temp_table_base_name + '_delete'
     merge_temp_table_name: str = temp_table_base_name + '_merge'
-    cols_to_not_sync: set[str] = set([c.strip().lower() for c in opts.cols_to_not_sync.split(',')])
+    cols_to_not_sync: set[str] = set([c.strip().lower() for c in config.cols_to_not_sync.split(',')])
     cols_to_not_sync.discard('')
-    proc_id: str = f'{socket.getfqdn()}+{int(datetime.now().timestamp())}'
+    proc_id: str = f'{socket.getfqdn()}+{int(datetime.now().timestamp())}+{config.replay_topic}'
     stop_event: EventClass = mp.Event()
     # For faster_fifo the ctor arg here is the queue byte size, not its item count size:
     queue: Queue = Queue(opts.upsert_batch_size * 5_000)
     proc_start_time: float = time.perf_counter()
 
-    logger.info("Starting CDC replayer.")
-
     try:
         with ctds.connect(opts.target_db_server, user=opts.target_db_user, password=opts.target_db_password,
                           database=opts.target_db_database) as db_conn:
             with db_conn.cursor() as cursor:
-                progress: List[Progress] = get_progress(opts, db_conn)
+                # Create a modified opts object for this specific topic/table
+                worker_opts = argparse.Namespace(**vars(opts))
+                worker_opts.replay_topic = config.replay_topic
+                worker_opts.target_db_table_schema = config.target_db_table_schema
+                worker_opts.target_db_table_name = config.target_db_table_name
+                worker_opts.cols_to_not_sync = config.cols_to_not_sync
+                worker_opts.primary_key_fields_override = config.primary_key_fields_override
+
+                progress: List[Progress] = get_progress(worker_opts, db_conn)
                 consumer_subprocess: mp.Process = mp.Process(
-                    target=consumer_process, name='consumer', args=(opts, stop_event, queue, progress, proc_id, logger))
+                    target=consumer_process, name=f'consumer-{config.replay_topic}',
+                    args=(worker_opts, stop_event, queue, progress, proc_id, logger))
                 consumer_subprocess.start()
 
                 primary_key_field_names: List[str]
-                if opts.primary_key_fields_override.strip():
-                    primary_key_field_names = [x.strip() for x in opts.primary_key_fields_override.split(',')]
+                if config.primary_key_fields_override.strip():
+                    primary_key_field_names = [x.strip() for x in config.primary_key_fields_override.split(',')]
                 else:
                     cursor.execute(f'''
     SELECT [COLUMN_NAME]
@@ -319,7 +301,7 @@ def main() -> None:
     AND [TABLE_SCHEMA] = :0
     AND [TABLE_NAME] = :1
     ORDER BY [ORDINAL_POSITION]
-                    ''', (opts.target_db_table_schema, opts.target_db_table_name))
+                    ''', (config.target_db_table_schema, config.target_db_table_name))
                     primary_key_field_names = [r[0] for r in cursor.fetchall()]
 
                 field_names: List[str] = []
@@ -333,10 +315,10 @@ SELECT [COLUMN_NAME]
     , COALESCE([CHARACTER_MAXIMUM_LENGTH], [DATETIME_PRECISION]) AS [PRECISION_SPEC]
     , [IS_NULLABLE]
 FROM [INFORMATION_SCHEMA].[COLUMNS]
-WHERE [TABLE_SCHEMA] = :0 
+WHERE [TABLE_SCHEMA] = :0
     AND [TABLE_NAME] = :1
 ORDER BY [ORDINAL_POSITION]
-                ''', (opts.target_db_table_schema, opts.target_db_table_name))
+                ''', (config.target_db_table_schema, config.target_db_table_name))
                 for col_name, col_type, col_precision, col_is_nullable in cursor.fetchall():
                     if col_name.lower() in cols_to_not_sync:
                         continue
@@ -363,8 +345,8 @@ ORDER BY [ORDINAL_POSITION]
                 cursor.execute(f'DROP TABLE IF EXISTS {delete_temp_table_name};')
                 cursor.execute(f'''
 CREATE TABLE {delete_temp_table_name} (
-    {",".join(delete_temp_table_col_specs)}, 
-    CONSTRAINT [PK_{delete_temp_table_name}] 
+    {",".join(delete_temp_table_col_specs)},
+    CONSTRAINT [PK_{delete_temp_table_name}]
     PRIMARY KEY ({",".join(primary_key_field_names)})
 );
                 ''')
@@ -394,7 +376,7 @@ TRUNCATE TABLE {delete_temp_table_name};
                     merge_stmt = f'''
 {set_identity_insert_if_needed}
 MERGE {fq_target_table_name} AS tgt
-USING {merge_temp_table_name} AS src 
+USING {merge_temp_table_name} AS src
     ON ({merge_match_predicates})
 WHEN NOT MATCHED THEN
     INSERT ([{'], ['.join(field_names)}]) VALUES (src.[{'], src.['.join(field_names)}]);
@@ -405,7 +387,7 @@ TRUNCATE TABLE {merge_temp_table_name};
                     merge_stmt = f'''
 {set_identity_insert_if_needed}
 MERGE {fq_target_table_name} AS tgt
-USING {merge_temp_table_name} AS src 
+USING {merge_temp_table_name} AS src
     ON ({merge_match_predicates})
 WHEN MATCHED THEN
     UPDATE SET {", ".join([f'[{x}] = src.[{x}]' for x in field_names if x not in primary_key_field_names])}
@@ -416,7 +398,7 @@ TRUNCATE TABLE {merge_temp_table_name};
                     '''
 
             proc_start_time = time.perf_counter()
-            logger.info("Listening for consumed messages.")
+            logger.info(f"Worker for '{config.replay_topic}': Listening for consumed messages.")
 
             while True:
                 queue_get_wait_start = time.perf_counter()
@@ -434,14 +416,15 @@ TRUNCATE TABLE {merge_temp_table_name};
                             db_conn.bulk_insert(delete_temp_table_name, list(queued_deletes))
                             sql_time_acc += time.perf_counter() - start_time
                             elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-                            logger.info('Inserted to temp table for delete: %s items in %s ms',
-                                        len(queued_deletes), elapsed_ms)
+                            logger.info('Worker %s: Inserted to temp table for delete: %s items in %s ms',
+                                        config.replay_topic, len(queued_deletes), elapsed_ms)
 
                             start_time = time.perf_counter()
                             cursor.execute(delete_stmt)
                             sql_time_acc += time.perf_counter() - start_time
                             elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-                            logger.info('Deleted %s items in %s ms', len(queued_deletes), elapsed_ms)
+                            logger.info('Worker %s: Deleted %s items in %s ms',
+                                        config.replay_topic, len(queued_deletes), elapsed_ms)
 
                         if queued_upserts:
                             inserts: List[Any] = []
@@ -458,7 +441,8 @@ TRUNCATE TABLE {merge_temp_table_name};
                             # are relatively few of them, to cut down on DB round-trips:
                             if inserts and merges and len(inserts) < 100 or \
                                     len(inserts) / (len(inserts) + len(merges)) < 0.1:
-                                logger.debug('Rolling %s inserts into %s merges', len(inserts), len(merges))
+                                logger.debug('Worker %s: Rolling %s inserts into %s merges',
+                                             config.replay_topic, len(inserts), len(merges))
                                 merges += inserts
                                 inserts = []
 
@@ -467,27 +451,28 @@ TRUNCATE TABLE {merge_temp_table_name};
                                 db_conn.bulk_insert(fq_target_table_name, inserts)
                                 sql_time_acc += time.perf_counter() - start_time
                                 elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-                                logger.info('Inserted directly to target table: %s items in %s ms',
-                                            len(inserts), elapsed_ms)
+                                logger.info('Worker %s: Inserted directly to target table: %s items in %s ms',
+                                            config.replay_topic, len(inserts), elapsed_ms)
 
                             if merges:
                                 start_time = time.perf_counter()
                                 db_conn.bulk_insert(merge_temp_table_name, merges)
                                 sql_time_acc += time.perf_counter() - start_time
                                 elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-                                logger.info('Inserted to temp table for merge: %s items in %s ms',
-                                            len(merges), elapsed_ms)
+                                logger.info('Worker %s: Inserted to temp table for merge: %s items in %s ms',
+                                            config.replay_topic, len(merges), elapsed_ms)
 
                                 start_time = time.perf_counter()
                                 cursor.execute(merge_stmt)
                                 sql_time_acc += time.perf_counter() - start_time
                                 elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-                                logger.info('Merged %s items in %s ms', len(merges), elapsed_ms)
+                                logger.info('Worker %s: Merged %s items in %s ms',
+                                            config.replay_topic, len(merges), elapsed_ms)
 
                         if queued_upserts or queued_deletes:
                             queued_upserts.clear()
                             queued_deletes.clear()
-                            commit_progress(opts, last_consume_by_partition, proc_id, db_conn)
+                            commit_progress(worker_opts, last_consume_by_partition, proc_id, db_conn)
                             last_commit_time = datetime.now()
 
                     if stop_event.is_set() and queue.empty():
@@ -525,23 +510,154 @@ TRUNCATE TABLE {merge_temp_table_name};
                     upsert_cnt += 1
 
                 if len(queued_deletes) + len(queued_upserts) % 5_000 == 0:
-                    logger.debug('Currently have %s queued deletes and %s queued upserts. Time waiting on queue = %s. '
-                                 'Apx. queue depth %s', len(queued_deletes), len(queued_upserts), queue_get_wait,
-                                 queue.qsize())
+                    logger.debug('Worker %s: Currently have %s queued deletes and %s queued upserts. '
+                                 'Time waiting on queue = %s. Apx. queue depth %s',
+                                 config.replay_topic, len(queued_deletes), len(queued_upserts),
+                                 queue_get_wait, queue.qsize())
                     queue_get_wait = 0
 
                 last_consume_by_partition[msg_partition] = (msg_offset, msg_timestamp)
     except KeyboardInterrupt:
         pass
     except Exception as e:
-        logger.exception(e)
+        logger.exception(f"Worker for '{config.replay_topic}' encountered error: {e}")
     finally:
         stop_event.set()
         consumer_subprocess.join(1)
-        logger.info(f'Processed {msg_ctr} messages total, {delete_cnt} deletes, {upsert_cnt} upserts.')
+        logger.info(f"Worker for '{config.replay_topic}': Processed {msg_ctr} messages total, "
+                    f"{delete_cnt} deletes, {upsert_cnt} upserts.")
         overall_time = time.perf_counter() - proc_start_time
-        logger.info(f'Total times:\nKafka poll: {poll_time_acc:.2f}s\nSQL execution: {sql_time_acc:.2f}s\n'
-                    f'Overall: {overall_time:.2f}s')
+        logger.info(f"Worker for '{config.replay_topic}' total times:\n"
+                    f"Kafka poll: {poll_time_acc:.2f}s\nSQL execution: {sql_time_acc:.2f}s\n"
+                    f"Overall: {overall_time:.2f}s")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+
+    # Config for data source
+    p.add_argument('--replay-topic',
+                   default=os.environ.get('REPLAY_TOPIC'),
+                   help='Single topic to replay (for backward compatibility)')
+    p.add_argument('--topic-to-table-map',
+                   default=os.environ.get('TOPIC_TO_TABLE_MAP'),
+                   help='JSON mapping of topics to tables, e.g. {"topic1": {"schema": "dbo", "table": "Table1"}, ...}')
+    p.add_argument('--kafka-bootstrap-servers',
+                   default=os.environ.get('KAFKA_BOOTSTRAP_SERVERS'))
+    p.add_argument('--schema-registry-url',
+                   default=os.environ.get('SCHEMA_REGISTRY_URL'))
+    p.add_argument('--extra-kafka-consumer-config',
+                   default=os.environ.get('EXTRA_KAFKA_CONSUMER_CONFIG', {}), type=json.loads)
+    kafka_oauth.add_kafka_oauth_arg(p)
+
+    # Config for data target / progress tracking
+    p.add_argument('--target-db-server',
+                   default=os.environ.get('TARGET_DB_SERVER'))
+    p.add_argument('--target-db-user',
+                   default=os.environ.get('TARGET_DB_USER'))
+    p.add_argument('--target-db-password',
+                   default=os.environ.get('TARGET_DB_PASSWORD'))
+    p.add_argument('--target-db-database',
+                   default=os.environ.get('TARGET_DB_DATABASE'))
+    p.add_argument('--target-db-table-schema',
+                   default=os.environ.get('TARGET_DB_TABLE_SCHEMA'),
+                   help='Single table schema (for backward compatibility)')
+    p.add_argument('--target-db-table-name',
+                   default=os.environ.get('TARGET_DB_TABLE_NAME'),
+                   help='Single table name (for backward compatibility)')
+    p.add_argument('--cols-to-not-sync',
+                   default=os.environ.get('COLS_TO_NOT_SYNC', ''))
+    p.add_argument('--primary-key-fields-override',
+                   default=os.environ.get('PRIMARY_KEY_FIELDS_OVERRIDE', ''))
+    p.add_argument('--progress-tracking-namespace',
+                   default=os.environ.get('PROGRESS_TRACKING_NAMESPACE', 'default'))
+    p.add_argument('--progress-tracking-table-schema',
+                   default=os.environ.get('PROGRESS_TRACKING_TABLE_SCHEMA', 'dbo'))
+    p.add_argument('--progress-tracking-table-name',
+                   default=os.environ.get('PROGRESS_TRACKING_TABLE_NAME', 'CdcKafkaReplayerProgress'))
+
+    # Config for process behavior and tuning
+    p.add_argument('--delete-batch-size', type=int,
+                   default=os.environ.get('DELETE_BATCH_SIZE', 2000))
+    p.add_argument('--upsert-batch-size', type=int,
+                   default=os.environ.get('UPSERT_BATCH_SIZE', 5000))
+    p.add_argument('--max-commit-latency-seconds', type=int,
+                   default=os.environ.get('MAX_COMMIT_LATENCY_SECONDS', 10))
+    p.add_argument('--consumed-messages-limit', type=int,
+                   default=os.environ.get('CONSUMED_MESSAGES_LIMIT', 0))
+
+    opts, _ = p.parse_known_args()
+
+    # Validate common required arguments
+    if not (opts.kafka_bootstrap_servers and opts.schema_registry_url and opts.target_db_server and
+            opts.target_db_user and opts.target_db_password and opts.target_db_database):
+        raise Exception('Arguments kafka_bootstrap_servers, schema_registry_url, target_db_server, '
+                        'target_db_user, target_db_password, and target_db_database are all required.')
+
+    # Build list of replay configurations
+    replay_configs: List[ReplayConfig] = []
+
+    if opts.topic_to_table_map:
+        # New mode: parallel replay of multiple topics
+        topic_map = json.loads(opts.topic_to_table_map)
+        for topic, table_info in topic_map.items():
+            config = ReplayConfig(
+                replay_topic=topic,
+                target_db_table_schema=table_info.get('schema', 'dbo'),
+                target_db_table_name=table_info['table'],
+                cols_to_not_sync=table_info.get('cols_to_not_sync', ''),
+                primary_key_fields_override=table_info.get('primary_key_fields_override', '')
+            )
+            replay_configs.append(config)
+    elif opts.replay_topic and opts.target_db_table_schema and opts.target_db_table_name:
+        # Legacy mode: single topic replay for backward compatibility
+        config = ReplayConfig(
+            replay_topic=opts.replay_topic,
+            target_db_table_schema=opts.target_db_table_schema,
+            target_db_table_name=opts.target_db_table_name,
+            cols_to_not_sync=opts.cols_to_not_sync,
+            primary_key_fields_override=opts.primary_key_fields_override
+        )
+        replay_configs.append(config)
+    else:
+        raise Exception('Either --topic-to-table-map OR (--replay-topic, --target-db-table-schema, '
+                        'and --target-db-table-name) must be provided.')
+
+    logger.info(f"Starting CDC replayer with {len(replay_configs)} topic(s) to replay.")
+
+    # Launch worker processes for each topic/table pair
+    workers: List[mp.Process] = []
+    try:
+        for config in replay_configs:
+            worker = mp.Process(
+                target=replay_worker,
+                name=f'replayer-{config.replay_topic}',
+                args=(config, opts)
+            )
+            worker.start()
+            workers.append(worker)
+            logger.info(f"Launched worker process for '{config.replay_topic}' -> "
+                        f"[{config.target_db_table_schema}].[{config.target_db_table_name}]")
+
+        # Wait for all workers to complete
+        for worker in workers:
+            worker.join()
+
+        logger.info("All replay workers have completed.")
+    except KeyboardInterrupt:
+        logger.info("Received interrupt signal, shutting down workers...")
+        for worker in workers:
+            if worker.is_alive():
+                worker.terminate()
+        for worker in workers:
+            worker.join(timeout=5)
+    except Exception as e:
+        logger.exception(f"Error in main process: {e}")
+        for worker in workers:
+            if worker.is_alive():
+                worker.terminate()
+        for worker in workers:
+            worker.join(timeout=5)
 
 
 def consumer_process(opts: argparse.Namespace, stop_event: EventClass, queue: Queue,
