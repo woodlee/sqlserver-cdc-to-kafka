@@ -309,18 +309,29 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace) -> None:
                 varchar_field_names: set[str] = set()
                 nvarchar_field_names: set[str] = set()
                 delete_temp_table_col_specs: List[str] = []
+                column_defaults: Dict[str, Any] = {}
+
+                cursor.execute('''
+SELECT name
+FROM sys.computed_columns
+WHERE OBJECT_SCHEMA_NAME(object_id) = :0
+    AND OBJECT_NAME(object_id) = :1                
+                ''', (config.target_db_table_schema, config.target_db_table_name))
+                computed_cols: set[str] = {r[0].lower() for r in cursor.fetchall()}
+
                 cursor.execute('''
 SELECT [COLUMN_NAME]
     , [DATA_TYPE]
     , COALESCE([CHARACTER_MAXIMUM_LENGTH], [DATETIME_PRECISION]) AS [PRECISION_SPEC]
     , [IS_NULLABLE]
+    , [COLUMN_DEFAULT]
 FROM [INFORMATION_SCHEMA].[COLUMNS]
 WHERE [TABLE_SCHEMA] = :0
     AND [TABLE_NAME] = :1
 ORDER BY [ORDINAL_POSITION]
                 ''', (config.target_db_table_schema, config.target_db_table_name))
-                for col_name, col_type, col_precision, col_is_nullable in cursor.fetchall():
-                    if col_name.lower() in cols_to_not_sync:
+                for col_name, col_type, col_precision, col_is_nullable, col_default in cursor.fetchall():
+                    if col_name.lower() in cols_to_not_sync or col_name.lower() in computed_cols:
                         continue
                     field_names.append(col_name)
                     if col_type.lower().startswith('datetime'):  # TODO: more cases than "datetime"?
@@ -329,6 +340,8 @@ ORDER BY [ORDINAL_POSITION]
                         varchar_field_names.add(col_name)
                     if col_type.lower() in ('nchar', 'nvarchar', 'ntext'):
                         nvarchar_field_names.add(col_name)
+                    if col_default is not None:
+                        column_defaults[col_name] = col_default
                     if col_name in primary_key_field_names:
                         precision: str = f'({col_precision})' if col_precision is not None else ''
                         nullability: str = '' if col_is_nullable else 'NOT NULL'
@@ -340,14 +353,14 @@ ORDER BY [ORDINAL_POSITION]
                 cursor.execute(f'SELECT TOP 0 * INTO {merge_temp_table_name} FROM {fq_target_table_name} '
                                f'UNION ALL SELECT * FROM {fq_target_table_name} WHERE 1 <> 1;')
                 for c in cols_to_not_sync:
-                    cursor.execute(f'ALTER TABLE {merge_temp_table_name} DROP COLUMN {c};')
+                    cursor.execute(f'ALTER TABLE {merge_temp_table_name} DROP COLUMN [{c}];')
 
                 cursor.execute(f'DROP TABLE IF EXISTS {delete_temp_table_name};')
                 cursor.execute(f'''
 CREATE TABLE {delete_temp_table_name} (
     {",".join(delete_temp_table_col_specs)},
     CONSTRAINT [PK_{delete_temp_table_name}]
-    PRIMARY KEY ({",".join(primary_key_field_names)})
+    PRIMARY KEY ([{"], [".join(primary_key_field_names)}])
 );
                 ''')
 
@@ -398,7 +411,7 @@ TRUNCATE TABLE {merge_temp_table_name};
                     '''
 
             proc_start_time = time.perf_counter()
-            logger.info(f"Worker for '{config.replay_topic}': Listening for consumed messages.")
+            logger.debug(f"Worker for '{config.replay_topic}': Listening for consumed messages.")
 
             while True:
                 queue_get_wait_start = time.perf_counter()
@@ -490,13 +503,17 @@ TRUNCATE TABLE {merge_temp_table_name};
                 else:
                     vals: List[Any] = []
                     for f in field_names:
-                        if f in datetime_field_names and msg_val[f] is not None:
+                        if f not in msg_val:
+                            vals.append(column_defaults[f])
+                        elif msg_val[f] is None:
+                            vals.append(None)
+                        elif f in datetime_field_names:
                             vals.append(datetime.fromisoformat(msg_val[f]))
-                        elif f in varchar_field_names and msg_val[f] is not None:
+                        elif f in varchar_field_names:
                             # The below assumes your DB uses SQL_Latin1_General_CP1_CI_AS collation; if not, you may
                             # need to change 'cp1252' to something else:
                             vals.append(ctds.SqlVarChar(msg_val[f].encode('cp1252')))
-                        elif f in nvarchar_field_names and msg_val[f] is not None:
+                        elif f in nvarchar_field_names:
                             # See https://zillow.github.io/ctds/bulk_insert.html#text-columns
                             vals.append(ctds.SqlVarChar(msg_val[f].encode('utf-16le')))
                         else:
@@ -629,6 +646,7 @@ def main() -> None:
     workers: List[mp.Process] = []
     try:
         for config in replay_configs:
+            time.sleep(0.2)
             worker = mp.Process(
                 target=replay_worker,
                 name=f'replayer-{config.replay_topic}',
@@ -636,7 +654,7 @@ def main() -> None:
             )
             worker.start()
             workers.append(worker)
-            logger.info(f"Launched worker process for '{config.replay_topic}' -> "
+            logger.debug(f"Launched worker process for '{config.replay_topic}' -> "
                         f"[{config.target_db_table_schema}].[{config.target_db_table_name}]")
 
         # Wait for all workers to complete
@@ -691,11 +709,11 @@ def consumer_process(opts: argparse.Namespace, stop_event: EventClass, queue: Qu
     topic_partitions: List[TopicPartition] = [TopicPartition(
         opts.replay_topic, p, start_offset_by_partition.get(p, OFFSET_BEGINNING)
     ) for p in partitions]
-    logger.info('Consumer assignments: %s', [f'{tp.topic}:{tp.partition}@{tp.offset}' for tp in topic_partitions])
+    logger.debug('Consumer assignments: %s', [f'{tp.topic}:{tp.partition}@{tp.offset}' for tp in topic_partitions])
     consumer.assign(topic_partitions)
     msg_ctr: int = 0
 
-    logger.info(f'Starting consumer for {opts.replay_topic}.')
+    logger.debug(f'Starting consumer for {opts.replay_topic}.')
 
     while not stop_event.is_set():
         msg = consumer.poll(0.01)
