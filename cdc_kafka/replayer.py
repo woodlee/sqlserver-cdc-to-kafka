@@ -3,7 +3,7 @@
 """
 A tool for populating one or more tables that have been pre-created in a SQL Server DB based on data from Kafka
 topics produced by CDC-to-Kafka. The script can replay a single topic to a single table (legacy mode) or replay
-multiple topics to their corresponding tables in parallel (new mode).
+multiple topics to their corresponding tables in parallel.
 
 One example use case would be to create a copy of an existing table (initially with a different name of course) on the
 same DB from which a CDC-to-Kafka topic is produced, in order to rearrange indexes, types, etc. on the new copy of the
@@ -29,9 +29,9 @@ in the CDC feed/schema:
   --target-db-table-name 'Orders_copy' \
   --cols-to-not-sync 'OrderGuid'
 
-EXAMPLE 2: Multiple topics replay in parallel (new mode)
-This example replays three topics in parallel to their corresponding tables. The topic-to-table mapping is provided
-as a JSON object:
+EXAMPLE 2: Replaying multiple topics in parallel
+This example replays three topics in parallel to their corresponding tables. The topic-to-table mapping should be
+provided as a JSON object:
 
 ./replayer.py \
   --topic-to-table-map '{
@@ -54,10 +54,12 @@ Python package requirements:
 """
 
 import argparse
+import itertools
 import json
 import logging.config
 import multiprocessing as mp
 import os
+import pprint
 import queue as stdlib_queue
 import socket
 import time
@@ -65,6 +67,7 @@ from datetime import datetime, UTC
 from multiprocessing.synchronize import Event as EventClass
 from typing import Set, Any, List, Dict, Tuple, NamedTuple, Optional
 
+import _tds
 import ctds  # type: ignore[import-untyped]
 from confluent_kafka import Consumer, KafkaError, TopicPartition, Message, OFFSET_BEGINNING
 from confluent_kafka.admin import TopicMetadata
@@ -73,67 +76,7 @@ from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroDeserializer
 from faster_fifo import Queue  # type: ignore[import-not-found]
 
-# from cdc_kafka import kafka_oauth
-
 log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
-
-
-def extract_confluent_schema_id(raw_bytes: bytes) -> int:
-    """Extract schema ID from Confluent wire format (magic byte + 4-byte big-endian schema ID)."""
-    if len(raw_bytes) < 5 or raw_bytes[0] != 0:
-        raise ValueError("Invalid Confluent wire format")
-    return int.from_bytes(raw_bytes[1:5], 'big')
-
-
-def build_merge_sql(cursor: Any, merge_temp_table_name: str, fq_target_table_name: str,
-                    active_field_names: List[str], primary_key_field_names: List[str],
-                    identity_field_name: Optional[str], cols_to_not_sync: set[str]) -> str:
-    """Build and prepare the MERGE SQL statement for the given active columns.
-
-    Recreates the merge temp table and returns the MERGE statement SQL.
-    """
-    cursor.execute(f'DROP TABLE IF EXISTS {merge_temp_table_name};')
-    quoted_active_field_names = f'[{"], [".join(active_field_names)}]'
-    # Hack to prevent SQL Server from copying IDENTITY property - see https://stackoverflow.com/a/57509258
-    cursor.execute(f'SELECT TOP 0 {quoted_active_field_names} INTO {merge_temp_table_name} FROM {fq_target_table_name} '
-                   f'UNION ALL SELECT {quoted_active_field_names} FROM {fq_target_table_name} WHERE 1 <> 1;')
-    for c in cols_to_not_sync:
-        if c in [f.lower() for f in active_field_names]:
-            cursor.execute(f'ALTER TABLE {merge_temp_table_name} DROP COLUMN [{c}];')
-
-    merge_match_predicates = ' AND '.join([f'tgt.[{c}] = src.[{c}]' for c in primary_key_field_names])
-    set_identity_insert_if_needed = f'SET IDENTITY_INSERT {fq_target_table_name} ON; ' if identity_field_name else ''
-
-    # Edge case: if all table cols are in the PK, SQL models updates as insert+delete in CDC,
-    # so WHEN MATCHED THEN UPDATE SET would be empty (syntactically invalid)
-    if set(active_field_names) == set(primary_key_field_names):
-        merge_stmt = f'''
-{set_identity_insert_if_needed}
-MERGE {fq_target_table_name} AS tgt
-USING {merge_temp_table_name} AS src
-    ON ({merge_match_predicates})
-WHEN NOT MATCHED THEN
-    INSERT ({quoted_active_field_names}) VALUES (src.[{'], src.['.join(active_field_names)}]);
-
-TRUNCATE TABLE {merge_temp_table_name};
-        '''
-    else:
-        update_cols = [x for x in active_field_names if x not in primary_key_field_names and x != identity_field_name]
-        merge_stmt = f'''
-{set_identity_insert_if_needed}
-MERGE {fq_target_table_name} AS tgt
-USING {merge_temp_table_name} AS src
-    ON ({merge_match_predicates})
-WHEN MATCHED THEN
-    UPDATE SET {", ".join([f'[{x}] = src.[{x}]' for x in update_cols])}
-WHEN NOT MATCHED THEN
-    INSERT ({quoted_active_field_names}) VALUES (src.[{'], src.['.join(active_field_names)}]);
-
-TRUNCATE TABLE {merge_temp_table_name};
-        '''
-
-    return merge_stmt
-
 
 logging.config.dictConfig({
     'version': 1,
@@ -173,6 +116,14 @@ class Progress(NamedTuple):
     commit_time: datetime
     replayer_progress_namespace: str
     replayer_process_id: str
+
+
+class ReplayConfig(NamedTuple):
+    replay_topic: str
+    target_db_table_schema: str
+    target_db_table_name: str
+    cols_to_not_sync: str
+    primary_key_fields_override: str
 
 
 def get_progress(opts: argparse.Namespace, conn: ctds.Connection) -> List[Progress]:
@@ -295,16 +246,8 @@ def format_coordinates(msg: Message) -> str:
            f'time {datetime.fromtimestamp(msg.timestamp()[1] / 1000, UTC)}'
 
 
-class ReplayConfig(NamedTuple):
-    replay_topic: str
-    target_db_table_schema: str
-    target_db_table_name: str
-    cols_to_not_sync: str
-    primary_key_fields_override: str
-
-
-def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: EventClass,
-                  queue: Queue, proc_id: str) -> None:
+def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: EventClass, queue: Queue,
+                  proc_id: str) -> None:
     """Worker process that replays a single topic to a single table."""
     logger.info(f"Starting replay worker for topic '{config.replay_topic}' -> "
                 f"[{config.target_db_table_schema}].[{config.target_db_table_name}]")
@@ -333,7 +276,7 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
 
     try:
         with ctds.connect(opts.target_db_server, user=opts.target_db_user, password=opts.target_db_password,
-                          database=opts.target_db_database, timeout=10, login_timeout=10) as db_conn:
+                          database=opts.target_db_database, timeout=15, login_timeout=15) as db_conn:
             with db_conn.cursor() as cursor:
                 # Create a modified opts object for this specific topic/table
                 worker_opts = argparse.Namespace(**vars(opts))
@@ -362,7 +305,7 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                 varchar_field_names: set[str] = set()
                 nvarchar_field_names: set[str] = set()
                 delete_temp_table_col_specs: List[str] = []
-                column_missing_value_defaults: Dict[str, Any] = {}
+                column_defaults: Dict[str, Any] = {}
 
                 cursor.execute('''
 SELECT name
@@ -386,7 +329,6 @@ ORDER BY [ORDINAL_POSITION]
                 for col_name, col_type, col_precision, col_is_nullable, col_default in cursor.fetchall():
                     if col_name.lower() in cols_to_not_sync or col_name.lower() in computed_cols:
                         continue
-                    column_missing_value_defaults[col_name] = None if col_is_nullable else col_default
                     field_names.append(col_name)
                     if col_type.lower().startswith('datetime'):  # TODO: more cases than "datetime"?
                         datetime_field_names.add(col_name)
@@ -394,18 +336,19 @@ ORDER BY [ORDINAL_POSITION]
                         varchar_field_names.add(col_name)
                     if col_type.lower() in ('nchar', 'nvarchar', 'ntext'):
                         nvarchar_field_names.add(col_name)
+                    column_defaults[col_name] = col_default and col_default.strip('()') or None
                     if col_name in primary_key_field_names:
                         precision: str = f'({col_precision})' if col_precision is not None else ''
                         nullability: str = '' if col_is_nullable else 'NOT NULL'
                         delete_temp_table_col_specs.append(f'[{col_name}] {col_type}{precision} {nullability}')
 
-                # Schema tracking: we'll dynamically rebuild merge SQL when the schema changes
-                # to only include columns that exist in the current message schema
-                current_value_schema_id: Optional[int] = None
-                active_field_names: List[str] = field_names.copy()
-                has_missing_columns: bool = False  # When True, forces merge path instead of direct insert
-                merge_stmt: str = ''  # Will be built on first message
-                quoted_active_field_names: str = ''
+                cursor.execute(f'DROP TABLE IF EXISTS {merge_temp_table_name};')
+                # Yep, this looks weird--it's a hack to prevent SQL Server from copying over the IDENTITY property
+                # of any columns that have it whenever it creates the temp table. https://stackoverflow.com/a/57509258
+                cursor.execute(f'SELECT TOP 0 * INTO {merge_temp_table_name} FROM {fq_target_table_name} '
+                               f'UNION ALL SELECT * FROM {fq_target_table_name} WHERE 1 <> 1;')
+                for c in itertools.chain(cols_to_not_sync, computed_cols):
+                    cursor.execute(f'ALTER TABLE {merge_temp_table_name} DROP COLUMN {c};')
 
                 cursor.execute(f'DROP TABLE IF EXISTS {delete_temp_table_name};')
                 cursor.execute(f'''
@@ -428,11 +371,40 @@ TRUNCATE TABLE {delete_temp_table_name};
                 cursor.execute('SELECT TOP 1 [name] FROM sys.columns WHERE object_id = OBJECT_ID(:0) AND is_identity = 1',
                                (fq_target_table_name,))
                 rows = cursor.fetchall()
-                if len(rows):
-                    identity_field_name = rows[0][0]
-                else:
-                    identity_field_name = None
+                identity_col_name: Optional[str] = rows and rows[0][0] or None
+                set_identity_insert_if_needed = f'SET IDENTITY_INSERT {fq_target_table_name} ON; ' \
+                    if identity_col_name else ''
 
+                merge_match_predicates: str = ' AND '.join([f'tgt.[{c}] = src.[{c}]' for c in primary_key_field_names])
+
+                # This is a real edge case, but if all the table cols are in the PK, then SQL always models an
+                # update as an insert+delete in CDC data, so the WHEN MATCHED THEN UPDATE SET would wind up empty
+                # which is syntactically invalid:
+                merge_stmt: str
+                if set(field_names) == set(primary_key_field_names):
+                    merge_stmt = f'''
+                        {set_identity_insert_if_needed}
+                        MERGE {fq_target_table_name} AS tgt
+                        USING {merge_temp_table_name} AS src
+                            ON ({merge_match_predicates})
+                        WHEN NOT MATCHED THEN
+                            INSERT ([{'], ['.join(field_names)}]) VALUES (src.[{'], src.['.join(field_names)}]);
+        
+                        TRUNCATE TABLE {merge_temp_table_name};
+                    '''
+                else:
+                    merge_stmt = f'''
+                        {set_identity_insert_if_needed}
+                        MERGE {fq_target_table_name} AS tgt
+                        USING {merge_temp_table_name} AS src
+                            ON ({merge_match_predicates})
+                        WHEN MATCHED THEN
+                            UPDATE SET {", ".join([f'[{x}] = src.[{x}]' for x in field_names if x not in primary_key_field_names and x != identity_col_name])}
+                        WHEN NOT MATCHED THEN
+                            INSERT ([{'], ['.join(field_names)}]) VALUES (src.[{'], src.['.join(field_names)}]);
+        
+                        TRUNCATE TABLE {merge_temp_table_name};
+                    '''
                 # Truncate target table if requested and no prior progress exists
                 existing_progress = get_progress(worker_opts, db_conn)
                 if opts.truncate_existing_data and not existing_progress:
@@ -465,36 +437,6 @@ TRUNCATE TABLE {delete_temp_table_name};
                     # noinspection PyNoneFunctionAssignment
                     msg_val = avro_deserializer(raw_val, SerializationContext(topic, MessageField.VALUE))  # type: ignore[func-returns-value, arg-type]
 
-                    # Check for schema change and rebuild SQL statements if needed
-                    new_schema_id = extract_confluent_schema_id(raw_val)
-                    if new_schema_id != current_value_schema_id:
-                        # Schema changed - determine which columns exist in this schema
-                        schema = schema_registry_client.get_schema(new_schema_id)
-                        avro_schema = json.loads(schema.schema_str)
-                        schema_field_names = {f['name'] for f in avro_schema.get('fields', [])}
-
-                        # active_field_names = columns that exist in both target table AND current schema
-                        active_field_names = [f for f in field_names if f in schema_field_names]
-                        has_missing_columns = len(active_field_names) < len(field_names)
-
-                        if has_missing_columns:
-                            missing_cols = set(field_names) - set(active_field_names)
-                            logger.info(f"Worker {config.replay_topic}: Schema {new_schema_id} is missing columns "
-                                       f"{missing_cols} that exist in target table. Will only sync columns present "
-                                       f"in schema and let DB use defaults for missing columns.")
-
-                        # Rebuild merge SQL for the active columns
-                        with db_conn.cursor() as schema_cursor:
-                            merge_stmt = build_merge_sql(
-                                schema_cursor, merge_temp_table_name, fq_target_table_name,
-                                active_field_names, primary_key_field_names,
-                                identity_field_name, cols_to_not_sync
-                            )
-                        quoted_active_field_names = f'[{"], [".join(active_field_names)}]'
-                        current_value_schema_id = new_schema_id
-                        logger.debug(f"Worker {config.replay_topic}: Rebuilt merge SQL for schema {new_schema_id} "
-                                    f"with {len(active_field_names)} columns")
-
                 if len(queued_deletes) >= opts.delete_batch_size or len(queued_upserts) >= opts.upsert_batch_size or \
                         (datetime.now() - last_commit_time).seconds > opts.max_commit_latency_seconds:
                     with db_conn.cursor() as cursor:
@@ -519,10 +461,8 @@ TRUNCATE TABLE {delete_temp_table_name};
                             merges: List[Any] = []
                             for _, (op, val) in queued_upserts.items():
                                 # CTDS unfortunately completely ignores values for target-table IDENTITY cols when doing
-                                # a bulk_insert, so in that case we have to fall back to the slower MERGE mechanism.
-                                # Also when has_missing_columns is True, the vals don't match the target table structure
-                                # so we must use the MERGE path with our rebuilt temp table:
-                                if (not identity_field_name) and (not has_missing_columns) and op == 'Insert':  # in ('Snapshot', 'Insert'): -- Snapshots can hit PK collisions! :(
+                                # a bulk_insert, so in that case we have to fall back to the slower MERGE mechanism:
+                                if (not identity_col_name) and op == 'Insert':  # in ('Snapshot', 'Insert'): -- Snapshots can hit PK collisions! :(
                                     inserts.append(val)
                                 else:
                                     merges.append(val)
@@ -547,9 +487,13 @@ TRUNCATE TABLE {delete_temp_table_name};
 
                             if merges:
                                 start_time = time.perf_counter()
-                                #import pprint;pprint.pprint(dict(zip(field_names, merges[0])))
+                                #pprint.pprint(dict(zip(field_names, merges[0])))
                                 #logger.info(merges)
-                                db_conn.bulk_insert(merge_temp_table_name, merges)
+                                try:
+                                    db_conn.bulk_insert(merge_temp_table_name, merges)
+                                except _tds.DatabaseError as e:
+                                    pprint.pprint(merges)
+                                    raise e
                                 sql_time_acc += time.perf_counter() - start_time
                                 elapsed_ms = int((time.perf_counter() - start_time) * 1000)
                                 logger.info('Worker %s: Inserted to temp table for merge: %s items in %s ms',
@@ -583,10 +527,9 @@ TRUNCATE TABLE {delete_temp_table_name};
                     delete_cnt += 1
                 else:
                     vals: List[Any] = []
-                    # Use active_field_names (columns present in current schema) not field_names (all target table columns)
-                    for f in active_field_names:
+                    for f in field_names:
                         if f not in msg_val:
-                            vals.append(column_missing_value_defaults[f])
+                            vals.append(column_defaults[f])
                         elif msg_val[f] is None:
                             vals.append(None)
                         elif f in datetime_field_names:
@@ -652,7 +595,6 @@ def main() -> None:
                    default=os.environ.get('SCHEMA_REGISTRY_URL'))
     p.add_argument('--extra-kafka-consumer-config',
                    default=os.environ.get('EXTRA_KAFKA_CONSUMER_CONFIG', {}), type=json.loads)
-    # kafka_oauth.add_kafka_oauth_arg(p)
 
     # Config for data target / progress tracking
     p.add_argument('--target-db-server',
@@ -824,13 +766,7 @@ def consumer_process(replay_configs: List[ReplayConfig], opts: argparse.Namespac
                      'auto.offset.reset': "earliest",
                      'on_commit': commit_cb,
                      **opts.extra_kafka_consumer_config}
-    # oauth_provider = kafka_oauth.get_kafka_oauth_provider()
-    # if oauth_provider is not None:
-    #     if not consumer_conf.get('security.protocol'):
-    #         consumer_conf['security.protocol'] = 'SASL_SSL'
-    #     if not consumer_conf.get('sasl.mechanisms'):
-    #         consumer_conf['sasl.mechanisms'] = 'OAUTHBEARER'
-    #     consumer_conf['oauth_cb'] = oauth_provider.consumer_oauth_cb
+
     consumer: Consumer = Consumer(consumer_conf)
 
     # Build topic partitions for all topics
