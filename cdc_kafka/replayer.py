@@ -78,6 +78,56 @@ from faster_fifo import Queue  # type: ignore[import-not-found]
 
 log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
 
+
+def parse_sql_default(col_default: Optional[str]) -> Any:
+    """Parse a SQL Server column default expression into a Python value.
+
+    Only handles simple literal defaults (numbers, strings). Returns None for
+    function calls (getdate(), newid(), etc.) or complex expressions, allowing
+    SQL Server to apply the default or the column to accept NULL.
+
+    Examples:
+        '((0))'       -> 0
+        '((3.14))'    -> 3.14
+        "('')"        -> ''
+        "(N'text')"   -> 'text'
+        '(getdate())' -> None (function, can't replicate in Python)
+        '(NULL)'      -> None
+    """
+    if not col_default:
+        return None
+
+    # Strip outer whitespace and parentheses layers
+    val = col_default.strip()
+    while val.startswith('(') and val.endswith(')'):
+        val = val[1:-1].strip()
+
+    if not val:
+        return None
+
+    # Explicit NULL
+    if val.upper() == 'NULL':
+        return None
+
+    # String literal: 'text' or N'text'
+    if val.upper().startswith("N'") and val.endswith("'"):
+        return val[2:-1].replace("''", "'")  # Unescape doubled quotes
+    if val.startswith("'") and val.endswith("'"):
+        return val[1:-1].replace("''", "'")
+
+    # Numeric literal
+    try:
+        if '.' in val:
+            return float(val)
+        return int(val)
+    except ValueError:
+        pass
+
+    # Anything else (functions like getdate(), newid(), complex expressions)
+    # Return None and let SQL Server handle it or accept NULL
+    return None
+
+
 logging.config.dictConfig({
     'version': 1,
     'disable_existing_loggers': False,
@@ -252,7 +302,6 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
     logger.info(f"Starting replay worker for topic '{config.replay_topic}' -> "
                 f"[{config.target_db_table_schema}].[{config.target_db_table_name}]")
 
-    msg_ctr: int = 0
     delete_cnt: int = 0
     upsert_cnt: int = 0
     poll_time_acc: float = 0.0
@@ -336,7 +385,7 @@ ORDER BY [ORDINAL_POSITION]
                         varchar_field_names.add(col_name)
                     if col_type.lower() in ('nchar', 'nvarchar', 'ntext'):
                         nvarchar_field_names.add(col_name)
-                    column_defaults[col_name] = col_default and col_default.strip('()') or None
+                    column_defaults[col_name] = parse_sql_default(col_default)
                     if col_name in primary_key_field_names:
                         precision: str = f'({col_precision})' if col_precision is not None else ''
                         nullability: str = '' if col_is_nullable else 'NOT NULL'
@@ -348,7 +397,7 @@ ORDER BY [ORDINAL_POSITION]
                 cursor.execute(f'SELECT TOP 0 * INTO {merge_temp_table_name} FROM {fq_target_table_name} '
                                f'UNION ALL SELECT * FROM {fq_target_table_name} WHERE 1 <> 1;')
                 for c in itertools.chain(cols_to_not_sync, computed_cols):
-                    cursor.execute(f'ALTER TABLE {merge_temp_table_name} DROP COLUMN {c};')
+                    cursor.execute(f'ALTER TABLE {merge_temp_table_name} DROP COLUMN [{c}];')
 
                 cursor.execute(f'DROP TABLE IF EXISTS {delete_temp_table_name};')
                 cursor.execute(f'''
@@ -410,7 +459,7 @@ TRUNCATE TABLE {delete_temp_table_name};
                 if opts.truncate_existing_data and not existing_progress:
                     logger.info(f"Worker {config.replay_topic}: Truncating target table {fq_target_table_name} "
                                f"(no prior progress exists)")
-                    cursor.execute(f'DELETE FROM {fq_target_table_name};')
+                    cursor.execute(f'TRUNCATE TABLE {fq_target_table_name};')
                     db_conn.commit()
                 elif opts.truncate_existing_data and existing_progress:
                     logger.info(f"Worker {config.replay_topic}: Skipping truncation of {fq_target_table_name} "
@@ -422,7 +471,7 @@ TRUNCATE TABLE {delete_temp_table_name};
             while True:
                 queue_get_wait_start = time.perf_counter()
                 try:
-                    topic, msg_partition, msg_offset, msg_timestamp, raw_key, raw_val = queue.get(timeout=0.01)
+                    topic, msg_partition, msg_offset, msg_timestamp, raw_key, raw_val = queue.get(timeout=0.1)
                 except stdlib_queue.Empty:
                     topic, msg_partition, msg_offset, msg_timestamp, raw_key, raw_val = None, None, None, None, None, None
                 queue_get_wait += time.perf_counter() - queue_get_wait_start
@@ -557,7 +606,7 @@ TRUNCATE TABLE {delete_temp_table_name};
                     # queued_deletes.discard(key_val)
                     upsert_cnt += 1
 
-                if len(queued_deletes) + len(queued_upserts) % 5_000 == 0:
+                if (len(queued_deletes) + len(queued_upserts)) % 5_000 == 0:
                     logger.debug('Worker %s: Currently have %s queued deletes and %s queued upserts. '
                                  'Time waiting on queue = %s. Apx. queue depth %s',
                                  config.replay_topic, len(queued_deletes), len(queued_upserts),
@@ -571,8 +620,7 @@ TRUNCATE TABLE {delete_temp_table_name};
         logger.exception(f"Worker for '{config.replay_topic}' encountered error: {e}")
     finally:
         stop_event.set()
-        logger.info(f"Worker for '{config.replay_topic}': Processed {msg_ctr} messages total, "
-                    f"{delete_cnt} deletes, {upsert_cnt} upserts.")
+        logger.info(f"Worker for '{config.replay_topic}': Processed {delete_cnt} deletes, {upsert_cnt} upserts.")
         overall_time = time.perf_counter() - proc_start_time
         logger.info(f"Worker for '{config.replay_topic}' total times:\n"
                     f"Kafka poll: {poll_time_acc:.2f}s\nSQL execution: {sql_time_acc:.2f}s\n"
@@ -800,7 +848,7 @@ def consumer_process(replay_configs: List[ReplayConfig], opts: argparse.Namespac
         return all(event.is_set() for event in stop_events.values())
 
     while not all_workers_stopped():
-        msg = consumer.poll(0.01)
+        msg = consumer.poll(0.1)
 
         if msg is None:
             continue
@@ -850,13 +898,13 @@ def consumer_process(replay_configs: List[ReplayConfig], opts: argparse.Namespac
             logger.info(f'Consumed %s messages total, stopping...', opts.consumed_messages_limit)
             break
 
-    # Close all queues
-    for queue in queues.values():
-        queue.close()
-
     # Set all stop events
     for event in stop_events.values():
         event.set()
+
+    # Close all queues
+    for queue in queues.values():
+        queue.close()
 
     logger.info("Closing shared consumer.")
     consumer.close()
