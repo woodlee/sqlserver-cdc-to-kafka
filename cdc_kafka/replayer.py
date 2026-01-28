@@ -80,33 +80,14 @@ log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
 
 
 def parse_sql_default(col_default: Optional[str]) -> Any:
-    """Parse a SQL Server column default expression into a Python value.
-
-    Only handles simple literal defaults (numbers, strings). Returns None for
-    function calls (getdate(), newid(), etc.) or complex expressions, allowing
-    SQL Server to apply the default or the column to accept NULL.
-
-    Examples:
-        '((0))'       -> 0
-        '((3.14))'    -> 3.14
-        "('')"        -> ''
-        "(N'text')"   -> 'text'
-        '(getdate())' -> None (function, can't replicate in Python)
-        '(NULL)'      -> None
-    """
     if not col_default:
         return None
 
-    # Strip outer whitespace and parentheses layers
     val = col_default.strip()
     while val.startswith('(') and val.endswith(')'):
         val = val[1:-1].strip()
 
-    if not val:
-        return None
-
-    # Explicit NULL
-    if val.upper() == 'NULL':
+    if (not val) or val.upper() == 'NULL':
         return None
 
     # String literal: 'text' or N'text'
@@ -153,6 +134,44 @@ logging.config.dictConfig({
 })
 
 logger = logging.getLogger(__name__)
+
+
+CDC_OPERATION_NAME_TO_ID = {
+    'Snapshot': 0,
+    'Delete': 1,
+    'Insert': 2,
+    'PreUpdate': 3,
+    'PostUpdate': 4,
+}
+
+
+class LsnPosition(NamedTuple):
+    """Represents an LSN position for comparison, using __log_lsn, __log_seqval, and operation.
+
+    Comparison follows SQL Server CDC ordering: lsn first, then seqval, then operation.
+    """
+    lsn: bytes
+    seqval: bytes
+    operation: int
+
+    @staticmethod
+    def from_message(msg_val: Dict[str, Any]) -> 'LsnPosition':
+        """Create an LsnPosition from a deserialized message value."""
+        lsn_hex = msg_val.get('__log_lsn', '0x' + '00' * 10)
+        seqval_hex = msg_val.get('__log_seqval', '0x' + '00' * 10)
+        operation_name = msg_val.get('__operation', 'Snapshot')
+        return LsnPosition(
+            lsn=bytes.fromhex(lsn_hex[2:]),  # Strip '0x' prefix
+            seqval=bytes.fromhex(seqval_hex[2:]),
+            operation=CDC_OPERATION_NAME_TO_ID.get(operation_name, 0)
+        )
+
+    def __repr__(self) -> str:
+        return f'LSN(0x{self.lsn.hex()}:{self.seqval.hex()}:{self.operation})'
+
+
+LOWEST_LSN_POSITION = LsnPosition(b'\x00' * 10, b'\x00' * 10, 0)
+HIGHEST_LSN_POSITION = LsnPosition(b'\xff' * 10, b'\xff' * 10, 4)
 
 
 class Progress(NamedTuple):
@@ -296,11 +315,179 @@ def format_coordinates(msg: Message) -> str:
            f'time {datetime.fromtimestamp(msg.timestamp()[1] / 1000, UTC)}'
 
 
+def get_latest_lsn_from_all_changes_topic(opts: argparse.Namespace) -> Tuple[LsnPosition, int]:
+    """Get the LSN and offset of the most recent message in the all-changes topic.
+
+    Returns a tuple of (LsnPosition, offset) for the latest message.
+    """
+    schema_registry_client = SchemaRegistryClient({'url': opts.schema_registry_url})
+    avro_deserializer = AvroDeserializer(schema_registry_client)
+
+    consumer_conf = {
+        'bootstrap.servers': opts.kafka_bootstrap_servers,
+        'group.id': f'replayer-lsn-lookup-{int(datetime.now().timestamp())}',
+        'enable.auto.offset.store': False,
+        'enable.auto.commit': False,
+        'auto.offset.reset': 'latest',
+        **opts.extra_kafka_consumer_config
+    }
+    consumer = Consumer(consumer_conf)
+
+    try:
+        # Get topic metadata
+        topics_meta: Dict[str, TopicMetadata] | None = consumer.list_topics(
+            topic=opts.all_changes_topic).topics  # type: ignore[call-arg]
+        if topics_meta is None:
+            raise Exception(f'No metadata found for topic {opts.all_changes_topic}')
+
+        partitions = list((topics_meta[opts.all_changes_topic].partitions or {}).keys())
+        if not partitions:
+            raise Exception(f'No partitions found for topic {opts.all_changes_topic}')
+
+        # For each partition, get the high watermark and read the last message
+        latest_lsn = LOWEST_LSN_POSITION
+        latest_offset = -1
+
+        for partition_id in partitions:
+            tp = TopicPartition(opts.all_changes_topic, partition_id)
+            low, high = consumer.get_watermark_offsets(tp)
+
+            if high <= low:
+                logger.debug(f'Partition {partition_id} is empty (low={low}, high={high})')
+                continue
+
+            # Seek to the last message
+            tp.offset = high - 2
+            consumer.assign([tp])
+
+            msg = consumer.poll(timeout=10.0)
+            if msg is None:
+                logger.warning(f'Could not read last message from partition {partition_id}')
+                continue
+
+            err = msg.error()
+            if err:
+                logger.warning(f'Error reading from partition {partition_id}: {err}')
+                continue
+
+            raw_val = msg.value()
+            if raw_val is None:
+                continue
+
+            msg_val = avro_deserializer(raw_val, SerializationContext(opts.all_changes_topic, MessageField.VALUE))
+            if msg_val is None:
+                continue
+
+            msg_lsn = LsnPosition.from_message(msg_val)
+            if msg_lsn > latest_lsn:
+                latest_lsn = msg_lsn
+                latest_offset = msg.offset()
+
+        if latest_offset < 0:
+            raise Exception(f'Could not find any messages in topic {opts.all_changes_topic}')
+
+        logger.info(f'Found latest LSN in all-changes topic: {latest_lsn} at offset {latest_offset}')
+        return latest_lsn, latest_offset
+
+    finally:
+        consumer.close()
+
+
+def get_all_changes_topic_progress(opts: argparse.Namespace, db_conn: ctds.Connection) -> Optional[Progress]:
+    """Get the progress record for the all-changes topic, if it exists."""
+    progress_table_fq_name = f'[{opts.progress_tracking_table_schema}].[{opts.progress_tracking_table_name}]'
+
+    with db_conn.cursor() as cursor:
+        cursor.execute(f'''
+SELECT [source_topic_name]
+    , [source_topic_partition]
+    , [target_table_object_id]
+    , [target_table_schema_name]
+    , [target_table_name]
+    , [last_handled_message_offset]
+    , [last_handled_message_timestamp]
+    , [commit_time]
+    , [replayer_progress_namespace]
+    , [replayer_process_id]
+FROM {progress_table_fq_name}
+WHERE [source_topic_name] = :0
+    AND [replayer_progress_namespace] = :1
+        ''', (opts.all_changes_topic, opts.progress_tracking_namespace))
+
+        row = cursor.fetchone()
+        if row:
+            return Progress(*row)
+        return None
+
+
+def commit_all_changes_topic_progress(opts: argparse.Namespace, offset: int, timestamp: int,
+                                      proc_id: str, db_conn: ctds.Connection) -> None:
+    """Commit progress for the all-changes topic."""
+    progress_table_fq_name = f'[{opts.progress_tracking_table_schema}].[{opts.progress_tracking_table_name}]'
+
+    with db_conn.cursor() as cursor:
+        cursor.execute(f'''
+MERGE {progress_table_fq_name} AS pt
+USING (SELECT
+    :0 AS [source_topic_name]
+    , 0 AS [source_topic_partition]
+    , 0 AS [target_table_object_id]
+    , '' AS [target_table_schema_name]
+    , '' AS [target_table_name]
+    , :1 AS [last_handled_message_offset]
+    , :2 AS [last_handled_message_timestamp]
+    , GETDATE() AS [commit_time]
+    , :3 AS [replayer_progress_namespace]
+    , :4 AS [replayer_process_id]
+) AS row ON (pt.[source_topic_name] = row.[source_topic_name]
+    AND pt.[replayer_progress_namespace] = row.[replayer_progress_namespace]
+    AND pt.[source_topic_partition] = row.[source_topic_partition]
+)
+WHEN MATCHED THEN UPDATE SET
+    [last_handled_message_offset] = row.[last_handled_message_offset]
+    , [last_handled_message_timestamp] = row.[last_handled_message_timestamp]
+    , [commit_time] = row.[commit_time]
+    , [replayer_process_id] = row.[replayer_process_id]
+WHEN NOT MATCHED THEN INSERT (
+    [source_topic_name]
+    , [source_topic_partition]
+    , [target_table_object_id]
+    , [target_table_schema_name]
+    , [target_table_name]
+    , [last_handled_message_offset]
+    , [last_handled_message_timestamp]
+    , [commit_time]
+    , [replayer_progress_namespace]
+    , [replayer_process_id]
+)
+VALUES (
+    row.[source_topic_name]
+    , row.[source_topic_partition]
+    , row.[target_table_object_id]
+    , row.[target_table_schema_name]
+    , row.[target_table_name]
+    , row.[last_handled_message_offset]
+    , row.[last_handled_message_timestamp]
+    , row.[commit_time]
+    , row.[replayer_progress_namespace]
+    , row.[replayer_process_id]
+);
+        ''', (opts.all_changes_topic, offset,
+              datetime.fromtimestamp(timestamp / 1000, UTC).replace(tzinfo=None),
+              opts.progress_tracking_namespace, proc_id))
+        db_conn.commit()
+
+
 def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: EventClass, queue: Queue,
-                  proc_id: str) -> None:
-    """Worker process that replays a single topic to a single table."""
+                  proc_id: str, cutoff_lsn: Optional[LsnPosition] = None) -> None:
+    """Worker process that replays a single topic to a single table.
+
+    If cutoff_lsn is provided (backfill mode), the worker stops when it sees a message
+    with an LSN exceeding the cutoff.
+    """
     logger.info(f"Starting replay worker for topic '{config.replay_topic}' -> "
-                f"[{config.target_db_table_schema}].[{config.target_db_table_name}]")
+                f"[{config.target_db_table_schema}].[{config.target_db_table_name}]"
+                f"{f' (cutoff: {cutoff_lsn})' if cutoff_lsn else ''}")
 
     delete_cnt: int = 0
     upsert_cnt: int = 0
@@ -340,12 +527,12 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                     primary_key_field_names = [x.strip() for x in config.primary_key_fields_override.split(',')]
                 else:
                     cursor.execute(f'''
-    SELECT [COLUMN_NAME]
-    FROM [INFORMATION_SCHEMA].[KEY_COLUMN_USAGE]
-    WHERE OBJECTPROPERTY(OBJECT_ID([CONSTRAINT_SCHEMA] + '.' + QUOTENAME([CONSTRAINT_NAME])), 'IsPrimaryKey') = 1
-    AND [TABLE_SCHEMA] = :0
-    AND [TABLE_NAME] = :1
-    ORDER BY [ORDINAL_POSITION]
+SELECT [COLUMN_NAME]
+FROM [INFORMATION_SCHEMA].[KEY_COLUMN_USAGE]
+WHERE OBJECTPROPERTY(OBJECT_ID([CONSTRAINT_SCHEMA] + '.' + QUOTENAME([CONSTRAINT_NAME])), 'IsPrimaryKey') = 1
+AND [TABLE_SCHEMA] = :0
+AND [TABLE_NAME] = :1
+ORDER BY [ORDINAL_POSITION]
                     ''', (config.target_db_table_schema, config.target_db_table_name))
                     primary_key_field_names = [r[0] for r in cursor.fetchall()]
 
@@ -432,27 +619,27 @@ TRUNCATE TABLE {delete_temp_table_name};
                 merge_stmt: str
                 if set(field_names) == set(primary_key_field_names):
                     merge_stmt = f'''
-                        {set_identity_insert_if_needed}
-                        MERGE {fq_target_table_name} AS tgt
-                        USING {merge_temp_table_name} AS src
-                            ON ({merge_match_predicates})
-                        WHEN NOT MATCHED THEN
-                            INSERT ([{'], ['.join(field_names)}]) VALUES (src.[{'], src.['.join(field_names)}]);
-        
-                        TRUNCATE TABLE {merge_temp_table_name};
+{set_identity_insert_if_needed}
+MERGE {fq_target_table_name} AS tgt
+USING {merge_temp_table_name} AS src
+    ON ({merge_match_predicates})
+WHEN NOT MATCHED THEN
+    INSERT ([{'], ['.join(field_names)}]) VALUES (src.[{'], src.['.join(field_names)}]);
+
+TRUNCATE TABLE {merge_temp_table_name};
                     '''
                 else:
                     merge_stmt = f'''
-                        {set_identity_insert_if_needed}
-                        MERGE {fq_target_table_name} AS tgt
-                        USING {merge_temp_table_name} AS src
-                            ON ({merge_match_predicates})
-                        WHEN MATCHED THEN
-                            UPDATE SET {", ".join([f'[{x}] = src.[{x}]' for x in field_names if x not in primary_key_field_names and x != identity_col_name])}
-                        WHEN NOT MATCHED THEN
-                            INSERT ([{'], ['.join(field_names)}]) VALUES (src.[{'], src.['.join(field_names)}]);
-        
-                        TRUNCATE TABLE {merge_temp_table_name};
+{set_identity_insert_if_needed}
+MERGE {fq_target_table_name} AS tgt
+USING {merge_temp_table_name} AS src
+    ON ({merge_match_predicates})
+WHEN MATCHED THEN
+    UPDATE SET {", ".join([f'[{x}] = src.[{x}]' for x in field_names if x not in primary_key_field_names and x != identity_col_name])}
+WHEN NOT MATCHED THEN
+    INSERT ([{'], ['.join(field_names)}]) VALUES (src.[{'], src.['.join(field_names)}]);
+
+TRUNCATE TABLE {merge_temp_table_name};
                     '''
                 # Truncate target table if requested and no prior progress exists
                 existing_progress = get_progress(worker_opts, db_conn)
@@ -486,7 +673,20 @@ TRUNCATE TABLE {delete_temp_table_name};
                     # noinspection PyNoneFunctionAssignment
                     msg_val = avro_deserializer(raw_val, SerializationContext(topic, MessageField.VALUE))  # type: ignore[func-returns-value, arg-type]
 
-                if len(queued_deletes) >= opts.delete_batch_size or len(queued_upserts) >= opts.upsert_batch_size or \
+                # Check cutoff LSN in backfill mode
+                reached_cutoff = False
+                if cutoff_lsn is not None and msg_val is not None:
+                    msg_lsn = LsnPosition.from_message(msg_val)
+                    if msg_lsn > cutoff_lsn:
+                        logger.info(f"Worker {config.replay_topic}: reached cutoff LSN at offset {msg_offset} "
+                                   f"(msg LSN {msg_lsn} > cutoff {cutoff_lsn}). Will flush and stop.")
+                        reached_cutoff = True
+                        # Clear the current message so we don't process it, but continue to flush
+                        msg_key = None
+                        msg_val = None
+
+                if reached_cutoff or len(queued_deletes) >= opts.delete_batch_size or \
+                        len(queued_upserts) >= opts.upsert_batch_size or \
                         (datetime.now() - last_commit_time).seconds > opts.max_commit_latency_seconds:
                     with db_conn.cursor() as cursor:
                         if queued_deletes:
@@ -536,8 +736,6 @@ TRUNCATE TABLE {delete_temp_table_name};
 
                             if merges:
                                 start_time = time.perf_counter()
-                                #pprint.pprint(dict(zip(field_names, merges[0])))
-                                #logger.info(merges)
                                 try:
                                     db_conn.bulk_insert(merge_temp_table_name, merges)
                                 except _tds.DatabaseError as e:
@@ -561,6 +759,10 @@ TRUNCATE TABLE {delete_temp_table_name};
                             queued_deletes.clear()
                             commit_progress(worker_opts, last_consume_by_partition, proc_id, db_conn)
                             last_commit_time = datetime.now()
+
+                    if reached_cutoff:
+                        logger.info(f"Worker {config.replay_topic}: flushed remaining work, exiting.")
+                        break
 
                     if stop_event.is_set() and queue.empty():
                         break
@@ -683,6 +885,17 @@ def main() -> None:
                    default=os.environ.get('TRUNCATE_EXISTING_DATA', '').lower() in ('true', '1', 'yes'),
                    help='Truncate target table data if no prior progress exists')
 
+    # Mode selection for backfill vs follow
+    p.add_argument('--mode',
+                   default=os.environ.get('REPLAYER_MODE', 'backfill'),
+                   choices=['backfill', 'follow'],
+                   help='Operation mode: "backfill" replays single-table topics in parallel up to a cutoff LSN, '
+                        '"follow" reads the all-changes topic in order to maintain FK constraints')
+    p.add_argument('--all-changes-topic',
+                   default=os.environ.get('ALL_CHANGES_TOPIC'),
+                   help='Name of the unified all-changes topic (e.g., "ssy_all_cdc_changes") containing messages '
+                        'from all tables in LSN order')
+
     opts, _ = p.parse_known_args()
 
     # Validate common required arguments
@@ -690,6 +903,10 @@ def main() -> None:
             opts.target_db_user and opts.target_db_password and opts.target_db_database):
         raise Exception('Arguments kafka_bootstrap_servers, schema_registry_url, target_db_server, '
                         'target_db_user, target_db_password, and target_db_database are all required.')
+
+    # Validate all-changes-topic is provided (required for both modes)
+    if not opts.all_changes_topic:
+        raise Exception('Argument --all-changes-topic is required.')
 
     # Build list of replay configurations
     replay_configs: List[ReplayConfig] = []
@@ -720,7 +937,19 @@ def main() -> None:
         raise Exception('Either --topic-to-table-map OR (--replay-topic, --target-db-table-schema, '
                         'and --target-db-table-name) must be provided.')
 
-    logger.info(f"Starting CDC replayer with {len(replay_configs)} topic(s) to replay.")
+    logger.info(f"Starting CDC replayer in {opts.mode} mode with {len(replay_configs)} topic(s).")
+
+    if opts.mode == 'backfill':
+        run_backfill_mode(opts, replay_configs)
+    else:
+        run_follow_mode(opts, replay_configs)
+
+
+def run_backfill_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfig]) -> None:
+    """Run the replayer in backfill mode - parallel replay up to a cutoff LSN."""
+    # Get cutoff LSN from the all-changes topic
+    cutoff_lsn, cutoff_offset = get_latest_lsn_from_all_changes_topic(opts)
+    logger.info(f"Backfill mode: will replay up to LSN {cutoff_lsn}")
 
     # Create shared structures for the consumer process
     stop_events: Dict[str, EventClass] = {}
@@ -743,15 +972,16 @@ def main() -> None:
             worker_opts.target_db_table_name = config.target_db_table_name
             progress_by_topic[config.replay_topic] = get_progress(worker_opts, db_conn)
 
-    # Launch single shared consumer process
+    # Launch single shared consumer process (with cutoff LSN for backfill mode)
     consumer_proc = mp.Process(
-        target=consumer_process,
+        target=backfill_consumer_process,
         name='shared-consumer',
-        args=(replay_configs, opts, stop_events, queues, progress_by_topic, proc_id, logger)
+        args=(replay_configs, opts, stop_events, queues, progress_by_topic, proc_id, cutoff_lsn, logger)
     )
 
     # Launch worker processes for each topic/table pair
     workers: List[mp.Process] = []
+    backfill_completed = False
     try:
         consumer_proc.start()
         logger.info("Launched shared consumer process")
@@ -762,7 +992,8 @@ def main() -> None:
             worker = mp.Process(
                 target=replay_worker,
                 name=f'replayer-{config.replay_topic}',
-                args=(config, opts, stop_events[config.replay_topic], queues[config.replay_topic], worker_proc_id)
+                args=(config, opts, stop_events[config.replay_topic], queues[config.replay_topic],
+                      worker_proc_id, cutoff_lsn)
             )
             worker.start()
             workers.append(worker)
@@ -776,7 +1007,18 @@ def main() -> None:
         # Wait for consumer to finish
         consumer_proc.join()
 
+        backfill_completed = True
         logger.info("All replay workers have completed.")
+
+        # Write progress for the all-changes topic so follow mode knows where to start
+        with ctds.connect(opts.target_db_server, user=opts.target_db_user, password=opts.target_db_password,
+                         database=opts.target_db_database, timeout=30, login_timeout=30) as db_conn:
+            # Use current timestamp for the progress record
+            commit_all_changes_topic_progress(opts, cutoff_offset, int(datetime.now().timestamp() * 1000),
+                                              proc_id, db_conn)
+            logger.info(f"Backfill complete. Wrote all-changes topic progress at offset {cutoff_offset} "
+                       f"for follow mode handoff.")
+
     except KeyboardInterrupt:
         logger.info("Received interrupt signal, shutting down workers...")
         for event in stop_events.values():
@@ -803,10 +1045,401 @@ def main() -> None:
         consumer_proc.join(timeout=5)
 
 
-def consumer_process(replay_configs: List[ReplayConfig], opts: argparse.Namespace,
-                     stop_events: Dict[str, EventClass], queues: Dict[str, Queue],
-                     progress_by_topic: Dict[str, List[Progress]], proc_id: str, logger: logging.Logger) -> None:
-    """Single consumer process that reads from multiple topics and routes raw messages to worker queues."""
+def run_follow_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfig]) -> None:
+    """Run the replayer in follow mode - ordered replay from the all-changes topic."""
+    proc_id: str = f'{socket.getfqdn()}+{int(datetime.now().timestamp())}'
+
+    # Check for existing all-changes topic progress
+    with ctds.connect(opts.target_db_server, user=opts.target_db_user, password=opts.target_db_password,
+                     database=opts.target_db_database, timeout=30, login_timeout=30) as db_conn:
+        all_changes_progress = get_all_changes_topic_progress(opts, db_conn)
+        if all_changes_progress is None:
+            raise Exception(f'No progress found for all-changes topic "{opts.all_changes_topic}" in namespace '
+                           f'"{opts.progress_tracking_namespace}". Run backfill mode first to establish progress.')
+
+        start_offset = all_changes_progress.last_handled_message_offset + 1
+        logger.info(f"Follow mode: starting from all-changes topic offset {start_offset}")
+
+    # Build topic-to-config mapping for routing messages
+    topic_to_config: Dict[str, ReplayConfig] = {config.replay_topic: config for config in replay_configs}
+
+    # Initialize Kafka consumer
+    consumer_conf = {
+        'bootstrap.servers': opts.kafka_bootstrap_servers,
+        'group.id': f'replayer-follow-{proc_id}',
+        'enable.auto.offset.store': False,
+        'enable.auto.commit': False,
+        'auto.offset.reset': 'earliest',
+        **opts.extra_kafka_consumer_config
+    }
+    consumer = Consumer(consumer_conf)
+
+    # Initialize Avro deserializer
+    schema_registry_client = SchemaRegistryClient({'url': opts.schema_registry_url})
+    avro_deserializer = AvroDeserializer(schema_registry_client)
+
+    # Assign to all-changes topic partition(s) at the saved offset
+    topics_meta: Dict[str, TopicMetadata] | None = consumer.list_topics(
+        topic=opts.all_changes_topic).topics  # type: ignore[call-arg]
+    if topics_meta is None:
+        raise Exception(f'No metadata found for topic {opts.all_changes_topic}')
+
+    partitions = list((topics_meta[opts.all_changes_topic].partitions or {}).keys())
+    if len(partitions) != 1:
+        logger.warning(f'All-changes topic has {len(partitions)} partitions; expected 1 for ordered processing')
+
+    topic_partitions = [TopicPartition(opts.all_changes_topic, p, start_offset) for p in partitions]
+    consumer.assign(topic_partitions)
+
+    logger.info(f"Follow mode: consuming from {opts.all_changes_topic}, assigned partitions: {partitions}")
+
+    # Initialize per-table worker state
+    # We'll use a simplified single-threaded approach that processes one message at a time
+    # and maintains state per target table
+    table_workers: Dict[str, 'FollowModeTableWorker'] = {}
+    for config in replay_configs:
+        table_workers[config.replay_topic] = FollowModeTableWorker(config, opts, proc_id)
+
+    msg_ctr = 0
+    last_all_changes_offset = start_offset - 1
+    last_all_changes_timestamp = 0
+    last_commit_time = datetime.now()
+
+    try:
+        while True:
+            msg = consumer.poll(0.5)
+
+            if msg is None:
+                # Periodically commit progress even without new messages
+                if (datetime.now() - last_commit_time).seconds > opts.max_commit_latency_seconds:
+                    _flush_all_table_workers(table_workers, opts, proc_id)
+                    if last_all_changes_offset >= start_offset:
+                        with ctds.connect(opts.target_db_server, user=opts.target_db_user,
+                                         password=opts.target_db_password, database=opts.target_db_database,
+                                         timeout=30, login_timeout=30) as db_conn:
+                            commit_all_changes_topic_progress(opts, last_all_changes_offset,
+                                                             last_all_changes_timestamp, proc_id, db_conn)
+                    last_commit_time = datetime.now()
+                continue
+
+            err = msg.error()
+            if err:
+                # noinspection PyProtectedMember
+                if err.code() == KafkaError._PARTITION_EOF:
+                    continue
+                else:
+                    raise Exception(msg.error())
+
+            msg_ctr += 1
+
+            # Get the original topic from message header
+            headers = msg.headers() or []
+            original_topic = None
+            for header_key, header_val in headers:
+                if header_key == 'cdc_to_kafka_original_topic':
+                    original_topic = header_val.decode('utf-8') if isinstance(header_val, bytes) else header_val
+                    break
+
+            if original_topic is None:
+                logger.warning(f'Message at offset {msg.offset()} missing cdc_to_kafka_original_topic header, skipping')
+                last_all_changes_offset = msg.offset()
+                last_all_changes_timestamp = msg.timestamp()[1]
+                continue
+
+            if original_topic not in table_workers:
+                # This table isn't in our replay config, skip it
+                last_all_changes_offset = msg.offset()
+                last_all_changes_timestamp = msg.timestamp()[1]
+                continue
+
+            # Deserialize the message
+            raw_key = msg.key()
+            raw_val = msg.value()
+
+            msg_key: Optional[Dict[str, Any]] = None
+            msg_val: Optional[Dict[str, Any]] = None
+            if raw_key is not None:
+                # Use the original topic for schema lookup
+                msg_key = avro_deserializer(raw_key, SerializationContext(original_topic, MessageField.KEY))
+            if raw_val is not None:
+                msg_val = avro_deserializer(raw_val, SerializationContext(original_topic, MessageField.VALUE))
+
+            # Process the message through the appropriate table worker
+            worker = table_workers[original_topic]
+            worker.process_message(msg_key, msg_val, msg.offset(), msg.timestamp()[1])
+
+            last_all_changes_offset = msg.offset()
+            last_all_changes_timestamp = msg.timestamp()[1]
+
+            if msg_ctr % 5_000 == 0:
+                logger.debug(f'Follow mode: processed {msg_ctr} messages, at offset {last_all_changes_offset}')
+
+            # Periodically flush and commit
+            if (datetime.now() - last_commit_time).seconds > opts.max_commit_latency_seconds:
+                _flush_all_table_workers(table_workers, opts, proc_id)
+                with ctds.connect(opts.target_db_server, user=opts.target_db_user,
+                                 password=opts.target_db_password, database=opts.target_db_database,
+                                 timeout=30, login_timeout=30) as db_conn:
+                    commit_all_changes_topic_progress(opts, last_all_changes_offset,
+                                                     last_all_changes_timestamp, proc_id, db_conn)
+                last_commit_time = datetime.now()
+
+            if 0 < opts.consumed_messages_limit <= msg_ctr:
+                logger.info(f'Consumed {msg_ctr} messages, stopping...')
+                break
+
+    except KeyboardInterrupt:
+        logger.info("Received interrupt signal, shutting down follow mode...")
+    finally:
+        # Final flush
+        _flush_all_table_workers(table_workers, opts, proc_id)
+        if last_all_changes_offset >= start_offset:
+            with ctds.connect(opts.target_db_server, user=opts.target_db_user,
+                             password=opts.target_db_password, database=opts.target_db_database,
+                             timeout=30, login_timeout=30) as db_conn:
+                commit_all_changes_topic_progress(opts, last_all_changes_offset,
+                                                 last_all_changes_timestamp, proc_id, db_conn)
+
+        # Close table workers
+        for worker in table_workers.values():
+            worker.close()
+
+        consumer.close()
+        logger.info(f"Follow mode: processed {msg_ctr} messages total, final offset {last_all_changes_offset}")
+
+
+def _flush_all_table_workers(table_workers: Dict[str, 'FollowModeTableWorker'],
+                             opts: argparse.Namespace, proc_id: str) -> None:
+    """Flush all table workers' queued operations."""
+    for worker in table_workers.values():
+        worker.flush(opts, proc_id)
+
+
+class FollowModeTableWorker:
+    """Manages state for a single table in follow mode."""
+
+    def __init__(self, config: ReplayConfig, opts: argparse.Namespace, proc_id: str) -> None:
+        self.config = config
+        self.fq_target_table_name = f'[{config.target_db_table_schema.strip()}].[{config.target_db_table_name.strip()}]'
+        self.cols_to_not_sync: set[str] = set([c.strip().lower() for c in config.cols_to_not_sync.split(',')])
+        self.cols_to_not_sync.discard('')
+
+        self.queued_deletes: Set[Any] = set()
+        self.queued_upserts: Dict[Any, Tuple[str, List[Any]]] = {}
+        self.last_offset_by_partition: Dict[int, Tuple[int, int]] = {}
+        self.delete_cnt = 0
+        self.upsert_cnt = 0
+
+        # Initialize database connection and get table metadata
+        self.db_conn = ctds.connect(opts.target_db_server, user=opts.target_db_user,
+                                    password=opts.target_db_password, database=opts.target_db_database,
+                                    timeout=15, login_timeout=15)
+
+        with self.db_conn.cursor() as cursor:
+            # Get primary key fields
+            if config.primary_key_fields_override.strip():
+                self.primary_key_field_names = [x.strip() for x in config.primary_key_fields_override.split(',')]
+            else:
+                cursor.execute('''
+    SELECT [COLUMN_NAME]
+    FROM [INFORMATION_SCHEMA].[KEY_COLUMN_USAGE]
+    WHERE OBJECTPROPERTY(OBJECT_ID([CONSTRAINT_SCHEMA] + '.' + QUOTENAME([CONSTRAINT_NAME])), 'IsPrimaryKey') = 1
+    AND [TABLE_SCHEMA] = :0
+    AND [TABLE_NAME] = :1
+    ORDER BY [ORDINAL_POSITION]
+                ''', (config.target_db_table_schema, config.target_db_table_name))
+                self.primary_key_field_names = [r[0] for r in cursor.fetchall()]
+
+            # Get computed columns
+            cursor.execute('''
+SELECT name
+FROM sys.computed_columns
+WHERE OBJECT_SCHEMA_NAME(object_id) = :0
+    AND OBJECT_NAME(object_id) = :1
+            ''', (config.target_db_table_schema, config.target_db_table_name))
+            computed_cols: set[str] = {r[0].lower() for r in cursor.fetchall()}
+
+            # Get column metadata
+            self.field_names: List[str] = []
+            self.datetime_field_names: set[str] = set()
+            self.varchar_field_names: set[str] = set()
+            self.nvarchar_field_names: set[str] = set()
+            self.column_defaults: Dict[str, Any] = {}
+            delete_temp_table_col_specs: List[str] = []
+
+            cursor.execute('''
+SELECT [COLUMN_NAME]
+    , [DATA_TYPE]
+    , COALESCE([CHARACTER_MAXIMUM_LENGTH], [DATETIME_PRECISION]) AS [PRECISION_SPEC]
+    , [IS_NULLABLE]
+    , [COLUMN_DEFAULT]
+FROM [INFORMATION_SCHEMA].[COLUMNS]
+WHERE [TABLE_SCHEMA] = :0
+    AND [TABLE_NAME] = :1
+ORDER BY [ORDINAL_POSITION]
+            ''', (config.target_db_table_schema, config.target_db_table_name))
+
+            for col_name, col_type, col_precision, col_is_nullable, col_default in cursor.fetchall():
+                if col_name.lower() in self.cols_to_not_sync or col_name.lower() in computed_cols:
+                    continue
+                self.field_names.append(col_name)
+                if col_type.lower().startswith('datetime'):
+                    self.datetime_field_names.add(col_name)
+                if col_type.lower() in ('char', 'varchar', 'text'):
+                    self.varchar_field_names.add(col_name)
+                if col_type.lower() in ('nchar', 'nvarchar', 'ntext'):
+                    self.nvarchar_field_names.add(col_name)
+                self.column_defaults[col_name] = parse_sql_default(col_default)
+                if col_name in self.primary_key_field_names:
+                    precision = f'({col_precision})' if col_precision is not None else ''
+                    nullability = '' if col_is_nullable else 'NOT NULL'
+                    delete_temp_table_col_specs.append(f'[{col_name}] {col_type}{precision} {nullability}')
+
+            # Create temp tables
+            temp_table_base_name = f'#replayer_{config.target_db_table_schema.strip()}_{config.target_db_table_name.strip()}'
+            self.delete_temp_table_name = temp_table_base_name + '_delete'
+            self.merge_temp_table_name = temp_table_base_name + '_merge'
+
+            cursor.execute(f'DROP TABLE IF EXISTS {self.merge_temp_table_name};')
+            cursor.execute(f'SELECT TOP 0 * INTO {self.merge_temp_table_name} FROM {self.fq_target_table_name} '
+                          f'UNION ALL SELECT * FROM {self.fq_target_table_name} WHERE 1 <> 1;')
+            for c in itertools.chain(self.cols_to_not_sync, computed_cols):
+                cursor.execute(f'ALTER TABLE {self.merge_temp_table_name} DROP COLUMN [{c}];')
+
+            cursor.execute(f'DROP TABLE IF EXISTS {self.delete_temp_table_name};')
+            cursor.execute(f'''
+CREATE TABLE {self.delete_temp_table_name} (
+    {",".join(delete_temp_table_col_specs)},
+    CONSTRAINT [PK_{self.delete_temp_table_name}]
+    PRIMARY KEY ([{"], [".join(self.primary_key_field_names)}])
+);
+            ''')
+
+            # Build SQL statements
+            delete_join_predicates = ' AND '.join([f'tgt.[{c}] = dtt.[{c}]' for c in self.primary_key_field_names])
+            self.delete_stmt = f'''
+DELETE tgt
+FROM {self.fq_target_table_name} AS tgt
+INNER JOIN {self.delete_temp_table_name} AS dtt ON ({delete_join_predicates});
+
+TRUNCATE TABLE {self.delete_temp_table_name};
+            '''
+
+            cursor.execute('SELECT TOP 1 [name] FROM sys.columns WHERE object_id = OBJECT_ID(:0) AND is_identity = 1',
+                          (self.fq_target_table_name,))
+            rows = cursor.fetchall()
+            self.identity_col_name: Optional[str] = rows and rows[0][0] or None
+            set_identity_insert_if_needed = f'SET IDENTITY_INSERT {self.fq_target_table_name} ON; ' \
+                if self.identity_col_name else ''
+
+            merge_match_predicates = ' AND '.join([f'tgt.[{c}] = src.[{c}]' for c in self.primary_key_field_names])
+
+            if set(self.field_names) == set(self.primary_key_field_names):
+                self.merge_stmt = f'''
+                    {set_identity_insert_if_needed}
+                    MERGE {self.fq_target_table_name} AS tgt
+                    USING {self.merge_temp_table_name} AS src
+                        ON ({merge_match_predicates})
+                    WHEN NOT MATCHED THEN
+                        INSERT ([{'], ['.join(self.field_names)}]) VALUES (src.[{'], src.['.join(self.field_names)}]);
+
+                    TRUNCATE TABLE {self.merge_temp_table_name};
+                '''
+            else:
+                self.merge_stmt = f'''
+                    {set_identity_insert_if_needed}
+                    MERGE {self.fq_target_table_name} AS tgt
+                    USING {self.merge_temp_table_name} AS src
+                        ON ({merge_match_predicates})
+                    WHEN MATCHED THEN
+                        UPDATE SET {", ".join([f'[{x}] = src.[{x}]' for x in self.field_names if x not in self.primary_key_field_names and x != self.identity_col_name])}
+                    WHEN NOT MATCHED THEN
+                        INSERT ([{'], ['.join(self.field_names)}]) VALUES (src.[{'], src.['.join(self.field_names)}]);
+
+                    TRUNCATE TABLE {self.merge_temp_table_name};
+                '''
+
+        logger.info(f"Follow mode: initialized table worker for {self.fq_target_table_name}")
+
+    def process_message(self, msg_key: Optional[Dict[str, Any]], msg_val: Optional[Dict[str, Any]],
+                       offset: int, timestamp: int) -> None:
+        """Process a single message for this table."""
+        if msg_key is None:
+            return
+
+        key_val = tuple((msg_key[x] for x in self.primary_key_field_names))
+
+        if msg_val is None or msg_val.get('__operation') == 'Delete':
+            self.queued_deletes.add(key_val)
+            self.queued_upserts.pop(key_val, None)
+            self.delete_cnt += 1
+        else:
+            vals: List[Any] = []
+            for f in self.field_names:
+                if f not in msg_val:
+                    vals.append(self.column_defaults[f])
+                elif msg_val[f] is None:
+                    vals.append(None)
+                elif f in self.datetime_field_names:
+                    dt = datetime.fromisoformat(msg_val[f])
+                    if dt.year < 1753:
+                        dt = datetime(1753, 1, 1, 0, 0, 0)
+                    vals.append(dt)
+                elif f in self.varchar_field_names:
+                    vals.append(ctds.SqlVarChar(msg_val[f].encode('cp1252')))
+                elif f in self.nvarchar_field_names:
+                    vals.append(ctds.SqlVarChar(msg_val[f].encode('utf-16le')))
+                else:
+                    vals.append(msg_val[f])
+            self.queued_upserts[key_val] = (msg_val['__operation'], vals)
+            self.upsert_cnt += 1
+
+        # Track progress per partition (use 0 since all-changes topic is single partition)
+        self.last_offset_by_partition[0] = (offset, timestamp)
+
+    def flush(self, opts: argparse.Namespace, proc_id: str) -> None:
+        """Flush queued operations to the database."""
+        if not self.queued_deletes and not self.queued_upserts:
+            return
+
+        with self.db_conn.cursor() as cursor:
+            if self.queued_deletes:
+                self.db_conn.bulk_insert(self.delete_temp_table_name, list(self.queued_deletes))
+                cursor.execute(self.delete_stmt)
+                logger.debug(f'Follow mode worker {self.config.replay_topic}: deleted {len(self.queued_deletes)} rows')
+
+            if self.queued_upserts:
+                merges = [val for _, (op, val) in self.queued_upserts.items()]
+                self.db_conn.bulk_insert(self.merge_temp_table_name, merges)
+                cursor.execute(self.merge_stmt)
+                logger.debug(f'Follow mode worker {self.config.replay_topic}: merged {len(merges)} rows')
+
+            self.queued_deletes.clear()
+            self.queued_upserts.clear()
+
+            # Commit per-table progress
+            worker_opts = argparse.Namespace(**vars(opts))
+            worker_opts.replay_topic = self.config.replay_topic
+            worker_opts.target_db_table_schema = self.config.target_db_table_schema
+            worker_opts.target_db_table_name = self.config.target_db_table_name
+            commit_progress(worker_opts, self.last_offset_by_partition, proc_id, self.db_conn)
+
+    def close(self) -> None:
+        """Close the database connection."""
+        self.db_conn.close()
+        logger.info(f"Follow mode worker {self.config.replay_topic}: "
+                   f"processed {self.delete_cnt} deletes, {self.upsert_cnt} upserts")
+
+
+def backfill_consumer_process(replay_configs: List[ReplayConfig], opts: argparse.Namespace,
+                              stop_events: Dict[str, EventClass], queues: Dict[str, Queue],
+                              progress_by_topic: Dict[str, List[Progress]], proc_id: str,
+                              cutoff_lsn: LsnPosition, logger: logging.Logger) -> None:
+    """Consumer process for backfill mode - reads multiple topics and routes to workers.
+
+    The cutoff_lsn parameter is accepted but not used here - workers check the cutoff themselves
+    after deserializing messages (to avoid double-deserialization performance penalty).
+    """
     consumer_conf = {'bootstrap.servers': opts.kafka_bootstrap_servers,
                      'group.id': f'unused-{proc_id}',
                      'enable.auto.offset.store': False,
@@ -841,6 +1474,16 @@ def consumer_process(replay_configs: List[ReplayConfig], opts: argparse.Namespac
     msg_ctr: int = 0
     msg_ctr_by_topic: Dict[str, int] = {config.replay_topic: 0 for config in replay_configs}
 
+    # Track which topics have been paused (worker hit cutoff)
+    paused_topics: Set[str] = set()
+
+    # Map topic names to their partitions for pausing
+    topic_to_partitions: Dict[str, List[TopicPartition]] = {}
+    for tp in all_topic_partitions:
+        if tp.topic not in topic_to_partitions:
+            topic_to_partitions[tp.topic] = []
+        topic_to_partitions[tp.topic].append(TopicPartition(tp.topic, tp.partition))
+
     logger.debug(f'Starting shared consumer for topics: {[c.replay_topic for c in replay_configs]}')
 
     # Check if all workers have stopped
@@ -851,6 +1494,13 @@ def consumer_process(replay_configs: List[ReplayConfig], opts: argparse.Namespac
         msg = consumer.poll(0.1)
 
         if msg is None:
+            # Check if any workers have stopped and we need to pause their topics
+            for topic, event in stop_events.items():
+                if event.is_set() and topic not in paused_topics:
+                    logger.info(f'Consumer: worker for topic {topic} has stopped, pausing partition(s)')
+                    if topic in topic_to_partitions:
+                        consumer.pause(topic_to_partitions[topic])
+                    paused_topics.add(topic)
             continue
 
         msg_ctr += 1
@@ -866,6 +1516,15 @@ def consumer_process(replay_configs: List[ReplayConfig], opts: argparse.Namespac
         topic = msg.topic()
         if topic is None:
             raise Exception('Unexpected None value for message topic()')
+
+        # Check if this topic's worker has stopped (hit cutoff) - skip and pause if so
+        if topic in stop_events and stop_events[topic].is_set():
+            if topic not in paused_topics:
+                logger.info(f'Consumer: worker for topic {topic} has stopped, pausing partition(s)')
+                if topic in topic_to_partitions:
+                    consumer.pause(topic_to_partitions[topic])
+                paused_topics.add(topic)
+            continue
 
         # Route message to the appropriate worker queue
         if topic not in queues:
