@@ -663,6 +663,13 @@ TRUNCATE TABLE {merge_temp_table_name};
                     topic, msg_partition, msg_offset, msg_timestamp, raw_key, raw_val = None, None, None, None, None, None
                 queue_get_wait += time.perf_counter() - queue_get_wait_start
 
+                # Check for EOF sentinel (topic is set but partition is None when consumer reached end of topic)
+                # Note: when queue.get times out, topic is also None, so we check topic is not None
+                reached_eof = topic is not None and msg_partition is None
+                if reached_eof:
+                    logger.info(f"Worker {config.replay_topic}: received EOF sentinel (topic has been fully consumed). "
+                               f"Will flush and stop.")
+
                 # Deserialize Avro messages in parallel workers
                 msg_key: Optional[Dict[str, Any]] = None
                 msg_val: Optional[Dict[str, Any]] = None
@@ -685,7 +692,7 @@ TRUNCATE TABLE {merge_temp_table_name};
                         msg_key = None
                         msg_val = None
 
-                if reached_cutoff or len(queued_deletes) >= opts.delete_batch_size or \
+                if reached_cutoff or reached_eof or len(queued_deletes) >= opts.delete_batch_size or \
                         len(queued_upserts) >= opts.upsert_batch_size or \
                         (datetime.now() - last_commit_time).seconds > opts.max_commit_latency_seconds:
                     with db_conn.cursor() as cursor:
@@ -760,7 +767,7 @@ TRUNCATE TABLE {merge_temp_table_name};
                             commit_progress(worker_opts, last_consume_by_partition, proc_id, db_conn)
                             last_commit_time = datetime.now()
 
-                    if reached_cutoff:
+                    if reached_cutoff or reached_eof:
                         logger.info(f"Worker {config.replay_topic}: flushed remaining work, exiting.")
                         break
 
@@ -1444,14 +1451,16 @@ def backfill_consumer_process(replay_configs: List[ReplayConfig], opts: argparse
                      'group.id': f'unused-{proc_id}',
                      'enable.auto.offset.store': False,
                      'enable.auto.commit': False,  # We don't use Kafka for offset management in this code
+                     'enable.partition.eof': True,
                      'auto.offset.reset': "earliest",
                      'on_commit': commit_cb,
                      **opts.extra_kafka_consumer_config}
 
     consumer: Consumer = Consumer(consumer_conf)
 
-    # Build topic partitions for all topics
+    # Build topic partitions for all topics and track high watermarks for EOF detection
     all_topic_partitions: List[TopicPartition] = []
+    high_watermarks: Dict[str, Dict[int, int]] = {}  # topic -> partition -> high watermark
     for config in replay_configs:
         topic = config.replay_topic
         progress = progress_by_topic.get(topic, [])
@@ -1464,6 +1473,15 @@ def backfill_consumer_process(replay_configs: List[ReplayConfig], opts: argparse
             raise Exception(f'No partitions found for topic {topic}')
         else:
             partitions = list((topics_meta[topic].partitions or {}).keys())
+
+        # Get high watermarks for each partition to detect EOF
+        high_watermarks[topic] = {}
+        for p in partitions:
+            tp = TopicPartition(topic, p)
+            _, high = consumer.get_watermark_offsets(tp)
+            high_watermarks[topic][p] = high
+            logger.debug(f'Topic {topic} partition {p}: high watermark = {high}')
+
         topic_partitions: List[TopicPartition] = [TopicPartition(
             topic, p, start_offset_by_partition.get(p, OFFSET_BEGINNING)
         ) for p in partitions]
@@ -1476,6 +1494,10 @@ def backfill_consumer_process(replay_configs: List[ReplayConfig], opts: argparse
 
     # Track which topics have been paused (worker hit cutoff)
     paused_topics: Set[str] = set()
+
+    # Track which topic/partitions have reached EOF (for topics with infrequent messages)
+    eof_partitions: Dict[str, Set[int]] = {config.replay_topic: set() for config in replay_configs}
+    topics_at_eof: Set[str] = set()
 
     # Map topic names to their partitions for pausing
     topic_to_partitions: Dict[str, List[TopicPartition]] = {}
@@ -1509,7 +1531,20 @@ def backfill_consumer_process(replay_configs: List[ReplayConfig], opts: argparse
         if err:
             # noinspection PyProtectedMember
             if err.code() == KafkaError._PARTITION_EOF:
-                continue  # Just continue to next message for other topics
+                # Track which partitions have reached EOF
+                eof_topic = msg.topic()
+                eof_partition = msg.partition()
+                if eof_topic and eof_topic not in topics_at_eof:
+                    eof_partitions[eof_topic].add(eof_partition)
+                    # Check if all partitions for this topic have reached EOF
+                    if eof_partitions[eof_topic] == set(high_watermarks[eof_topic].keys()):
+                        logger.info(f'Consumer: all partitions for topic {eof_topic} have reached EOF, '
+                                   f'sending EOF sentinel to worker')
+                        topics_at_eof.add(eof_topic)
+                        # Send EOF sentinel to the worker (None values signal EOF)
+                        if eof_topic in queues:
+                            queues[eof_topic].put((eof_topic, None, None, None, None, None))
+                continue
             else:
                 raise Exception(msg.error())
 
