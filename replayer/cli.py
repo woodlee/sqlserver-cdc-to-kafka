@@ -74,8 +74,7 @@ def main() -> None:
                         '"follow" reads the all-changes topic in order to maintain FK constraints')
     p.add_argument('--all-changes-topic',
                    default=os.environ.get('ALL_CHANGES_TOPIC'),
-                   help='Name of the unified all-changes topic (e.g., "ssy_all_cdc_changes") containing messages '
-                        'from all tables in LSN order')
+                   help='Name of the unified all-changes topic containing messages from all tables in LSN order')
 
     opts, _ = p.parse_known_args()
 

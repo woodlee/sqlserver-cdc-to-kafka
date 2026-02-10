@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import argparse
 import multiprocessing as mp
 import socket
 import time
 from datetime import datetime, timezone, timedelta
+from multiprocessing.sharedctypes import Synchronized
 from multiprocessing.synchronize import Event as EventClass
 from typing import Any, Dict, List, Optional
 
@@ -14,6 +17,7 @@ from confluent_kafka.schema_registry.avro import AvroDeserializer
 from confluent_kafka.serialization import MessageField, SerializationContext
 from faster_fifo import Queue  # type: ignore[import-not-found]
 
+from .backfill_progress import BackfillProgressTracker, calculate_total_messages_to_process
 from .consumer import flush_ordered_operations, backfill_consumer_process
 from .kafka_utils import build_consumer_config, get_latest_lsn_from_all_changes_topic
 from .logging_config import get_logger
@@ -24,6 +28,40 @@ from .utils import get_pyodbc_conn_string_from_opts
 from .worker import replay_worker
 
 logger = get_logger(__name__)
+
+
+def _get_high_watermarks_for_topics(
+    opts: argparse.Namespace,
+    replay_configs: List[ReplayConfig]
+) -> Dict[str, Dict[int, int]]:
+    """Get high watermarks for all topic partitions.
+
+    Returns a dict of topic -> partition -> high watermark offset.
+    """
+    consumer_conf = build_consumer_config(opts.kafka_bootstrap_servers, 'watermark-check',
+                                          **opts.extra_kafka_consumer_config)
+    consumer = Consumer(consumer_conf)
+    high_watermarks: Dict[str, Dict[int, int]] = {}
+
+    try:
+        for config in replay_configs:
+            topic = config.replay_topic
+            topics_meta: Dict[str, TopicMetadata] | None = consumer.list_topics(
+                topic=topic).topics  # type: ignore[call-arg]
+            if topics_meta is None:
+                raise Exception(f'No partitions found for topic {topic}')
+
+            partitions = list((topics_meta[topic].partitions or {}).keys())
+            high_watermarks[topic] = {}
+
+            for p in partitions:
+                tp = TopicPartition(topic, p)
+                _, high = consumer.get_watermark_offsets(tp)
+                high_watermarks[topic][p] = high
+    finally:
+        consumer.close()
+
+    return high_watermarks
 
 
 def run_backfill_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfig]) -> None:
@@ -55,6 +93,13 @@ def run_backfill_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfi
         progress_by_topic[config.replay_topic] = progress_tracker.get_progress(
             worker_opts.target_db_table_schema, worker_opts.target_db_table_name, worker_opts.replay_topic)
 
+    # Calculate total messages to process and set up progress tracking
+    high_watermarks = _get_high_watermarks_for_topics(opts, replay_configs)
+    total_messages = calculate_total_messages_to_process(high_watermarks, progress_by_topic)
+    backfill_progress = BackfillProgressTracker()
+    backfill_progress.set_total_to_process(total_messages)
+    shared_processed_counter = backfill_progress.get_shared_counter()
+
     # Launch single shared consumer process (with cutoff LSN for backfill mode)
     consumer_proc = mp.Process(
         target=backfill_consumer_process,
@@ -76,19 +121,26 @@ def run_backfill_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfi
                 target=replay_worker,
                 name=f'replayer-{config.replay_topic}',
                 args=(config, opts, stop_events[config.replay_topic], queues[config.replay_topic],
-                      worker_proc_id, cutoff_lsn)
+                      worker_proc_id, cutoff_lsn, shared_processed_counter)
             )
             worker.start()
             workers.append(worker)
             logger.debug(f"Launched worker process for '{config.replay_topic}' -> "
                         f"[{config.target_db_table_schema}].[{config.target_db_table_name}]")
 
-        # Wait for all workers to complete
-        for worker in workers:
-            worker.join()
+        # Wait for all workers to complete while displaying progress
+        last_progress_log_time = datetime.now()
+        progress_log_interval = timedelta(seconds=10)
 
-        # Wait for consumer to finish
-        consumer_proc.join()
+        while any(w.is_alive() for w in workers) or consumer_proc.is_alive():
+            # Check if it's time to log progress
+            if datetime.now() >= last_progress_log_time + progress_log_interval:
+                logger.info(backfill_progress.format_progress_report())
+                last_progress_log_time = datetime.now()
+            time.sleep(1)
+
+        # Final progress report
+        logger.info(f"Final: {backfill_progress.format_progress_report()}")
         logger.info("All replay workers have completed.")
 
         progress_tracker.commit_all_changes_topic_progress(cutoff_offset, datetime.now())

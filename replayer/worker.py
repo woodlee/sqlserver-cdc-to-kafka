@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import argparse
 import pprint
 import queue as stdlib_queue
 import time
 from datetime import datetime
+from multiprocessing.sharedctypes import Synchronized
 from multiprocessing.synchronize import Event as EventClass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -13,6 +16,7 @@ from confluent_kafka.schema_registry.avro import AvroDeserializer
 from confluent_kafka.serialization import MessageField, SerializationContext
 from faster_fifo import Queue  # type: ignore[import-not-found]
 
+from .backfill_progress import BackfillProgressTracker
 from .logging_config import get_logger
 from .models import ReplayConfig
 from .progress import ProgressTracker
@@ -23,11 +27,15 @@ logger = get_logger(__name__)
 
 
 def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: EventClass, queue: Queue,
-                  proc_id: str, cutoff_lsn: str = None) -> None:
+                  proc_id: str, cutoff_lsn: str = None,
+                  processed_counter: Optional[Synchronized[int]] = None) -> None:
     """Worker process that replays a single topic to a single table.
 
     If cutoff_lsn is provided (backfill mode), the worker stops when it sees a message
     with an LSN exceeding the cutoff.
+
+    If processed_counter is provided, it will be incremented for each message processed
+    to support backfill progress tracking.
     """
     logger.info(f"Starting replay worker for topic '{config.replay_topic}' -> "
                 f"[{config.target_db_table_schema}].[{config.target_db_table_name}]"
@@ -217,6 +225,10 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                     #
                     # queued_deletes.discard(key_val)
                     upsert_cnt += 1
+
+                # Increment the processed counter for progress tracking
+                if processed_counter is not None:
+                    BackfillProgressTracker.increment_processed(processed_counter)
 
                 if (len(queued_deletes) + len(queued_upserts)) % 5_000 == 0:
                     logger.debug('Worker %s: Currently have %s queued deletes and %s queued upserts. '
