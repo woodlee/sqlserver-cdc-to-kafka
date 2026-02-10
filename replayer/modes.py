@@ -1,14 +1,12 @@
-"""Execution modes for the replayer - backfill and follow."""
-
 import argparse
 import multiprocessing as mp
 import socket
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from multiprocessing.synchronize import Event as EventClass
 from typing import Any, Dict, List, Optional
 
-import ctds  # type: ignore[import-untyped]
+import pyodbc
 from confluent_kafka import Consumer, KafkaError, TopicPartition
 from confluent_kafka.admin import TopicMetadata
 from confluent_kafka.schema_registry import SchemaRegistryClient
@@ -16,13 +14,16 @@ from confluent_kafka.schema_registry.avro import AvroDeserializer
 from confluent_kafka.serialization import MessageField, SerializationContext
 from faster_fifo import Queue  # type: ignore[import-not-found]
 
-from .consumer import _flush_ordered_operations, backfill_consumer_process
+from .consumer import flush_ordered_operations, backfill_consumer_process
 from .kafka_utils import build_consumer_config, get_latest_lsn_from_all_changes_topic
-from .logging_config import logger
+from .logging_config import get_logger
 from .models import OrderedOperation, Progress, ReplayConfig
-from .progress import commit_all_changes_topic_progress, get_all_changes_topic_progress, get_progress
+from .progress import ProgressTracker
 from .table_metadata import FollowModeTableMetadata
+from .utils import get_pyodbc_conn_string_from_opts
 from .worker import replay_worker
+
+logger = get_logger(__name__)
 
 
 def run_backfill_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfig]) -> None:
@@ -37,20 +38,22 @@ def run_backfill_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfi
     progress_by_topic: Dict[str, List[Progress]] = {}
     proc_id: str = f'{socket.getfqdn()}+{int(datetime.now().timestamp())}'
 
+    pyodbc_conn_str = get_pyodbc_conn_string_from_opts(opts)
+    progress_tracker = ProgressTracker(pyodbc_conn_str, opts.progress_tracking_table_schema,
+                                       opts.progress_tracking_table_name, opts.all_changes_topic,
+                                       opts.progress_tracking_namespace, proc_id)
+
     # Get progress for each topic
     for config in replay_configs:
         stop_events[config.replay_topic] = mp.Event()
         # For faster_fifo the ctor arg here is the queue byte size, not its item count size:
         queues[config.replay_topic] = Queue(opts.upsert_batch_size * 5_000)
-
-        # Need to fetch progress for each topic
-        with ctds.connect(opts.target_db_server, user=opts.target_db_user, password=opts.target_db_password,
-                         database=opts.target_db_database, timeout=30, login_timeout=30) as db_conn:
-            worker_opts = argparse.Namespace(**vars(opts))
-            worker_opts.replay_topic = config.replay_topic
-            worker_opts.target_db_table_schema = config.target_db_table_schema
-            worker_opts.target_db_table_name = config.target_db_table_name
-            progress_by_topic[config.replay_topic] = get_progress(worker_opts, db_conn)
+        worker_opts = argparse.Namespace(**vars(opts))
+        worker_opts.replay_topic = config.replay_topic
+        worker_opts.target_db_table_schema = config.target_db_table_schema
+        worker_opts.target_db_table_name = config.target_db_table_name
+        progress_by_topic[config.replay_topic] = progress_tracker.get_progress(
+            worker_opts.target_db_table_schema, worker_opts.target_db_table_name, worker_opts.replay_topic)
 
     # Launch single shared consumer process (with cutoff LSN for backfill mode)
     consumer_proc = mp.Process(
@@ -88,14 +91,9 @@ def run_backfill_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfi
         consumer_proc.join()
         logger.info("All replay workers have completed.")
 
-        # Write progress for the all-changes topic so follow mode knows where to start
-        with ctds.connect(opts.target_db_server, user=opts.target_db_user, password=opts.target_db_password,
-                         database=opts.target_db_database, timeout=30, login_timeout=30) as db_conn:
-            # Use current timestamp for the progress record
-            commit_all_changes_topic_progress(opts, cutoff_offset, int(datetime.now().timestamp() * 1000),
-                                              proc_id, db_conn)
-            logger.info(f"Backfill complete. Wrote all-changes topic progress at offset {cutoff_offset} "
-                       f"for follow mode handoff.")
+        progress_tracker.commit_all_changes_topic_progress(cutoff_offset, datetime.now())
+        logger.info(f"Backfill complete. Wrote all-changes topic progress at offset {cutoff_offset} "
+                   f"for follow mode handoff.")
 
     except KeyboardInterrupt:
         logger.info("Received interrupt signal, shutting down workers...")
@@ -127,17 +125,29 @@ def run_follow_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfig]
     """Run the replayer in follow mode - strictly ordered replay from the all-changes topic.
 
     This mode processes messages from the all-changes topic in strict LSN order, applying
-    each operation immediately to maintain FK constraint safety. Operations are executed
-    one at a time (or in small batches of consecutive same-table same-type operations)
-    to ensure parent rows exist before child rows are inserted.
+    each operation immediately to maintain FK constraint safety. Operations are batched
+    and committed atomically with progress updates to ensure exactly-once semantics.
+
+    Uses pyodbc for all database operations to avoid the ctds/FreeTDS issue where empty
+    strings are converted to NULL. Data operations and progress updates are committed
+    together in a single transaction for crash safety.
     """
     proc_id: str = f'{socket.getfqdn()}+{int(datetime.now().timestamp())}'
 
-    # Use a single shared database connection for all operations
-    db_conn = ctds.connect(opts.target_db_server, user=opts.target_db_user, password=opts.target_db_password,
-                           database=opts.target_db_database, timeout=30, login_timeout=30)
+    pyodbc_conn_str = (f'DRIVER={{ODBC Driver 18 for SQL Server}};'
+                       f'SERVER={opts.target_db_server};'
+                       f'DATABASE={opts.target_db_database};'
+                       f'UID={opts.target_db_user};'
+                       f'PWD={opts.target_db_password};'
+                       f'TrustServerCertificate=yes;')
 
-    all_changes_progress = get_all_changes_topic_progress(opts, db_conn)
+    progress_tracker = ProgressTracker(pyodbc_conn_str, opts.progress_tracking_table_schema,
+                                       opts.progress_tracking_table_name, opts.all_changes_topic,
+                                       opts.progress_tracking_namespace, proc_id)
+
+    db_conn = pyodbc.connect(pyodbc_conn_str, autocommit=False)
+
+    all_changes_progress = progress_tracker.get_all_changes_topic_progress()
     if all_changes_progress is None:
         raise Exception(f'No progress found for all-changes topic "{opts.all_changes_topic}" in namespace '
                        f'"{opts.progress_tracking_namespace}". Run backfill mode first to establish progress.')
@@ -148,10 +158,10 @@ def run_follow_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfig]
     table_metadata: Dict[str, FollowModeTableMetadata] = {}
     for config in replay_configs:
         metadata = FollowModeTableMetadata(config, db_conn)
-        metadata.create_temp_tables(db_conn)
         table_metadata[config.replay_topic] = metadata
 
-    consumer_conf = build_consumer_config(opts, f'replayer-follow-{proc_id}')
+    consumer_conf = build_consumer_config(opts.kafka_bootstrap_servers, f'replayer-follow-{proc_id}',
+                                          **opts.extra_kafka_consumer_config)
     consumer = Consumer(consumer_conf)
     schema_registry_client = SchemaRegistryClient({'url': opts.schema_registry_url})
     avro_deserializer = AvroDeserializer(schema_registry_client)
@@ -176,20 +186,26 @@ def run_follow_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfig]
     last_all_changes_offset = start_offset - 1
     last_all_changes_timestamp = 0
     last_commit_time = datetime.now()
+    last_heartbeat_time = datetime.now()
 
     try:
         while True:
+            if datetime.now() >= last_heartbeat_time + timedelta(seconds=30):
+                logger.info(f"Follow mode: heartbeat: last_all_changes_offset {last_all_changes_offset} "
+                            f"last_all_changes_timestamp {last_all_changes_timestamp} last_commit_time "
+                            f"{last_commit_time} msg_ctr {msg_ctr}")
+                last_heartbeat_time = datetime.now()
+
             msg = consumer.poll(0.5)
 
             if msg is None or msg.value() is None:
                 # Periodically flush and commit progress even without new messages
                 if (datetime.now() - last_commit_time).seconds > opts.max_commit_latency_seconds:
-                    if ordered_ops:
-                        _flush_ordered_operations(db_conn, ordered_ops, table_metadata)
+                    if ordered_ops or last_all_changes_offset >= start_offset:
+                        # Atomically commit data ops (if any) + progress update
+                        flush_ordered_operations(db_conn, progress_tracker, ordered_ops, table_metadata,
+                                                 last_all_changes_offset, last_all_changes_timestamp)
                         ordered_ops.clear()
-                    if last_all_changes_offset >= start_offset:
-                        commit_all_changes_topic_progress(opts, last_all_changes_offset,
-                                                          last_all_changes_timestamp, proc_id, db_conn)
                     last_commit_time = datetime.now()
                 continue
 
@@ -230,31 +246,33 @@ def run_follow_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfig]
             msg_key: Optional[Dict[str, Any]] = None
             msg_val: Optional[Dict[str, Any]] = None
             if raw_key is not None:
+                # noinspection PyNoneFunctionAssignment
                 msg_key = avro_deserializer(raw_key, SerializationContext(original_topic, MessageField.KEY))  # type: ignore[func-returns-value]
             if raw_val is not None:
+                # noinspection PyNoneFunctionAssignment
                 msg_val = avro_deserializer(raw_val, SerializationContext(original_topic, MessageField.VALUE))  # type: ignore[func-returns-value]
 
             # Prepare the operation (without executing)
             metadata = table_metadata[original_topic]
-            op = metadata.prepare_operation(msg_key, msg_val)
+            msg_timestamp = datetime.fromtimestamp(msg.timestamp()[1] / 1000, timezone.utc).replace(tzinfo=None)
+            op = metadata.prepare_operation(msg_key, msg_val, msg.offset(), msg_timestamp)
             if op is not None:
                 ordered_ops.append(op)
 
             last_all_changes_offset = msg.offset()  # type: ignore[assignment]
-            last_all_changes_timestamp = msg.timestamp()[1]  # type: ignore[assignment]
+            last_all_changes_timestamp = msg_timestamp
 
             if msg_ctr % 5_000 == 0:
                 logger.debug(f'Follow mode: processed {msg_ctr} messages, at offset {last_all_changes_offset}, '
                             f'pending ops: {len(ordered_ops)}')
 
             # Periodically flush and commit (but maintain order within each flush)
+            # Atomically commits data operations + progress update in a single transaction
             if (datetime.now() - last_commit_time).seconds > opts.max_commit_latency_seconds or \
                     len(ordered_ops) >= opts.upsert_batch_size:
-                if ordered_ops:
-                    _flush_ordered_operations(db_conn, ordered_ops, table_metadata)
-                    ordered_ops.clear()
-                commit_all_changes_topic_progress(opts, last_all_changes_offset,
-                                                  last_all_changes_timestamp, proc_id, db_conn)
+                flush_ordered_operations(db_conn, progress_tracker, ordered_ops, table_metadata,
+                                         last_all_changes_offset, msg_timestamp)
+                ordered_ops.clear()
                 last_commit_time = datetime.now()
 
             if 0 < opts.consumed_messages_limit <= msg_ctr:
@@ -264,17 +282,8 @@ def run_follow_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfig]
     except KeyboardInterrupt:
         logger.info("Received interrupt signal, shutting down follow mode...")
     finally:
-        # Final flush
-        if ordered_ops:
-            _flush_ordered_operations(db_conn, ordered_ops, table_metadata)
-        if last_all_changes_offset >= start_offset:
-            commit_all_changes_topic_progress(opts, last_all_changes_offset,
-                                              last_all_changes_timestamp, proc_id, db_conn)
-
-        # Log stats for each table
         for metadata in table_metadata.values():
             metadata.log_stats()
-
         consumer.close()
         db_conn.close()
         logger.info(f"Follow mode: processed {msg_ctr} messages total, final offset {last_all_changes_offset}")

@@ -10,12 +10,11 @@ Example usage:
 """
 
 from .cli import main
-from .models import LsnPosition, OrderedOperation, Progress, ReplayConfig
+from .models import OrderedOperation, Progress, ReplayConfig
 from .table_metadata import FollowModeTableMetadata, TableMetadata
 
 __all__ = [
     'main',
-    'LsnPosition',
     'OrderedOperation',
     'Progress',
     'ReplayConfig',

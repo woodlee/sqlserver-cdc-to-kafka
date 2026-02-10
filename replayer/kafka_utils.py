@@ -1,5 +1,3 @@
-"""Kafka utility functions for the replayer module."""
-
 import argparse
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
@@ -10,28 +8,26 @@ from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroDeserializer
 from confluent_kafka.serialization import MessageField, SerializationContext
 
-from .logging_config import logger
-from .models import LOWEST_LSN_POSITION, LsnPosition
+from .logging_config import get_logger
+
+logger = get_logger(__name__)
 
 UTC = timezone.utc
 
 
-def build_consumer_config(opts: argparse.Namespace, group_id: str, **overrides: Any) -> Dict[str, Any]:
-    """Build a Kafka consumer configuration dict with common settings."""
+def build_consumer_config(kafka_bootstrap_servers: str, group_id: str, **overrides: Any) -> Dict[str, Any]:
     config = {
-        'bootstrap.servers': opts.kafka_bootstrap_servers,
+        'bootstrap.servers': kafka_bootstrap_servers,
         'group.id': group_id,
         'enable.auto.offset.store': False,
         'enable.auto.commit': False,
         'auto.offset.reset': 'earliest',
-        **opts.extra_kafka_consumer_config,
         **overrides
     }
     return config
 
 
 def commit_cb(err: KafkaError, tps: List[TopicPartition]) -> None:
-    """Callback for Kafka offset commits."""
     if err is not None:
         logger.error(f'Error committing offsets: {err}')
     else:
@@ -39,20 +35,17 @@ def commit_cb(err: KafkaError, tps: List[TopicPartition]) -> None:
 
 
 def format_coordinates(msg: Message) -> str:
-    """Format a Kafka message's coordinates for logging."""
     return f'{msg.topic()}:{msg.partition()}@{msg.offset()}, ' \
            f'time {datetime.fromtimestamp(msg.timestamp()[1] / 1000, UTC)}'
 
 
-def get_latest_lsn_from_all_changes_topic(opts: argparse.Namespace) -> Tuple[LsnPosition, int]:
-    """Get the LSN and offset of the most recent message in the all-changes topic.
-
-    Returns a tuple of (LsnPosition, offset) for the latest message.
-    """
+def get_latest_lsn_from_all_changes_topic(opts: argparse.Namespace) -> Tuple[str, int]:
     schema_registry_client = SchemaRegistryClient({'url': opts.schema_registry_url})
     avro_deserializer = AvroDeserializer(schema_registry_client)
 
-    consumer_conf = build_consumer_config(opts, f'replayer-lsn-lookup-{int(datetime.now().timestamp())}')
+    consumer_conf = build_consumer_config(opts.kafka_bootstrap_servers,
+                                          f'replayer-lsn-lookup-{int(datetime.now().timestamp())}',
+                                          **opts.extra_kafka_consumer_config)
     consumer_conf['auto.offset.reset'] = 'latest'
     consumer = Consumer(consumer_conf)
 
@@ -68,7 +61,7 @@ def get_latest_lsn_from_all_changes_topic(opts: argparse.Namespace) -> Tuple[Lsn
             raise Exception(f'No partitions found for topic {opts.all_changes_topic}')
 
         # For each partition, get the high watermark and read the last message
-        latest_lsn = LOWEST_LSN_POSITION
+        latest_lsn = '0x00000000000000000000'
         latest_offset = -1
 
         for partition_id in partitions:
@@ -80,6 +73,7 @@ def get_latest_lsn_from_all_changes_topic(opts: argparse.Namespace) -> Tuple[Lsn
                 continue
 
             # Seek to the last message
+            # noinspection PyClassVar
             tp.offset = high - 2
             consumer.assign([tp])
 
@@ -97,11 +91,12 @@ def get_latest_lsn_from_all_changes_topic(opts: argparse.Namespace) -> Tuple[Lsn
             if raw_val is None:
                 continue
 
+            # noinspection PyNoneFunctionAssignment
             msg_val = avro_deserializer(raw_val, SerializationContext(opts.all_changes_topic, MessageField.VALUE))
             if msg_val is None:
                 continue
 
-            msg_lsn = LsnPosition.from_message(msg_val)
+            msg_lsn = msg_val['__log_lsn']
             if msg_lsn > latest_lsn:
                 latest_lsn = msg_lsn
                 latest_offset = msg.offset()  # type: ignore[assignment]

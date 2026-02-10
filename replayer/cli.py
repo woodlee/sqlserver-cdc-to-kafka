@@ -3,15 +3,15 @@ import json
 import os
 from typing import List
 
-from .logging_config import logger
+from .logging_config import get_logger
 from .models import ReplayConfig
 from .modes import run_backfill_mode, run_follow_mode
 
+logger = get_logger(__name__)
+
 
 def main() -> None:
-    p = argparse.ArgumentParser(
-        description='Replays CDC-to-Kafka topics to SQL Server tables.'
-    )
+    p = argparse.ArgumentParser(description='Replays CDC-to-Kafka topics to SQL Server tables.')
 
     # Config for data source
     p.add_argument('--replay-topic',
@@ -79,21 +79,17 @@ def main() -> None:
 
     opts, _ = p.parse_known_args()
 
-    # Validate common required arguments
     if not (opts.kafka_bootstrap_servers and opts.schema_registry_url and opts.target_db_server and
             opts.target_db_user and opts.target_db_password and opts.target_db_database):
         raise Exception('Arguments kafka_bootstrap_servers, schema_registry_url, target_db_server, '
                         'target_db_user, target_db_password, and target_db_database are all required.')
 
-    # Validate all-changes-topic is provided (required for both modes)
     if not opts.all_changes_topic:
         raise Exception('Argument --all-changes-topic is required.')
 
-    # Build list of replay configurations
     replay_configs: List[ReplayConfig] = []
 
     if opts.topic_to_table_map:
-        # New mode: parallel replay of multiple topics
         topic_map = json.loads(opts.topic_to_table_map)
         for topic, table_info in topic_map.items():
             config = ReplayConfig(
@@ -105,7 +101,6 @@ def main() -> None:
             )
             replay_configs.append(config)
     elif opts.replay_topic and opts.target_db_table_schema and opts.target_db_table_name:
-        # Legacy mode: single topic replay for backward compatibility
         config = ReplayConfig(
             replay_topic=opts.replay_topic,
             target_db_table_schema=opts.target_db_table_schema,

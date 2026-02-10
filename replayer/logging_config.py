@@ -1,5 +1,3 @@
-"""Logging configuration for the replayer module."""
-
 import logging.config
 import os
 
@@ -12,7 +10,7 @@ logging.config.dictConfig({
         'replayer': {
             'handlers': ['console'],
             'level': log_level,
-            'propagate': True,
+            'propagate': False,
         },
     },
     'handlers': {
@@ -29,4 +27,10 @@ logging.config.dictConfig({
     },
 })
 
-logger = logging.getLogger('replayer')
+
+def get_logger(name: str) -> logging.Logger:
+    """Get a logger for the given module name.
+
+    Use as: logger = get_logger(__name__)
+    """
+    return logging.getLogger(name)

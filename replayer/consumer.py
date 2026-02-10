@@ -1,94 +1,83 @@
-"""Consumer processes for the replayer module."""
-
 import argparse
 import logging
 import queue as stdlib_queue
 import time
 from multiprocessing.synchronize import Event as EventClass
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Set
 
-import ctds  # type: ignore[import-untyped]
 from confluent_kafka import Consumer, KafkaError, TopicPartition, OFFSET_BEGINNING
 from confluent_kafka.admin import TopicMetadata
 from faster_fifo import Queue  # type: ignore[import-not-found]
 
-from .logging_config import logger as module_logger
+from .logging_config import get_logger
+from .progress import ProgressTracker
 from .kafka_utils import build_consumer_config, commit_cb, format_coordinates
 from .models import OrderedOperation, Progress, ReplayConfig
 from .table_metadata import FollowModeTableMetadata
 
+logger = get_logger(__name__)
 
-def _flush_ordered_operations(db_conn: ctds.Connection, ops: List[OrderedOperation],
-                              table_metadata: Dict[str, FollowModeTableMetadata]) -> None:
-    """Flush operations in strict order, batching only consecutive same-table same-type operations.
 
-    This maintains FK constraint safety by ensuring operations are applied in the order
-    they appeared in the all-changes topic. Only consecutive operations targeting the same
-    table with the same operation type (delete or upsert) are batched together.
+def flush_ordered_operations(db_conn: Any, progress_tracker: ProgressTracker,
+                             ops: List[OrderedOperation],
+                             table_metadata: Dict[str, FollowModeTableMetadata],
+                             last_offset: int, last_timestamp: Any) -> None:
+    """Flush ordered operations and progress update atomically in a single transaction.
+
+    This ensures exactly-once semantics: data operations and progress tracking are
+    committed together, so on restart we won't re-process already-committed messages.
     """
     if not ops:
         return
 
-    start_time = time.perf_counter()
+    cursor = db_conn.cursor()
+    overall_start = time.perf_counter()
 
-    # Group consecutive operations by (table, operation_type)
-    batches: List[Tuple[str, str, List[OrderedOperation]]] = []
-    current_topic: Optional[str] = None
-    current_op_type: Optional[str] = None
-    current_batch: List[OrderedOperation] = []
+    try:
+        # Execute all data operations
+        for op in ops:
+            metadata = table_metadata[op.original_topic]
 
-    for op in ops:
-        if op.original_topic == current_topic and op.operation_type == current_op_type:
-            current_batch.append(op)
-        else:
-            if current_batch:
-                batches.append((current_topic, current_op_type, current_batch))  # type: ignore[arg-type]
-            current_topic = op.original_topic
-            current_op_type = op.operation_type
-            current_batch = [op]
-
-    if current_batch:
-        batches.append((current_topic, current_op_type, current_batch))  # type: ignore[arg-type]
-
-    # Execute batches in order
-    with db_conn.cursor() as cursor:
-        for topic, op_type, batch in batches:
-            metadata = table_metadata[topic]
-
-            if op_type == 'delete':
-                # Collect keys and bulk delete
-                keys = [op.key_val for op in batch]
-                db_conn.bulk_insert(metadata.delete_temp_table_name, keys)
-                cursor.execute(metadata.delete_stmt)
-                module_logger.debug(f'Follow mode: deleted {len(batch)} rows from {metadata.fq_target_table_name}')
+            start = time.perf_counter()
+            if op.cdc_operation == 'Delete':
+                cursor.execute(metadata.single_delete_stmt, tuple(op.key_val))
+            elif op.cdc_operation == 'Insert':
+                cursor.execute(metadata.insert_stmt, tuple(op.row_values))
+            elif op.cdc_operation == 'PostUpdate':
+                # Use targeted UPDATE if we have updated_fields info, otherwise fall back to full UPDATE
+                if op.updated_fields:
+                    stmt, params = metadata.build_dynamic_update(op.row_values, op.updated_fields)
+                    cursor.execute(stmt, params)
+                else:
+                    params = metadata.build_update_params(op.row_values)
+                    cursor.execute(metadata.update_stmt, params)
+                # if cursor.rowcount == 0:
+                #     raise Exception(f'UPDATE affected 0 rows for {metadata.fq_target_table_name} '
+                #                    f'with key {op.key_val} - row does not exist')
             else:
-                # Execute upserts row-by-row to preserve ordering when same PK appears multiple times
-                for op in batch:
-                    if op.row_values is None:
-                        continue
-                    if op.cdc_operation == 'Insert':
-                        cursor.execute(metadata.insert_stmt, tuple(op.row_values))
-                    elif op.cdc_operation == 'PostUpdate':
-                        params = metadata.build_update_params(op.row_values)
-                        cursor.execute(metadata.update_stmt, params)
-                        if cursor.rowcount == 0:
-                            raise Exception(f'UPDATE affected 0 rows for {metadata.fq_target_table_name} '
-                                           f'with key {op.key_val} - row does not exist')
-                    else:
-                        raise Exception(f'Unexpected CDC operation type: {op.cdc_operation}')
-                module_logger.debug(f'Follow mode: applied {len(batch)} upserts to {metadata.fq_target_table_name}')
+                raise Exception(f'Unexpected CDC operation type: {op.cdc_operation}')
+            elapsed_us = (time.perf_counter() - start) * 1_000_000
+            if elapsed_us > 100_000:
+                logger.warning(f"SLOW: {elapsed_us:.0f}µs - {op.cdc_operation} on {op.original_topic}")
+        overall_elapsed = time.perf_counter() - overall_start
 
+        logger.info(f'Executed {len(ops)} ops in {overall_elapsed:.2f}s, mean {(overall_elapsed * 1_000 / len(ops)):.2f} ms / op')
+
+        # Update progress in the same transaction
+        progress_tracker.upsert_all_changes_progress(cursor, last_offset, last_timestamp)
+    finally:
+        cursor.close()
+
+    # Commit both data operations and progress atomically
     db_conn.commit()
-    elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-    module_logger.info(f'Follow mode: flushed {len(ops)} operations in {len(batches)} batches ({elapsed_ms} ms)')
 
 
 def backfill_consumer_process(replay_configs: List[ReplayConfig], opts: argparse.Namespace,
                               stop_events: Dict[str, EventClass], queues: Dict[str, Queue],
                               progress_by_topic: Dict[str, List[Progress]], proc_id: str,
                               logger: logging.Logger) -> None:
-    """Shared consumer process that reads from multiple topics and routes messages to workers."""
-    consumer_conf = build_consumer_config(opts, f'unused-{proc_id}')
+    consumer_conf = build_consumer_config(opts.kafka_bootstrap_servers, f'unused-{proc_id}',
+                                          **opts.extra_kafka_consumer_config)
     consumer_conf['enable.partition.eof'] = True
     consumer_conf['on_commit'] = commit_cb
     consumer: Consumer = Consumer(consumer_conf)
@@ -145,7 +134,7 @@ def backfill_consumer_process(replay_configs: List[ReplayConfig], opts: argparse
 
     # Check if all workers have stopped
     def all_workers_stopped() -> bool:
-        return all(event.is_set() for event in stop_events.values())
+        return all(ev.is_set() for ev in stop_events.values())
 
     while not all_workers_stopped():
         msg = consumer.poll(0.1)

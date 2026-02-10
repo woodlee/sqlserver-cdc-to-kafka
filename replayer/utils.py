@@ -1,6 +1,14 @@
-"""Utility functions for the replayer module."""
-
+import argparse
 from typing import Any, Optional
+
+
+def get_pyodbc_conn_string_from_opts(opts: argparse.Namespace) -> str:
+    return (f'DRIVER={{ODBC Driver 18 for SQL Server}};'
+            f'SERVER={opts.target_db_server};'
+            f'DATABASE={opts.target_db_database};'
+            f'UID={opts.target_db_user};'
+            f'PWD={opts.target_db_password};'
+            f'TrustServerCertificate=yes;')
 
 
 def parse_sql_default(col_default: Optional[str]) -> Any:

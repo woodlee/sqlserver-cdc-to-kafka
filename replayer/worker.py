@@ -1,5 +1,3 @@
-"""Worker process for replaying Kafka messages to SQL Server."""
-
 import argparse
 import pprint
 import queue as stdlib_queue
@@ -15,14 +13,17 @@ from confluent_kafka.schema_registry.avro import AvroDeserializer
 from confluent_kafka.serialization import MessageField, SerializationContext
 from faster_fifo import Queue  # type: ignore[import-not-found]
 
-from .logging_config import logger
-from .models import LsnPosition, ReplayConfig
-from .progress import commit_progress, get_progress
+from .logging_config import get_logger
+from .models import ReplayConfig
+from .progress import ProgressTracker
 from .table_metadata import TableMetadata
+from .utils import get_pyodbc_conn_string_from_opts
+
+logger = get_logger(__name__)
 
 
 def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: EventClass, queue: Queue,
-                  proc_id: str, cutoff_lsn: Optional[LsnPosition] = None) -> None:
+                  proc_id: str, cutoff_lsn: str = None) -> None:
     """Worker process that replays a single topic to a single table.
 
     If cutoff_lsn is provided (backfill mode), the worker stops when it sees a message
@@ -43,10 +44,12 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
     queued_upserts: Dict[Any, Tuple[str, List[Any]]] = {}
     proc_start_time: float = time.perf_counter()
 
-    # Initialize Avro deserializer for this worker
     schema_registry_client: SchemaRegistryClient = SchemaRegistryClient({'url': opts.schema_registry_url})
     avro_deserializer: AvroDeserializer = AvroDeserializer(schema_registry_client)
-
+    pyodbc_conn_string = get_pyodbc_conn_string_from_opts(opts)
+    progress_tracker = ProgressTracker(pyodbc_conn_string, opts.progress_tracking_table_schema,
+                                       opts.progress_tracking_table_name, opts.all_changes_topic,
+                                       opts.progress_tracking_namespace, proc_id)
     try:
         with ctds.connect(opts.target_db_server, user=opts.target_db_user, password=opts.target_db_password,
                           database=opts.target_db_database, timeout=15, login_timeout=15) as db_conn:
@@ -63,7 +66,8 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
             metadata.create_temp_tables(db_conn)
 
             # Truncate target table if requested and no prior progress exists
-            existing_progress = get_progress(worker_opts, db_conn)
+            existing_progress = progress_tracker.get_progress(
+                worker_opts.target_db_table_schema, worker_opts.target_db_table_name, worker_opts.replay_topic)
             if opts.truncate_existing_data and not existing_progress:
                 logger.info(f"Worker {config.replay_topic}: Truncating target table {metadata.fq_target_table_name} "
                            f"(no prior progress exists)")
@@ -105,8 +109,8 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                 # Check cutoff LSN in backfill mode
                 reached_cutoff = False
                 if cutoff_lsn is not None and msg_val is not None:
-                    msg_lsn = LsnPosition.from_message(msg_val)
-                    if msg_lsn > cutoff_lsn:
+                    msg_lsn: str = msg_val['__log_lsn']
+                    if msg_lsn and msg_lsn > cutoff_lsn:
                         logger.info(f"Worker {config.replay_topic}: reached cutoff LSN at offset {msg_offset} "
                                    f"(msg LSN {msg_lsn} > cutoff {cutoff_lsn}). Will flush and stop.")
                         reached_cutoff = True
@@ -183,7 +187,9 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                         if queued_upserts or queued_deletes:
                             queued_upserts.clear()
                             queued_deletes.clear()
-                            commit_progress(worker_opts, last_consume_by_partition, proc_id, db_conn)
+                            progress_tracker.commit_progress(
+                                worker_opts.target_db_table_schema, worker_opts.target_db_table_name,
+                                worker_opts.replay_topic, last_consume_by_partition)
                             last_commit_time = datetime.now()
 
                     if reached_cutoff or reached_eof:

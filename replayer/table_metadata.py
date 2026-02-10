@@ -1,14 +1,14 @@
-"""Table metadata classes for the replayer module."""
-
 import itertools
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import ctds  # type: ignore[import-untyped]
 
-from .logging_config import logger
+from .logging_config import get_logger
 from .models import OrderedOperation, ReplayConfig
 from .utils import parse_sql_default
+
+logger = get_logger(__name__)
 
 
 class TableMetadata:
@@ -120,7 +120,7 @@ ORDER BY [ORDINAL_POSITION]
                 vals.append(dt)
             elif f in self.varchar_field_names and for_bcp:
                 # The below assumes your DB uses SQL_Latin1_General_CP1_CI_AS collation; if not, you may
-                # need to change 'cp1252' to something else:
+                # need to change 'cp1252' to something else.
                 vals.append(ctds.SqlVarChar(msg_val[f].encode('cp1252')))
             elif f in self.nvarchar_field_names and for_bcp:
                 # See https://zillow.github.io/ctds/bulk_insert.html#text-columns
@@ -207,71 +207,163 @@ TRUNCATE TABLE {self.merge_temp_table_name};
             logger.debug(f"Created temp tables for {self.fq_target_table_name}")
 
 
-class FollowModeTableMetadata(TableMetadata):
-    """Extends TableMetadata with follow-mode specific functionality.
+class FollowModeTableMetadata:
+    """Table metadata for follow-mode using pyodbc.
 
-    Adds operation counters, parameterized INSERT/UPDATE statements, and a method
-    to prepare OrderedOperations from messages.
+    This is a standalone class (not inheriting from TableMetadata) that uses pyodbc
+    for database operations. This avoids the ctds/FreeTDS issue where empty strings
+    are converted to NULL in parameterized queries.
+
+    Provides operation counters, parameterized INSERT/UPDATE/DELETE statements, and
+    methods to prepare OrderedOperations from Kafka messages.
     """
 
-    def __init__(self, config: ReplayConfig, db_conn: ctds.Connection) -> None:
-        super().__init__(config, db_conn)
+    def __init__(self, config: ReplayConfig, db_conn: Any) -> None:
+        """Initialize with a pyodbc connection."""
+        self.config = config
+        self.fq_target_table_name = f'[{config.target_db_table_schema.strip()}].[{config.target_db_table_name.strip()}]'
+        self.cols_to_not_sync: set[str] = set([c.strip().lower() for c in config.cols_to_not_sync.split(',')])
+        self.cols_to_not_sync.discard('')
+
         self.delete_cnt = 0
         self.upsert_cnt = 0
 
-        # Build parameterized INSERT statement for 'Insert' CDC operations
+        # Fetch metadata using pyodbc (uses ? placeholders)
+        cursor = db_conn.cursor()
+        try:
+            # Get primary key fields
+            if config.primary_key_fields_override.strip():
+                self.primary_key_field_names = [x.strip() for x in config.primary_key_fields_override.split(',')]
+            else:
+                cursor.execute('''
+SELECT [COLUMN_NAME]
+FROM [INFORMATION_SCHEMA].[KEY_COLUMN_USAGE]
+WHERE OBJECTPROPERTY(OBJECT_ID([CONSTRAINT_SCHEMA] + '.' + QUOTENAME([CONSTRAINT_NAME])), 'IsPrimaryKey') = 1
+AND [TABLE_SCHEMA] = ?
+AND [TABLE_NAME] = ?
+ORDER BY [ORDINAL_POSITION]
+                ''', (config.target_db_table_schema, config.target_db_table_name))
+                self.primary_key_field_names = [r[0] for r in cursor.fetchall()]
+
+            # Get computed columns
+            cursor.execute('''
+SELECT name
+FROM sys.computed_columns
+WHERE OBJECT_SCHEMA_NAME(object_id) = ?
+    AND OBJECT_NAME(object_id) = ?
+            ''', (config.target_db_table_schema, config.target_db_table_name))
+            self.computed_cols: set[str] = {r[0].lower() for r in cursor.fetchall()}
+
+            # Get column metadata
+            self.field_names: List[str] = []
+            self.datetime_field_names: set[str] = set()
+            self.varchar_field_names: set[str] = set()
+            self.nvarchar_field_names: set[str] = set()
+            self.column_defaults: Dict[str, Any] = {}
+
+            cursor.execute('''
+SELECT [COLUMN_NAME]
+    , [DATA_TYPE]
+    , COALESCE([CHARACTER_MAXIMUM_LENGTH], [DATETIME_PRECISION]) AS [PRECISION_SPEC]
+    , [IS_NULLABLE]
+    , [COLUMN_DEFAULT]
+FROM [INFORMATION_SCHEMA].[COLUMNS]
+WHERE [TABLE_SCHEMA] = ?
+    AND [TABLE_NAME] = ?
+ORDER BY [ORDINAL_POSITION]
+            ''', (config.target_db_table_schema, config.target_db_table_name))
+
+            for col_name, col_type, col_precision, col_is_nullable, col_default in cursor.fetchall():
+                if col_name.lower() in self.cols_to_not_sync or col_name.lower() in self.computed_cols:
+                    continue
+                self.field_names.append(col_name)
+                if col_type.lower().startswith('datetime'):
+                    self.datetime_field_names.add(col_name)
+                if col_type.lower() in ('char', 'varchar', 'text'):
+                    self.varchar_field_names.add(col_name)
+                if col_type.lower() in ('nchar', 'nvarchar', 'ntext'):
+                    self.nvarchar_field_names.add(col_name)
+                self.column_defaults[col_name] = parse_sql_default(col_default)
+
+            # Check for identity column
+            cursor.execute('SELECT TOP 1 [name] FROM sys.columns WHERE object_id = OBJECT_ID(?) AND is_identity = 1',
+                          (self.fq_target_table_name,))
+            rows = cursor.fetchall()
+            self.identity_col_name: Optional[str] = rows[0][0] if rows else None
+        finally:
+            cursor.close()
+
+        # Build parameterized INSERT statement for 'Insert' CDC operations (pyodbc uses ? placeholders)
         set_identity_insert = f'SET IDENTITY_INSERT {self.fq_target_table_name} ON; ' \
             if self.identity_col_name else ''
         self.insert_stmt = f'''
 {set_identity_insert}INSERT INTO {self.fq_target_table_name} ([{'], ['.join(self.field_names)}])
-VALUES ({', '.join([':' + str(i) for i in range(len(self.field_names))])})
+VALUES ({', '.join(['?' for _ in self.field_names])})
 '''
 
         # Build parameterized UPDATE statement for 'PostUpdate' CDC operations
         # SET clause excludes PK columns and identity column; WHERE clause uses PK columns
         self._non_pk_fields = [f for f in self.field_names
                               if f not in self.primary_key_field_names and f != self.identity_col_name]
-        set_clause = ', '.join([f'[{f}] = :{i}' for i, f in enumerate(self._non_pk_fields)])
-        where_clause = ' AND '.join([f'[{pk}] = :{len(self._non_pk_fields) + i}'
-                                     for i, pk in enumerate(self.primary_key_field_names)])
+        set_clause = ', '.join([f'[{f}] = ?' for f in self._non_pk_fields])
+        where_clause = ' AND '.join([f'[{pk}] = ?' for pk in self.primary_key_field_names])
         self.update_stmt = f'''
 UPDATE {self.fq_target_table_name}
 SET {set_clause}
 WHERE {where_clause}
 '''
+        single_delete_where_predicates = ' AND '.join([f'[{c}] = ?' for c in self.primary_key_field_names])
+        self.single_delete_stmt = f'DELETE FROM {self.fq_target_table_name} WHERE {single_delete_where_predicates}'
 
         logger.info(f"Follow mode: initialized table metadata for {self.fq_target_table_name}")
 
-    def prepare_operation(self, msg_key: Optional[Dict[str, Any]],
-                         msg_val: Optional[Dict[str, Any]]) -> Optional[OrderedOperation]:
-        """Prepare an OrderedOperation from a message without executing it.
+    def convert_msg_to_row_values(self, msg_val: Dict[str, Any]) -> List[Any]:
+        """Convert a Kafka message value dict to a list of database row values.
 
-        Returns None if msg_key is None.
+        Handles datetime conversion, missing fields, and None values.
+        Unlike the ctds version, pyodbc handles empty strings correctly so no SqlVarChar wrapping needed.
         """
-        if msg_key is None:
-            return None
+        vals: List[Any] = []
+        for f in self.field_names:
+            if f not in msg_val:
+                vals.append(self.column_defaults[f])
+            elif msg_val[f] is None:
+                vals.append(None)
+            elif f in self.datetime_field_names:
+                dt: datetime = datetime.fromisoformat(msg_val[f])
+                vals.append(dt)
+            else:
+                vals.append(msg_val[f])
+        return vals
 
+    def prepare_operation(self, msg_key: Optional[Dict[str, Any]], msg_val: Optional[Dict[str, Any]],
+                          offset: int, timestamp: datetime) -> Optional[OrderedOperation]:
         key_val = tuple((msg_key[x] for x in self.primary_key_field_names))
         cdc_operation = msg_val['__operation']
 
-        if msg_val is None or msg_val.get('__operation') == 'Delete':
+        if cdc_operation == 'Delete':
             self.delete_cnt += 1
             return OrderedOperation(
                 original_topic=self.config.replay_topic,
-                operation_type='delete',
+                cdc_operation=cdc_operation,
                 key_val=key_val,
                 row_values=None,
-                cdc_operation=cdc_operation
+                offset=offset,
+                timestamp=timestamp
             )
         else:
             vals = self.convert_msg_to_row_values(msg_val)
             self.upsert_cnt += 1
+            # Capture __updated_fields for PostUpdate operations to enable targeted updates
+            updated_fields = msg_val.get('__updated_fields') if cdc_operation == 'PostUpdate' else None
             return OrderedOperation(
                 original_topic=self.config.replay_topic,
-                operation_type='upsert',
+                cdc_operation=cdc_operation,
                 key_val=key_val,
                 row_values=vals,
-                cdc_operation=cdc_operation
+                offset=offset,
+                timestamp=timestamp,
+                updated_fields=updated_fields
             )
 
     def build_update_params(self, row_values: List[Any]) -> Tuple[Any, ...]:
@@ -280,6 +372,47 @@ WHERE {where_clause}
         non_pk_vals = [field_to_val[f] for f in self._non_pk_fields]
         pk_vals = [field_to_val[f] for f in self.primary_key_field_names]
         return tuple(non_pk_vals + pk_vals)
+
+    def build_dynamic_update(self, row_values: List[Any], updated_fields: List[str]) -> Tuple[str, Tuple[Any, ...]]:
+        """Build a targeted UPDATE statement that only updates the specified fields.
+
+        This reduces index maintenance overhead by only updating columns that actually changed,
+        rather than updating all non-PK columns.
+
+        Returns:
+            Tuple of (SQL statement, parameter tuple)
+        """
+        field_to_val = dict(zip(self.field_names, row_values))
+
+        # Filter to only fields that: are in updated_fields, exist in our field list,
+        # are not PK fields, and are not the identity column
+        fields_to_update = [
+            f for f in updated_fields
+            if f in field_to_val
+            and f not in self.primary_key_field_names
+            and f != self.identity_col_name
+            and f not in self.cols_to_not_sync
+            and f.lower() not in self.computed_cols
+        ]
+
+        # If no fields to update (e.g., only PK changed, which shouldn't happen), fall back to full update
+        if not fields_to_update:
+            return self.update_stmt, self.build_update_params(row_values)
+
+        # Build SET clause with only changed fields
+        set_clause = ', '.join([f'[{f}] = ?' for f in fields_to_update])
+        where_clause = ' AND '.join([f'[{pk}] = ?' for pk in self.primary_key_field_names])
+
+        stmt = f'''
+UPDATE {self.fq_target_table_name}
+SET {set_clause}
+WHERE {where_clause}
+'''
+        # Parameters: changed field values first, then PK values
+        params = tuple([field_to_val[f] for f in fields_to_update] +
+                       [field_to_val[f] for f in self.primary_key_field_names])
+
+        return stmt, params
 
     def log_stats(self) -> None:
         """Log processing statistics."""
