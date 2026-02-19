@@ -104,14 +104,16 @@ ORDER BY [ORDINAL_POSITION]
 
         Handles datetime conversion, varchar/nvarchar encoding, missing fields, and None values.
         """
+        msg_val = {k.lower(): v for k, v in msg_val.items()}
         vals: List[Any] = []
         for f in self.field_names:
-            if f not in msg_val:
+            fl = f.lower()
+            if fl not in msg_val:
                 vals.append(self.column_defaults[f])
-            elif msg_val[f] is None:
+            elif msg_val[fl] is None:
                 vals.append(None)
             elif f in self.datetime_field_names:
-                dt: datetime = datetime.fromisoformat(msg_val[f])
+                dt: datetime = datetime.fromisoformat(msg_val[fl])
                 if dt.year < 1753 and for_bcp:
                     # FML--something in either CTDS or FreeTDS gets weird when trying to BCP anything earlier
                     # so we're just going to standardize the cutoff for anything before this (which is likely
@@ -121,12 +123,12 @@ ORDER BY [ORDINAL_POSITION]
             elif f in self.varchar_field_names and for_bcp:
                 # The below assumes your DB uses SQL_Latin1_General_CP1_CI_AS collation; if not, you may
                 # need to change 'cp1252' to something else.
-                vals.append(ctds.SqlVarChar(msg_val[f].encode('cp1252')))
+                vals.append(ctds.SqlVarChar(msg_val[fl].encode('cp1252')))
             elif f in self.nvarchar_field_names and for_bcp:
                 # See https://zillow.github.io/ctds/bulk_insert.html#text-columns
-                vals.append(ctds.SqlVarChar(msg_val[f].encode('utf-16le')))
+                vals.append(ctds.SqlVarChar(msg_val[fl].encode('utf-16le')))
             else:
-                vals.append(msg_val[f])
+                vals.append(msg_val[fl])
         return vals
 
     def create_temp_tables(self, db_conn: ctds.Connection) -> None:
@@ -323,17 +325,19 @@ WHERE {where_clause}
         Handles datetime conversion, missing fields, and None values.
         Unlike the ctds version, pyodbc handles empty strings correctly so no SqlVarChar wrapping needed.
         """
+        msg_val = {k.lower(): v for k, v in msg_val.items()}
         vals: List[Any] = []
         for f in self.field_names:
-            if f not in msg_val:
+            fl = f.lower()
+            if fl not in msg_val:
                 vals.append(self.column_defaults[f])
-            elif msg_val[f] is None:
+            elif msg_val[fl] is None:
                 vals.append(None)
             elif f in self.datetime_field_names:
-                dt: datetime = datetime.fromisoformat(msg_val[f])
+                dt: datetime = datetime.fromisoformat(msg_val[fl])
                 vals.append(dt)
             else:
-                vals.append(msg_val[f])
+                vals.append(msg_val[fl])
         return vals
 
     def prepare_operation(self, msg_key: Optional[Dict[str, Any]], msg_val: Optional[Dict[str, Any]],

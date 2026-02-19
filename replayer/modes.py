@@ -85,7 +85,7 @@ def run_backfill_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfi
     for config in replay_configs:
         stop_events[config.replay_topic] = mp.Event()
         # For faster_fifo the ctor arg here is the queue byte size, not its item count size:
-        queues[config.replay_topic] = Queue(opts.upsert_batch_size * 5_000)
+        queues[config.replay_topic] = Queue(opts.upsert_batch_size * 10_000)
         worker_opts = argparse.Namespace(**vars(opts))
         worker_opts.replay_topic = config.replay_topic
         worker_opts.target_db_table_schema = config.target_db_table_schema
@@ -98,7 +98,21 @@ def run_backfill_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfi
     total_messages = calculate_total_messages_to_process(high_watermarks, progress_by_topic)
     backfill_progress = BackfillProgressTracker()
     backfill_progress.set_total_to_process(total_messages)
+    backfill_progress.set_total_tables(len(replay_configs))
     shared_processed_counter = backfill_progress.get_shared_counter()
+    shared_tables_complete_counter = backfill_progress.get_tables_complete_counter()
+
+    # Compute per-topic start offsets so workers can track progress via offset deltas
+    start_offsets_by_topic: Dict[str, Dict[int, int]] = {}
+    for topic, partition_watermarks in high_watermarks.items():
+        progress_records = progress_by_topic.get(topic, [])
+        last_offset_by_partition: Dict[int, int] = {
+            p.source_topic_partition: p.last_handled_message_offset for p in progress_records
+        }
+        start_offsets_by_topic[topic] = {
+            partition: last_offset_by_partition.get(partition, -1) + 1
+            for partition in partition_watermarks
+        }
 
     # Launch single shared consumer process (with cutoff LSN for backfill mode)
     consumer_proc = mp.Process(
@@ -121,7 +135,9 @@ def run_backfill_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfi
                 target=replay_worker,
                 name=f'replayer-{config.replay_topic}',
                 args=(config, opts, stop_events[config.replay_topic], queues[config.replay_topic],
-                      worker_proc_id, cutoff_lsn, shared_processed_counter)
+                      worker_proc_id, cutoff_lsn, shared_processed_counter,
+                      start_offsets_by_topic.get(config.replay_topic, {}),
+                      shared_tables_complete_counter)
             )
             worker.start()
             workers.append(worker)
@@ -130,13 +146,28 @@ def run_backfill_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfi
 
         # Wait for all workers to complete while displaying progress
         last_progress_log_time = datetime.now()
-        progress_log_interval = timedelta(seconds=10)
+        last_queue_depth_log_time = datetime.now()
+        progress_log_interval = timedelta(seconds=15)
+        queue_depth_log_interval = timedelta(seconds=60)
 
         while any(w.is_alive() for w in workers) or consumer_proc.is_alive():
+            now = datetime.now()
             # Check if it's time to log progress
-            if datetime.now() >= last_progress_log_time + progress_log_interval:
+            if now >= last_progress_log_time + progress_log_interval:
                 logger.info(backfill_progress.format_progress_report())
-                last_progress_log_time = datetime.now()
+                last_progress_log_time = now
+
+            # Less-frequent queue depth report for diagnosing hangs
+            if now >= last_queue_depth_log_time + queue_depth_log_interval:
+                depth_parts = []
+                for config, worker in zip(replay_configs, workers):
+                    if worker.is_alive():
+                        q = queues[config.replay_topic]
+                        depth_parts.append(f"{config.replay_topic}={q.qsize()}")
+                if depth_parts:
+                    logger.info(f"Queue depths for active workers: {', '.join(depth_parts)}")
+                last_queue_depth_log_time = now
+
             time.sleep(1)
 
         # Final progress report

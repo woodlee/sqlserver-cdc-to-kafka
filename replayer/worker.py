@@ -28,14 +28,20 @@ logger = get_logger(__name__)
 
 def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: EventClass, queue: Queue,
                   proc_id: str, cutoff_lsn: str = None,
-                  processed_counter: Optional[Synchronized[int]] = None) -> None:
+                  processed_counter: Optional[Synchronized[int]] = None,
+                  start_offsets_by_partition: Optional[Dict[int, int]] = None,
+                  tables_complete_counter: Optional[Synchronized[int]] = None) -> None:
     """Worker process that replays a single topic to a single table.
 
     If cutoff_lsn is provided (backfill mode), the worker stops when it sees a message
     with an LSN exceeding the cutoff.
 
     If processed_counter is provided, it will be incremented for each message processed
-    to support backfill progress tracking.
+    to support backfill progress tracking. When start_offsets_by_partition is also provided,
+    progress is tracked as offset advancement rather than message count, which correctly
+    accounts for gaps in Kafka offsets.
+
+    If tables_complete_counter is provided, it will be incremented when this worker finishes.
     """
     logger.info(f"Starting replay worker for topic '{config.replay_topic}' -> "
                 f"[{config.target_db_table_schema}].[{config.target_db_table_name}]"
@@ -60,7 +66,7 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                                        opts.progress_tracking_namespace, proc_id)
     try:
         with ctds.connect(opts.target_db_server, user=opts.target_db_user, password=opts.target_db_password,
-                          database=opts.target_db_database, timeout=15, login_timeout=15) as db_conn:
+                          database=opts.target_db_database, timeout=15, login_timeout=15, autocommit=True) as db_conn:
             # Create a modified opts object for this specific topic/table
             worker_opts = argparse.Namespace(**vars(opts))
             worker_opts.replay_topic = config.replay_topic
@@ -109,10 +115,13 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                 msg_val: Optional[Dict[str, Any]] = None
                 if raw_key is not None:
                     # noinspection PyNoneFunctionAssignment
+                    logger.debug('des key')
                     msg_key = avro_deserializer(raw_key, SerializationContext(topic, MessageField.KEY))  # type: ignore[func-returns-value]
                 if raw_val is not None:
                     # noinspection PyNoneFunctionAssignment
+                    logger.debug('des val')
                     msg_val = avro_deserializer(raw_val, SerializationContext(topic, MessageField.VALUE))  # type: ignore[func-returns-value]
+                logger.debug('des exit')
 
                 # Check cutoff LSN in backfill mode
                 reached_cutoff = False
@@ -129,21 +138,21 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                 if reached_cutoff or reached_eof or len(queued_deletes) >= opts.delete_batch_size or \
                         len(queued_upserts) >= opts.upsert_batch_size or \
                         (datetime.now() - last_commit_time).seconds > opts.max_commit_latency_seconds:
+                    logger.debug('Entering write loop. Reached cutoff: %s Reached EOF: %s Queued deletes: %s Queued '
+                                 'upserts: %s Time since last commit: %s', reached_cutoff, reached_eof,
+                                 len(queued_deletes), len(queued_upserts), (datetime.now() - last_commit_time).seconds)
                     with db_conn.cursor() as cursor:
                         if queued_deletes:
                             start_time = time.perf_counter()
                             db_conn.bulk_insert(metadata.delete_temp_table_name, list(queued_deletes))
                             sql_time_acc += time.perf_counter() - start_time
-                            elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-                            logger.info('Worker %s: Inserted to temp table for delete: %s items in %s ms',
-                                        config.replay_topic, len(queued_deletes), elapsed_ms)
-
+                            temp_table_elapsed_ms = int((time.perf_counter() - start_time) * 1000)
                             start_time = time.perf_counter()
                             cursor.execute(metadata.delete_stmt)
                             sql_time_acc += time.perf_counter() - start_time
                             elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-                            logger.info('Worker %s: Deleted %s items in %s ms',
-                                        config.replay_topic, len(queued_deletes), elapsed_ms)
+                            logger.info('Deleted %s items. Temp table insert: %s ms, delete stmt: %s ms',
+                                        len(queued_deletes), temp_table_elapsed_ms, elapsed_ms)
 
                         if queued_upserts:
                             inserts: List[Any] = []
@@ -160,18 +169,24 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                             # are relatively few of them, to cut down on DB round-trips:
                             if inserts and merges and len(inserts) < 100 or \
                                     len(inserts) / (len(inserts) + len(merges)) < 0.1:
-                                logger.debug('Worker %s: Rolling %s inserts into %s merges',
-                                             config.replay_topic, len(inserts), len(merges))
+                                logger.debug('Rolling %s inserts into %s merges', len(inserts), len(merges))
                                 merges += inserts
                                 inserts = []
 
                             if inserts:
                                 start_time = time.perf_counter()
-                                db_conn.bulk_insert(metadata.fq_target_table_name, inserts)
-                                sql_time_acc += time.perf_counter() - start_time
-                                elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-                                logger.info('Worker %s: Inserted directly to target table: %s items in %s ms',
-                                            config.replay_topic, len(inserts), elapsed_ms)
+                                try:
+                                    db_conn.bulk_insert(metadata.fq_target_table_name, inserts)
+                                    sql_time_acc += time.perf_counter() - start_time
+                                    elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+                                    logger.info('Inserted directly to target table: %s items in %s ms',
+                                                len(inserts), elapsed_ms)
+                                except _tds.IntegrityError as e:
+                                    # Likely a PK constraint violation due to potential event replay after a process
+                                    # restart; retry batch as merges
+                                    logger.warning(f'Integrity error while directly inserting into '
+                                                   f'{config.replay_topic}: {e}. Will retry operation as a MERGE...')
+                                    merges = merges + inserts
 
                             if merges:
                                 start_time = time.perf_counter()
@@ -181,16 +196,13 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                                     pprint.pprint(merges)
                                     raise e
                                 sql_time_acc += time.perf_counter() - start_time
-                                elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-                                logger.info('Worker %s: Inserted to temp table for merge: %s items in %s ms',
-                                            config.replay_topic, len(merges), elapsed_ms)
-
+                                temp_table_elapsed_ms = int((time.perf_counter() - start_time) * 1000)
                                 start_time = time.perf_counter()
                                 cursor.execute(metadata.merge_stmt)
                                 sql_time_acc += time.perf_counter() - start_time
                                 elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-                                logger.info('Worker %s: Merged %s items in %s ms',
-                                            config.replay_topic, len(merges), elapsed_ms)
+                                logger.info('Merged %s items. Temp table insert: %s ms, merge stmt: %s ms',
+                                            len(merges), temp_table_elapsed_ms, elapsed_ms)
 
                         if queued_upserts or queued_deletes:
                             queued_upserts.clear()
@@ -226,9 +238,19 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                     # queued_deletes.discard(key_val)
                     upsert_cnt += 1
 
-                # Increment the processed counter for progress tracking
+                # Increment the processed counter for progress tracking.
+                # Use offset delta rather than message count to correctly handle
+                # gaps in Kafka offsets.
                 if processed_counter is not None:
-                    BackfillProgressTracker.increment_processed(processed_counter)
+                    if start_offsets_by_partition is not None:
+                        prev = last_consume_by_partition.get(msg_partition)
+                        if prev is not None:
+                            offset_delta = msg_offset - prev[0]
+                        else:
+                            offset_delta = msg_offset - start_offsets_by_partition.get(msg_partition, 0) + 1
+                        BackfillProgressTracker.increment_processed(processed_counter, offset_delta)
+                    else:
+                        BackfillProgressTracker.increment_processed(processed_counter)
 
                 if (len(queued_deletes) + len(queued_upserts)) % 5_000 == 0:
                     logger.debug('Worker %s: Currently have %s queued deletes and %s queued upserts. '
@@ -244,6 +266,8 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
         logger.exception(f"Worker for '{config.replay_topic}' encountered error: {e}")
     finally:
         stop_event.set()
+        if tables_complete_counter is not None:
+            BackfillProgressTracker.increment_processed(tables_complete_counter)
         logger.info(f"Worker for '{config.replay_topic}': Processed {delete_cnt} deletes, {upsert_cnt} upserts.")
         overall_time = time.perf_counter() - proc_start_time
         logger.info(f"Worker for '{config.replay_topic}' total times:\n"

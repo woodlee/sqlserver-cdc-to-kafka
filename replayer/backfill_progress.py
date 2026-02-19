@@ -32,6 +32,8 @@ class BackfillProgressTracker:
     def __init__(self) -> None:
         self._total_to_process: Synchronized[int] = Value('q', 0)  # signed long long
         self._total_processed: Synchronized[int] = Value('q', 0)
+        self._total_tables: Synchronized[int] = Value('i', 0)
+        self._tables_complete: Synchronized[int] = Value('i', 0)
         self._start_time: Optional[datetime] = None
         # Rolling window of (timestamp, processed_count) samples for rate calculation
         self._rate_samples: Deque[Tuple[float, int]] = deque()
@@ -42,7 +44,16 @@ class BackfillProgressTracker:
         with self._total_to_process.get_lock():
             self._total_to_process.value = total
         self._start_time = datetime.now()
-        logger.info(f"Backfill progress: {total:,} total messages to process")
+        logger.info(f"Backfill progress: {total:,} total offset range to process")
+
+    def set_total_tables(self, total: int) -> None:
+        """Set the total number of tables being backfilled."""
+        with self._total_tables.get_lock():
+            self._total_tables.value = total
+
+    def get_tables_complete_counter(self) -> Synchronized[int]:
+        """Get the shared counter for workers to increment on completion."""
+        return self._tables_complete
 
     def get_shared_counter(self) -> Synchronized[int]:
         """Get the shared counter for workers to increment."""
@@ -140,12 +151,18 @@ class BackfillProgressTracker:
         rate = self.get_messages_per_second()
         eta = self.get_estimated_time_remaining()
 
+        total_tables = self._total_tables.value
+        tables_done = self._tables_complete.value
+
         parts = [
             f"Progress: {processed:,}/{total:,} ({pct:.1f}%)"
         ]
 
+        if total_tables > 0:
+            parts.append(f"{tables_done}/{total_tables} tables complete")
+
         if rate is not None:
-            parts.append(f"Rate: {rate:,.0f} msg/s")
+            parts.append(f"Rate: {rate:,.0f} offsets/s")
 
         if eta is not None:
             # Format ETA nicely
