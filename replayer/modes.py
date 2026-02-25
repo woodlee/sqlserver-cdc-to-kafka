@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import multiprocessing as mp
 import socket
 import time
@@ -85,7 +86,7 @@ def run_backfill_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfi
     for config in replay_configs:
         stop_events[config.replay_topic] = mp.Event()
         # For faster_fifo the ctor arg here is the queue byte size, not its item count size:
-        queues[config.replay_topic] = Queue(opts.upsert_batch_size * 10_000)
+        queues[config.replay_topic] = Queue(opts.upsert_batch_size * 3_000)
         worker_opts = argparse.Namespace(**vars(opts))
         worker_opts.replay_topic = config.replay_topic
         worker_opts.target_db_table_schema = config.target_db_table_schema
@@ -182,6 +183,7 @@ def run_backfill_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfi
         logger.info("Received interrupt signal, shutting down workers...")
         for event in stop_events.values():
             event.set()
+        time.sleep(1)
         for worker in workers:
             if worker.is_alive():
                 worker.terminate()
@@ -194,6 +196,7 @@ def run_backfill_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfi
         logger.exception(f"Error in main process: {e}")
         for event in stop_events.values():
             event.set()
+        time.sleep(1)
         for worker in workers:
             if worker.is_alive():
                 worker.terminate()
@@ -202,6 +205,9 @@ def run_backfill_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfi
         for worker in workers:
             worker.join(timeout=5)
         consumer_proc.join(timeout=5)
+    finally:
+        logging.shutdown()
+        time.sleep(0.5)
 
 
 def run_follow_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfig]) -> None:
@@ -246,7 +252,7 @@ def run_follow_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfig]
     consumer_conf = build_consumer_config(opts.kafka_bootstrap_servers, f'replayer-follow-{proc_id}',
                                           **opts.extra_kafka_consumer_config)
     consumer = Consumer(consumer_conf)
-    schema_registry_client = SchemaRegistryClient({'url': opts.schema_registry_url})
+    schema_registry_client = SchemaRegistryClient({'url': opts.schema_registry_url, 'timeout': 15.0})
     avro_deserializer = AvroDeserializer(schema_registry_client)
 
     topics_meta: Dict[str, TopicMetadata] | None = consumer.list_topics(

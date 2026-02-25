@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import pprint
 import queue as stdlib_queue
 import time
@@ -58,7 +59,8 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
     queued_upserts: Dict[Any, Tuple[str, List[Any]]] = {}
     proc_start_time: float = time.perf_counter()
 
-    schema_registry_client: SchemaRegistryClient = SchemaRegistryClient({'url': opts.schema_registry_url})
+    schema_registry_client: SchemaRegistryClient = SchemaRegistryClient({'url': opts.schema_registry_url,
+                                                                         'timeout': 15.0})
     avro_deserializer: AvroDeserializer = AvroDeserializer(schema_registry_client)
     pyodbc_conn_string = get_pyodbc_conn_string_from_opts(opts)
     progress_tracker = ProgressTracker(pyodbc_conn_string, opts.progress_tracking_table_schema,
@@ -94,14 +96,27 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
 
             proc_start_time = time.perf_counter()
             logger.debug(f"Worker for '{config.replay_topic}': Listening for consumed messages.")
+            last_worker_heartbeat = proc_start_time
 
             while True:
+                current = time.perf_counter()
+                if current - last_worker_heartbeat > 10.0:
+                    logger.debug(f"Worker heartbeat. Observed apx queue size: {queue.qsize()}")
+                    last_worker_heartbeat = current
+
+                first_since_write = len(queued_upserts) + len(queued_deletes) <= 1
+                if first_since_write:
+                    logger.debug('Restarting accumulation phase')
+
                 queue_get_wait_start = time.perf_counter()
                 try:
-                    topic, msg_partition, msg_offset, msg_timestamp, raw_key, raw_val = queue.get(timeout=0.1)
+                    topic, msg_partition, msg_offset, msg_timestamp, raw_key, raw_val = queue.get(timeout=1)
                 except stdlib_queue.Empty:
                     topic, msg_partition, msg_offset, msg_timestamp, raw_key, raw_val = None, None, None, None, None, None
-                queue_get_wait += time.perf_counter() - queue_get_wait_start
+                took = time.perf_counter() - queue_get_wait_start
+                if took > 1.1:
+                    logger.debug('Long queue wait')
+                queue_get_wait += took
 
                 # Check for EOF sentinel (topic is set but partition is None when consumer reached end of topic)
                 # Note: when queue.get times out, topic is also None, so we check topic is not None
@@ -113,15 +128,33 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                 # Deserialize Avro messages in parallel workers
                 msg_key: Optional[Dict[str, Any]] = None
                 msg_val: Optional[Dict[str, Any]] = None
+
                 if raw_key is not None:
-                    # noinspection PyNoneFunctionAssignment
-                    logger.debug('des key')
-                    msg_key = avro_deserializer(raw_key, SerializationContext(topic, MessageField.KEY))  # type: ignore[func-returns-value]
+                    retries: int = 0  # retries because schema registry calls very occasionally fail
+                    while True:
+                        try:
+                            # noinspection PyNoneFunctionAssignment
+                            msg_key = avro_deserializer(raw_key, SerializationContext(topic, MessageField.KEY))  # type: ignore[func-returns-value]
+                            break
+                        except Exception as e:
+                            if retries >= 3:
+                                raise e
+                            logger.warning('Avro key deserialization failed. Retrying. Exception was: %s', str(e))
+                            retries += 1
+                            time.sleep(1)
                 if raw_val is not None:
-                    # noinspection PyNoneFunctionAssignment
-                    logger.debug('des val')
-                    msg_val = avro_deserializer(raw_val, SerializationContext(topic, MessageField.VALUE))  # type: ignore[func-returns-value]
-                logger.debug('des exit')
+                    retries: int = 0  # retries because schema registry calls very occasionally fail
+                    while True:
+                        try:
+                            # noinspection PyNoneFunctionAssignment
+                            msg_val = avro_deserializer(raw_val, SerializationContext(topic, MessageField.VALUE))  # type: ignore[func-returns-value]
+                            break
+                        except Exception as e:
+                            if retries >= 3:
+                                raise e
+                            logger.warning('Avro value deserialization failed. Retrying. Exception was: %s', str(e))
+                            retries += 1
+                            time.sleep(1)
 
                 # Check cutoff LSN in backfill mode
                 reached_cutoff = False
@@ -212,6 +245,14 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                                 worker_opts.replay_topic, last_consume_by_partition)
                             last_commit_time = datetime.now()
 
+                        for partition, prev_offset in start_offsets_by_partition.items():
+                            curr_offset = last_consume_by_partition.get(partition)
+                            if curr_offset is not None:
+                                offset_delta = curr_offset[0] - prev_offset
+                                BackfillProgressTracker.increment_processed(processed_counter, offset_delta)
+                                start_offsets_by_partition[partition] = curr_offset[0]
+                        logger.debug('Incremented progress counters.')
+
                     if reached_cutoff or reached_eof:
                         logger.info(f"Worker {config.replay_topic}: flushed remaining work, exiting.")
                         break
@@ -238,20 +279,6 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                     # queued_deletes.discard(key_val)
                     upsert_cnt += 1
 
-                # Increment the processed counter for progress tracking.
-                # Use offset delta rather than message count to correctly handle
-                # gaps in Kafka offsets.
-                if processed_counter is not None:
-                    if start_offsets_by_partition is not None:
-                        prev = last_consume_by_partition.get(msg_partition)
-                        if prev is not None:
-                            offset_delta = msg_offset - prev[0]
-                        else:
-                            offset_delta = msg_offset - start_offsets_by_partition.get(msg_partition, 0) + 1
-                        BackfillProgressTracker.increment_processed(processed_counter, offset_delta)
-                    else:
-                        BackfillProgressTracker.increment_processed(processed_counter)
-
                 if (len(queued_deletes) + len(queued_upserts)) % 5_000 == 0:
                     logger.debug('Worker %s: Currently have %s queued deletes and %s queued upserts. '
                                  'Time waiting on queue = %s. Apx. queue depth %s',
@@ -273,3 +300,5 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
         logger.info(f"Worker for '{config.replay_topic}' total times:\n"
                     f"Kafka poll: {poll_time_acc:.2f}s\nSQL execution: {sql_time_acc:.2f}s\n"
                     f"Overall: {overall_time:.2f}s")
+        logging.shutdown()
+        time.sleep(0.5)

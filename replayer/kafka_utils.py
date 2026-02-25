@@ -40,7 +40,7 @@ def format_coordinates(msg: Message) -> str:
 
 
 def get_latest_lsn_from_all_changes_topic(opts: argparse.Namespace) -> Tuple[str, int]:
-    schema_registry_client = SchemaRegistryClient({'url': opts.schema_registry_url})
+    schema_registry_client = SchemaRegistryClient({'url': opts.schema_registry_url, 'timeout': 15.0})
     avro_deserializer = AvroDeserializer(schema_registry_client)
 
     consumer_conf = build_consumer_config(opts.kafka_bootstrap_servers,

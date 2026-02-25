@@ -3,9 +3,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pyodbc
 
+from .logging_config import get_logger
 from .models import Progress
 
 UTC = timezone.utc
+
+logger = get_logger(__name__)
 
 
 class ProgressTracker(object):
@@ -135,16 +138,15 @@ class ProgressTracker(object):
 
     def commit_progress(self, target_db_table_schema: str, target_db_table_name: str,
                         replay_topic: str, last_consume_by_partition: Dict[int, Tuple[int, int]]) -> None:
-        cursor = self.db_conn.cursor()
-        try:
+        logger.debug(f'Committing progress for topic {replay_topic}: {str(last_consume_by_partition)}')
+        with self.db_conn.cursor() as cursor:
             for partition, (offset, timestamp) in last_consume_by_partition.items():
                 self.upsert_progress_record(
                     cursor, replay_topic, partition, target_db_table_schema, target_db_table_name,
                     offset, datetime.fromtimestamp(timestamp / 1000, UTC).replace(tzinfo=None), use_object_id=True
                 )
             self.db_conn.commit()
-        finally:
-            cursor.close()
+        logger.debug(f'Progress commit complete.')
 
 
     def get_all_changes_topic_progress(self) -> Optional[Progress]:
