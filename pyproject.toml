@@ -7,7 +7,7 @@ name = "sqlserver-cdc-to-kafka"
 version = "4.4.0"
 description = "Stream SQL Server Change Data Capture (CDC) events to Apache Kafka"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 dependencies = [
     "avro==1.12.1",
     "aws-msk-iam-sasl-signer-python==1.0.2",
@@ -47,7 +47,7 @@ cdc-kafka = "cdc_kafka.main:run"
 include = ["cdc_kafka*"]
 
 [tool.mypy]
-python_version = "3.14"
+python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false

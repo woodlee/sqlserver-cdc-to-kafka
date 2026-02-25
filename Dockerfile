@@ -1,4 +1,4 @@
-FROM python:3.14-slim-trixie
+FROM python:3.12-slim-trixie
 
 WORKDIR /srv
 
