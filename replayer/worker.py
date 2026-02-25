@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import multiprocessing as mp
 import pprint
 import queue as stdlib_queue
 import time
+import traceback
 from datetime import datetime
 from multiprocessing.sharedctypes import Synchronized
 from multiprocessing.synchronize import Event as EventClass
@@ -31,7 +33,9 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                   proc_id: str, cutoff_lsn: str = None,
                   processed_counter: Optional[Synchronized[int]] = None,
                   start_offsets_by_partition: Optional[Dict[int, int]] = None,
-                  tables_complete_counter: Optional[Synchronized[int]] = None) -> None:
+                  tables_complete_counter: Optional[Synchronized[int]] = None,
+                  error_event: Optional[EventClass] = None,
+                  error_queue: Optional[mp.Queue] = None) -> None:
     """Worker process that replays a single topic to a single table.
 
     If cutoff_lsn is provided (backfill mode), the worker stops when it sees a message
@@ -291,8 +295,19 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
         pass
     except Exception as e:
         logger.exception(f"Worker for '{config.replay_topic}' encountered error: {e}")
-    finally:
+        if error_queue is not None and error_event is not None:
+            try:
+                error_queue.put_nowait((config.replay_topic, traceback.format_exc()))
+            except Exception:
+                pass
+            error_event.set()
+        else:
+            # Legacy fallback: if no error signaling available, set stop_event so consumer pauses
+            stop_event.set()
+    else:
+        # Normal exit (cutoff reached, EOF, or clean stop): signal consumer to pause this topic
         stop_event.set()
+    finally:
         if tables_complete_counter is not None:
             BackfillProgressTracker.increment_processed(tables_complete_counter)
         logger.info(f"Worker for '{config.replay_topic}': Processed {delete_cnt} deletes, {upsert_cnt} upserts.")

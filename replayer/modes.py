@@ -4,6 +4,7 @@ import argparse
 import logging
 import multiprocessing as mp
 import socket
+import sys
 import time
 from datetime import datetime, timezone, timedelta
 from multiprocessing.synchronize import Event as EventClass
@@ -114,6 +115,11 @@ def run_backfill_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfi
             for partition in partition_watermarks
         }
 
+    # Shared error signaling: any worker that dies exceptionally sets this event and puts
+    # (topic, traceback_str) on the queue so the main thread can tear everything down fast.
+    error_event: EventClass = mp.Event()
+    error_queue: mp.Queue = mp.Queue(len(replay_configs))
+
     # Launch single shared consumer process (with cutoff LSN for backfill mode)
     consumer_proc = mp.Process(
         target=backfill_consumer_process,
@@ -137,7 +143,7 @@ def run_backfill_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfi
                 args=(config, opts, stop_events[config.replay_topic], queues[config.replay_topic],
                       worker_proc_id, cutoff_lsn, shared_processed_counter,
                       start_offsets_by_topic.get(config.replay_topic, {}),
-                      shared_tables_complete_counter)
+                      shared_tables_complete_counter, error_event, error_queue)
             )
             worker.start()
             workers.append(worker)
@@ -152,6 +158,30 @@ def run_backfill_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfi
 
         while any(w.is_alive() for w in workers) or consumer_proc.is_alive():
             now = datetime.now()
+
+            # Check if any worker died exceptionally
+            if error_event.is_set():
+                failed_topic = '(unknown)'
+                tb_str = '(no traceback available)'
+                try:
+                    failed_topic, tb_str = error_queue.get_nowait()
+                except Exception:
+                    pass
+                logger.error(f"Worker for topic '{failed_topic}' died with exception. "
+                             f"Initiating full shutdown for safe restart.\n{tb_str}")
+                for event in stop_events.values():
+                    event.set()
+                time.sleep(1)
+                for w in workers:
+                    if w.is_alive():
+                        w.terminate()
+                if consumer_proc.is_alive():
+                    consumer_proc.terminate()
+                for w in workers:
+                    w.join(timeout=5)
+                consumer_proc.join(timeout=5)
+                sys.exit(1)
+
             # Check if it's time to log progress
             if now >= last_progress_log_time + progress_log_interval:
                 logger.info(backfill_progress.format_progress_report())
