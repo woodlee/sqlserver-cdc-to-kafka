@@ -3,10 +3,12 @@ FROM python:3.14-slim-trixie
 WORKDIR /srv
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends curl gnupg \
-  && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg \
-  && echo "deb [signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" > /etc/apt/sources.list.d/mssql-release.list \
-  && apt-get update \
+  && apt-get install -y --no-install-recommends curl \
+  && curl -sSL -O https://packages.microsoft.com/config/debian/$(grep VERSION_ID /etc/os-release | cut -d '"' -f 2 | cut -d '.' -f 1)/packages-microsoft-prod.deb \
+  && dpkg -i packages-microsoft-prod.deb \
+  && rm packages-microsoft-prod.deb
+
+RUN apt-get update \
   && ACCEPT_EULA=Y apt-get install -y --no-install-recommends \
        unixodbc-dev \
        msodbcsql18 \
@@ -16,7 +18,7 @@ RUN apt-get update \
        build-essential \
        gcc \
        g++ \
-  && apt-get purge -y --auto-remove curl gnupg \
+  && apt-get purge -y --auto-remove curl \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*
 

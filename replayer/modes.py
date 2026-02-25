@@ -6,7 +6,6 @@ import multiprocessing as mp
 import socket
 import time
 from datetime import datetime, timezone, timedelta
-from multiprocessing.sharedctypes import Synchronized
 from multiprocessing.synchronize import Event as EventClass
 from typing import Any, Dict, List, Optional
 

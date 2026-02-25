@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import multiprocessing as mp
 import time
 from collections import deque
 from datetime import datetime, timedelta
 from multiprocessing import Value
 from multiprocessing.sharedctypes import Synchronized
-from typing import Deque, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Deque, Dict, List, Optional, Tuple
 
 from .logging_config import get_logger
 from .models import Progress
@@ -30,7 +29,7 @@ class BackfillProgressTracker:
     SAMPLE_INTERVAL_SECONDS = 5
 
     def __init__(self) -> None:
-        self._total_to_process: Synchronized[int] = Value('q', 0)  # signed long long
+        self._total_to_process: Synchronized[int] = Value('q', 0)
         self._total_processed: Synchronized[int] = Value('q', 0)
         self._total_tables: Synchronized[int] = Value('i', 0)
         self._tables_complete: Synchronized[int] = Value('i', 0)
