@@ -65,6 +65,10 @@ def main() -> None:
     p.add_argument('--truncate-existing-data', action='store_true',
                    default=os.environ.get('TRUNCATE_EXISTING_DATA', '').lower() in ('true', '1', 'yes'),
                    help='Truncate target table data if no prior progress exists')
+    p.add_argument('--always-merge', action='store_true',
+                   default=os.environ.get('ALWAYS_MERGE', '').lower() in ('true', '1', 'yes'),
+                   help='During backfill, always upsert by merging from a loaded temp table, avoiding direct INSERTs '
+                        'to the target table')
 
     # Mode selection for backfill vs follow
     p.add_argument('--mode',

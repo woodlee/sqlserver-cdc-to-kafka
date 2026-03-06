@@ -181,7 +181,7 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                     with db_conn.cursor() as cursor:
                         if queued_deletes:
                             start_time = time.perf_counter()
-                            db_conn.bulk_insert(metadata.delete_temp_table_name, list(queued_deletes))
+                            db_conn.bulk_insert(metadata.delete_temp_table_name, list(queued_deletes), tablock=True)
                             sql_time_acc += time.perf_counter() - start_time
                             temp_table_elapsed_ms = int((time.perf_counter() - start_time) * 1000)
                             start_time = time.perf_counter()
@@ -195,12 +195,15 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                             inserts: List[Any] = []
                             merges: List[Any] = []
                             for _, (op, val) in queued_upserts.items():
-                                # CTDS unfortunately completely ignores values for target-table IDENTITY cols when doing
-                                # a bulk_insert, so in that case we have to fall back to the slower MERGE mechanism:
-                                if (not metadata.identity_col_name) and op == 'Insert':  # in ('Snapshot', 'Insert'): -- Snapshots can hit PK collisions! :(
-                                    inserts.append(val)
-                                else:
+                                if opts.always_merge:
                                     merges.append(val)
+                                else:
+                                    # CTDS unfortunately completely ignores values for target-table IDENTITY cols when doing
+                                    # a bulk_insert, so in that case we have to fall back to the slower MERGE mechanism:
+                                    if (not metadata.identity_col_name) and op == 'Insert':  # in ('Snapshot', 'Insert'): -- Snapshots can hit PK collisions! :(
+                                        inserts.append(val)
+                                    else:
+                                        merges.append(val)
 
                             # Inserts CAN be treated as merges, and it's probably more efficient to do so if there
                             # are relatively few of them, to cut down on DB round-trips:
@@ -213,7 +216,7 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                             if inserts:
                                 start_time = time.perf_counter()
                                 try:
-                                    db_conn.bulk_insert(metadata.fq_target_table_name, inserts)
+                                    db_conn.bulk_insert(metadata.fq_target_table_name, inserts, tablock=True)
                                     sql_time_acc += time.perf_counter() - start_time
                                     elapsed_ms = int((time.perf_counter() - start_time) * 1000)
                                     logger.info('Inserted directly to target table: %s items in %s ms',
@@ -228,7 +231,7 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                             if merges:
                                 start_time = time.perf_counter()
                                 try:
-                                    db_conn.bulk_insert(metadata.merge_temp_table_name, merges)
+                                    db_conn.bulk_insert(metadata.merge_temp_table_name, merges, tablock=True)
                                 except _tds.DatabaseError as e:
                                     pprint.pprint(merges)
                                     raise e

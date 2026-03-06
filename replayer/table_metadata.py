@@ -166,7 +166,7 @@ CREATE TABLE {self.delete_temp_table_name} (
             # Build DELETE statement
             delete_join_predicates = ' AND '.join([f'tgt.[{c}] = dtt.[{c}]' for c in self.primary_key_field_names])
             self.delete_stmt = f'''
-DELETE tgt
+DELETE tgt WITH (TABLOCK)
 FROM {self.fq_target_table_name} AS tgt
 INNER JOIN {self.delete_temp_table_name} AS dtt ON ({delete_join_predicates});
 
@@ -184,7 +184,7 @@ TRUNCATE TABLE {self.delete_temp_table_name};
             if set(self.field_names) == set(self.primary_key_field_names):
                 self.merge_stmt = f'''
 {set_identity_insert}
-MERGE {self.fq_target_table_name} AS tgt
+MERGE {self.fq_target_table_name} WITH (TABLOCK) AS tgt
 USING {self.merge_temp_table_name} AS src
     ON ({merge_match_predicates})
 WHEN NOT MATCHED THEN
@@ -195,7 +195,7 @@ TRUNCATE TABLE {self.merge_temp_table_name};
             else:
                 self.merge_stmt = f'''
 {set_identity_insert}
-MERGE {self.fq_target_table_name} AS tgt
+MERGE {self.fq_target_table_name} WITH (TABLOCK) AS tgt
 USING {self.merge_temp_table_name} AS src
     ON ({merge_match_predicates})
 WHEN MATCHED THEN

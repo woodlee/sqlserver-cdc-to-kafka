@@ -115,6 +115,7 @@ def backfill_consumer_process(replay_configs: List[ReplayConfig], opts: argparse
         logger.debug('Consumer assignments: %s', [f'{tp.topic}:{tp.partition}@{tp.offset}' for tp in all_topic_partitions])
         consumer.assign(all_topic_partitions)
         msg_ctr: int = 0
+
         msg_ctr_by_topic: Dict[str, int] = {config.replay_topic: 0 for config in replay_configs}
 
         # Track which topics have been paused (worker hit cutoff)
@@ -223,7 +224,7 @@ def backfill_consumer_process(replay_configs: List[ReplayConfig], opts: argparse
                         retries += 1
                         logger.warning(f'Retry {retries}. Current apx queue size for topic {topic} '
                                        f'is {queues[topic].qsize()}')
-                        time.sleep(10)
+                        time.sleep(4)
                     else:
                         logger.error(f'Persistent queue full attempting to enqueue message for topic {topic}, queue '
                                      f'apx size {queues[topic].qsize()}')

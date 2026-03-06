@@ -108,7 +108,8 @@ class TrackedTable(object):
             q, p = sql_queries.get_change_table_count_by_operation(
                 helpers.quote_name(helpers.get_fq_change_table_name(self.capture_instance_name)))
             cursor.setinputsizes(p)  # type: ignore[arg-type]
-            cursor.execute(q, (highest_change_index.lsn, highest_change_index.seqval, highest_change_index.operation))
+            cursor.execute(q, (highest_change_index.lsn, highest_change_index.command_id, highest_change_index.seqval,
+                               highest_change_index.operation))
             for row in cursor.fetchall():
                 if row[1] == 1:
                     deletes = row[0]
@@ -142,7 +143,7 @@ class TrackedTable(object):
                 logger.info('%s Proceeding anyway, because it appears that no new entries are present in the prior '
                             'capture instance with an LSN higher than the last changes sent to Kafka.', msg)
                 self.progress_tracker.record_changes_progress(self.topic_name, change_index.ChangeIndex(
-                    self.min_lsn, change_index.LOWEST_CHANGE_INDEX.seqval, change_index.LOWEST_CHANGE_INDEX.operation))
+                    self.min_lsn, change_index.LOWEST_CHANGE_INDEX.seqval, change_index.LOWEST_CHANGE_INDEX.operation))  # TODO
             elif lsn_gap_handling == options.LSN_GAP_HANDLING_IGNORE:
                 logger.warning('%s Proceeding anyway since lsn_gap_handling is set to "%s"!',
                                msg, options.LSN_GAP_HANDLING_IGNORE)
@@ -281,7 +282,8 @@ class TrackedTable(object):
         if self._changes_query_pending:
             raise Exception('enqueue_changes_query called while a query was already pending')
 
-        params = (self.max_polled_change_index.lsn, self.max_polled_change_index.seqval, lsn_limit)
+        params = (self.max_polled_change_index.lsn, self.max_polled_change_index.command_id,
+                  self.max_polled_change_index.seqval, lsn_limit)
         changes_query = sql_query_subprocess.SQLQueryRequest(
             self._changes_query_queue_name, lsn_limit, self._change_rows_query,
             self._change_rows_query_param_types, params, self._parse_db_row)
@@ -344,7 +346,7 @@ class TrackedTable(object):
                 else:
                     self.change_reads_are_lagging = False
                     self.max_polled_change_index = change_index.ChangeIndex(
-                        res.reflected_query_request_metadata, change_index.HIGHEST_CHANGE_INDEX.seqval,
+                        res.reflected_query_request_metadata, 2**31, change_index.HIGHEST_CHANGE_INDEX.seqval,
                         change_index.HIGHEST_CHANGE_INDEX.operation)
             else:
                 raise Exception('TrackedTable.retrieve_changes_query_results failed retrieving SQL query results.')
@@ -393,12 +395,12 @@ class TrackedTable(object):
         return len(b), b.decode('utf-8')
 
     def _parse_db_row(self, db_row: pyodbc.Row) -> parsed_row.ParsedRow:
-        operation_id, event_db_time, lsn, seqval, update_mask, *table_cols = db_row
+        operation_id, event_db_time, lsn, command_id, seqval, update_mask, *table_cols = db_row
 
         if operation_id == constants.SNAPSHOT_OPERATION_ID:
             change_idx = change_index.LOWEST_CHANGE_INDEX
         else:
-            change_idx = change_index.ChangeIndex(lsn, seqval, operation_id)
+            change_idx = change_index.ChangeIndex(lsn, command_id, seqval, operation_id)
 
         extra_headers: Dict[str, str | bytes] = {}
 

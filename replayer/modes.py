@@ -86,7 +86,7 @@ def run_backfill_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfi
     for config in replay_configs:
         stop_events[config.replay_topic] = mp.Event()
         # For faster_fifo the ctor arg here is the queue byte size, not its item count size:
-        queues[config.replay_topic] = Queue(opts.upsert_batch_size * 3_000)
+        queues[config.replay_topic] = Queue(opts.upsert_batch_size * 3_500)
         worker_opts = argparse.Namespace(**vars(opts))
         worker_opts.replay_topic = config.replay_topic
         worker_opts.target_db_table_schema = config.target_db_table_schema
