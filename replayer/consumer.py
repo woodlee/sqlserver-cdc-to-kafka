@@ -216,15 +216,17 @@ def backfill_consumer_process(replay_configs: List[ReplayConfig], opts: argparse
                     if topic in stop_events and stop_events[topic].is_set():
                         logger.warning(f'Queue for topic {topic} full but worker for topic has already signaled '
                                        f'stop. Skipping.')
-                        consumer.pause(topic_to_partitions[topic])
-                        logger.debug(f'Pausing topic {topic} (loc 3)')
-                        paused_topics.add(topic)
-                        continue
-                    if retries < 6:
+                        if topic not in paused_topics:
+                            consumer.pause(topic_to_partitions[topic])
+                            logger.debug(f'Pausing topic {topic} (loc 3)')
+                            paused_topics.add(topic)
+                        break
+                    if retries < 20:
                         retries += 1
-                        logger.warning(f'Retry {retries}. Current apx queue size for topic {topic} '
-                                       f'is {queues[topic].qsize()}')
-                        time.sleep(4)
+                        if retries > 1:
+                            logger.warning(f'Retry {retries}. Current apx queue size for topic {topic} '
+                                           f'is {queues[topic].qsize()}')
+                        time.sleep(2)
                     else:
                         logger.error(f'Persistent queue full attempting to enqueue message for topic {topic}, queue '
                                      f'apx size {queues[topic].qsize()}')
