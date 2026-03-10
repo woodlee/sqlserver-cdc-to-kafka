@@ -72,7 +72,7 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                                        opts.progress_tracking_namespace, proc_id)
     try:
         with ctds.connect(opts.target_db_server, user=opts.target_db_user, password=opts.target_db_password,
-                          database=opts.target_db_database, timeout=15, login_timeout=15, autocommit=True) as db_conn:
+                          database=opts.target_db_database, timeout=30, login_timeout=30, autocommit=True) as db_conn:
             # Create a modified opts object for this specific topic/table
             worker_opts = argparse.Namespace(**vars(opts))
             worker_opts.replay_topic = config.replay_topic
