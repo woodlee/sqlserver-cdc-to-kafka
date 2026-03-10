@@ -126,18 +126,21 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                     logger.info(f"Worker {config.replay_topic}: received EOF sentinel (topic has been fully consumed). "
                                f"Will flush and stop.")
 
-                retries: int = 0  # retries because schema registry calls very occasionally fail
-                while True:
-                    try:
-                        msg_key = avro_deserializer(raw_key, SerializationContext(topic, MessageField.KEY))
-                        assert isinstance(msg_key, dict)
-                        break
-                    except Exception as e:
-                        if retries >= 3:
-                            raise e
-                        logger.warning('Avro key deserialization failed. Retrying. Exception was: %s', str(e))
-                        retries += 1
-                        time.sleep(1)
+                if raw_key is not None:
+                    retries = 0  # retries because schema registry calls very occasionally fail
+                    while True:
+                        try:
+                            msg_key = avro_deserializer(raw_key, SerializationContext(topic, MessageField.KEY))
+                            assert isinstance(msg_key, dict)
+                            break
+                        except Exception as e:
+                            if retries >= 3:
+                                raise e
+                            logger.warning('Avro key deserialization failed. Retrying. Exception was: %s', str(e))
+                            retries += 1
+                            time.sleep(1)
+                else:
+                    msg_key = None
 
                 if raw_val is not None:
                     retries = 0  # retries because schema registry calls very occasionally fail
