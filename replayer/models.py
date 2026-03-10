@@ -6,7 +6,7 @@ class OrderedOperation(NamedTuple):
     original_topic: str
     cdc_operation: str
     key_val: Tuple[Any, ...]
-    row_values: Optional[List[Any]]
+    row_values: List[Any]
     offset: int
     timestamp: datetime
     updated_fields: Optional[List[str]] = None  # For PostUpdate: which fields actually changed

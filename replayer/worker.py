@@ -12,12 +12,12 @@ from multiprocessing.sharedctypes import Synchronized
 from multiprocessing.synchronize import Event as EventClass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-import _tds  # type: ignore[import-not-found]
-import ctds  # type: ignore[import-untyped]
+import _tds
+import ctds
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroDeserializer
 from confluent_kafka.serialization import MessageField, SerializationContext
-from faster_fifo import Queue  # type: ignore[import-not-found]
+from faster_fifo import Queue
 
 from .backfill_progress import BackfillProgressTracker
 from .logging_config import get_logger
@@ -30,12 +30,9 @@ logger = get_logger(__name__)
 
 
 def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: EventClass, queue: Queue,
-                  proc_id: str, cutoff_lsn: str = None,
-                  processed_counter: Optional[Synchronized[int]] = None,
-                  start_offsets_by_partition: Optional[Dict[int, int]] = None,
-                  tables_complete_counter: Optional[Synchronized[int]] = None,
-                  error_event: Optional[EventClass] = None,
-                  error_queue: Optional[mp.Queue] = None) -> None:
+                  proc_id: str, start_offsets_by_partition: Dict[int, int], processed_counter: Synchronized[int],
+                  cutoff_lsn: Optional[str] = None, tables_complete_counter: Optional[Synchronized[int]] = None,
+                  error_event: Optional[EventClass] = None, error_queue: Optional[mp.Queue] = None) -> None:
     """Worker process that replays a single topic to a single table.
 
     If cutoff_lsn is provided (backfill mode), the worker stops when it sees a message
@@ -129,29 +126,25 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                     logger.info(f"Worker {config.replay_topic}: received EOF sentinel (topic has been fully consumed). "
                                f"Will flush and stop.")
 
-                # Deserialize Avro messages in parallel workers
-                msg_key: Optional[Dict[str, Any]] = None
-                msg_val: Optional[Dict[str, Any]] = None
+                retries: int = 0  # retries because schema registry calls very occasionally fail
+                while True:
+                    try:
+                        msg_key = avro_deserializer(raw_key, SerializationContext(topic, MessageField.KEY))
+                        assert isinstance(msg_key, dict)
+                        break
+                    except Exception as e:
+                        if retries >= 3:
+                            raise e
+                        logger.warning('Avro key deserialization failed. Retrying. Exception was: %s', str(e))
+                        retries += 1
+                        time.sleep(1)
 
-                if raw_key is not None:
-                    retries: int = 0  # retries because schema registry calls very occasionally fail
-                    while True:
-                        try:
-                            # noinspection PyNoneFunctionAssignment
-                            msg_key = avro_deserializer(raw_key, SerializationContext(topic, MessageField.KEY))  # type: ignore[func-returns-value]
-                            break
-                        except Exception as e:
-                            if retries >= 3:
-                                raise e
-                            logger.warning('Avro key deserialization failed. Retrying. Exception was: %s', str(e))
-                            retries += 1
-                            time.sleep(1)
                 if raw_val is not None:
-                    retries: int = 0  # retries because schema registry calls very occasionally fail
+                    retries = 0  # retries because schema registry calls very occasionally fail
                     while True:
                         try:
-                            # noinspection PyNoneFunctionAssignment
-                            msg_val = avro_deserializer(raw_val, SerializationContext(topic, MessageField.VALUE))  # type: ignore[func-returns-value]
+                            msg_val = avro_deserializer(raw_val, SerializationContext(topic, MessageField.VALUE))
+                            assert isinstance(msg_val, dict)
                             break
                         except Exception as e:
                             if retries >= 3:
@@ -159,6 +152,8 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                             logger.warning('Avro value deserialization failed. Retrying. Exception was: %s', str(e))
                             retries += 1
                             time.sleep(1)
+                else:
+                    msg_val = None
 
                 # Check cutoff LSN in backfill mode
                 reached_cutoff = False

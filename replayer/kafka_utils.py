@@ -52,7 +52,7 @@ def get_latest_lsn_from_all_changes_topic(opts: argparse.Namespace) -> Tuple[str
     try:
         # Get topic metadata
         topics_meta: Dict[str, TopicMetadata] | None = consumer.list_topics(
-            topic=opts.all_changes_topic).topics  # type: ignore[call-arg]
+            topic=opts.all_changes_topic).topics
         if topics_meta is None:
             raise Exception(f'No metadata found for topic {opts.all_changes_topic}')
 
@@ -73,8 +73,7 @@ def get_latest_lsn_from_all_changes_topic(opts: argparse.Namespace) -> Tuple[str
                 continue
 
             # Seek to the last message
-            # noinspection PyClassVar
-            tp.offset = high - 2
+            tp = TopicPartition(opts.all_changes_topic, partition_id, high - 2)
             consumer.assign([tp])
 
             msg = consumer.poll(timeout=10.0)
@@ -91,15 +90,18 @@ def get_latest_lsn_from_all_changes_topic(opts: argparse.Namespace) -> Tuple[str
             if raw_val is None:
                 continue
 
-            # noinspection PyNoneFunctionAssignment
             msg_val = avro_deserializer(raw_val, SerializationContext(opts.all_changes_topic, MessageField.VALUE))
             if msg_val is None:
                 continue
+            assert isinstance(msg_val, dict)
+
+            offset = msg.offset()
+            assert isinstance(offset, int)
 
             msg_lsn = msg_val['__log_lsn']
             if msg_lsn > latest_lsn:
                 latest_lsn = msg_lsn
-                latest_offset = msg.offset()  # type: ignore[assignment]
+                latest_offset = offset
 
         if latest_offset < 0:
             raise Exception(f'Could not find any messages in topic {opts.all_changes_topic}')

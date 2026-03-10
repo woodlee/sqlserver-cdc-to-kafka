@@ -2,12 +2,13 @@ import argparse
 import logging
 import queue as stdlib_queue
 import time
+from datetime import datetime
 from multiprocessing.synchronize import Event as EventClass
 from typing import Any, Dict, List, Set
 
 from confluent_kafka import Consumer, KafkaError, TopicPartition, OFFSET_BEGINNING
 from confluent_kafka.admin import TopicMetadata
-from faster_fifo import Queue  # type: ignore[import-not-found]
+from faster_fifo import Queue
 
 from .logging_config import get_logger
 from .progress import ProgressTracker
@@ -21,7 +22,7 @@ logger = get_logger(__name__)
 def flush_ordered_operations(db_conn: Any, progress_tracker: ProgressTracker,
                              ops: List[OrderedOperation],
                              table_metadata: Dict[str, FollowModeTableMetadata],
-                             last_offset: int, last_timestamp: Any) -> None:
+                             last_offset: int, last_timestamp: datetime) -> None:
     """Flush ordered operations and progress update atomically in a single transaction.
 
     This ensures exactly-once semantics: data operations and progress tracking are
@@ -93,7 +94,7 @@ def backfill_consumer_process(replay_configs: List[ReplayConfig], opts: argparse
                 p.source_topic_partition: p.last_handled_message_offset + 1 for p in progress
             }
             topics_meta: Dict[str, TopicMetadata] | None = consumer.list_topics(
-                topic=topic).topics  # type: ignore[call-arg]
+                topic=topic).topics
             if topics_meta is None:
                 raise Exception(f'No partitions found for topic {topic}')
             else:
@@ -156,13 +157,13 @@ def backfill_consumer_process(replay_configs: List[ReplayConfig], opts: argparse
 
             err = msg.error()
             if err:
-                # noinspection PyProtectedMember
                 if err.code() == KafkaError._PARTITION_EOF:
                     # Track which partitions have reached EOF
                     eof_topic = msg.topic()
                     eof_partition = msg.partition()
+                    assert isinstance(eof_partition, int)
                     if eof_topic and eof_topic not in topics_at_eof:
-                        eof_partitions[eof_topic].add(eof_partition)  # type: ignore[arg-type]
+                        eof_partitions[eof_topic].add(eof_partition)
                         # Check if all partitions for this topic have reached EOF
                         if eof_partitions[eof_topic] == set(high_watermarks[eof_topic].keys()):
                             logger.info(f'Consumer: all partitions for topic {eof_topic} have reached EOF, '
@@ -175,9 +176,9 @@ def backfill_consumer_process(replay_configs: List[ReplayConfig], opts: argparse
                 else:
                     raise Exception(msg.error())
 
-            topic = msg.topic()
-            if topic is None:
-                raise Exception('Unexpected None value for message topic()')
+            raw_topic = msg.topic()
+            assert isinstance(raw_topic, str)
+            topic = raw_topic
 
             # Check if this topic's worker has stopped (hit cutoff) - skip and pause if so
             if topic in stop_events and stop_events[topic].is_set():

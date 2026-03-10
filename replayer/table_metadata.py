@@ -2,7 +2,7 @@ import itertools
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-import ctds  # type: ignore[import-untyped]
+import ctds
 
 from .logging_config import get_logger
 from .models import OrderedOperation, ReplayConfig
@@ -340,8 +340,8 @@ WHERE {where_clause}
                 vals.append(msg_val[fl])
         return vals
 
-    def prepare_operation(self, msg_key: Optional[Dict[str, Any]], msg_val: Optional[Dict[str, Any]],
-                          offset: int, timestamp: datetime) -> Optional[OrderedOperation]:
+    def prepare_operation(self, msg_key: Dict[Any, Any], msg_val: Dict[Any, Any], offset: int,
+                          timestamp: datetime) -> Optional[OrderedOperation]:
         key_val = tuple((msg_key[x] for x in self.primary_key_field_names))
         cdc_operation = msg_val['__operation']
 
@@ -351,7 +351,7 @@ WHERE {where_clause}
                 original_topic=self.config.replay_topic,
                 cdc_operation=cdc_operation,
                 key_val=key_val,
-                row_values=None,
+                row_values=[],
                 offset=offset,
                 timestamp=timestamp
             )

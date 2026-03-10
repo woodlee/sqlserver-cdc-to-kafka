@@ -1,5 +1,3 @@
-"""Progress tracking for backfill mode with ETA calculation."""
-
 from __future__ import annotations
 
 import time

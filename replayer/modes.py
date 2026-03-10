@@ -8,7 +8,7 @@ import sys
 import time
 from datetime import datetime, timezone, timedelta
 from multiprocessing.synchronize import Event as EventClass
-from typing import Any, Dict, List, Optional
+from typing import Dict, List
 
 import pyodbc
 from confluent_kafka import Consumer, KafkaError, TopicPartition
@@ -16,7 +16,7 @@ from confluent_kafka.admin import TopicMetadata
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroDeserializer
 from confluent_kafka.serialization import MessageField, SerializationContext
-from faster_fifo import Queue  # type: ignore[import-not-found]
+from faster_fifo import Queue
 
 from .backfill_progress import BackfillProgressTracker, calculate_total_messages_to_process
 from .consumer import flush_ordered_operations, backfill_consumer_process
@@ -48,7 +48,7 @@ def _get_high_watermarks_for_topics(
         for config in replay_configs:
             topic = config.replay_topic
             topics_meta: Dict[str, TopicMetadata] | None = consumer.list_topics(
-                topic=topic).topics  # type: ignore[call-arg]
+                topic=topic).topics
             if topics_meta is None:
                 raise Exception(f'No partitions found for topic {topic}')
 
@@ -141,9 +141,8 @@ def run_backfill_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfi
                 target=replay_worker,
                 name=f'replayer-{config.replay_topic}',
                 args=(config, opts, stop_events[config.replay_topic], queues[config.replay_topic],
-                      worker_proc_id, cutoff_lsn, shared_processed_counter,
-                      start_offsets_by_topic.get(config.replay_topic, {}),
-                      shared_tables_complete_counter, error_event, error_queue)
+                      worker_proc_id, start_offsets_by_topic.get(config.replay_topic, {}), shared_processed_counter,
+                      cutoff_lsn, shared_tables_complete_counter, error_event, error_queue)
             )
             worker.start()
             workers.append(worker)
@@ -285,7 +284,7 @@ def run_follow_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfig]
     avro_deserializer = AvroDeserializer(schema_registry_client)
 
     topics_meta: Dict[str, TopicMetadata] | None = consumer.list_topics(
-        topic=opts.all_changes_topic).topics  # type: ignore[call-arg]
+        topic=opts.all_changes_topic).topics
     if topics_meta is None:
         raise Exception(f'No metadata found for topic {opts.all_changes_topic}')
 
@@ -302,7 +301,7 @@ def run_follow_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfig]
     ordered_ops: List[OrderedOperation] = []
     msg_ctr = 0
     last_all_changes_offset = start_offset - 1
-    last_all_changes_timestamp = 0
+    last_all_changes_timestamp: datetime = datetime(1900, 1, 1)
     last_commit_time = datetime.now()
     last_heartbeat_time = datetime.now()
 
@@ -329,13 +328,17 @@ def run_follow_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfig]
 
             err = msg.error()
             if err:
-                # noinspection PyProtectedMember
                 if err.code() == KafkaError._PARTITION_EOF:
                     continue
                 else:
                     raise Exception(msg.error())
 
             msg_ctr += 1
+
+            raw_offset = msg.offset()
+            if raw_offset is None:
+                raise Exception(msg.error())
+            offset: int = raw_offset
 
             # Get the original topic from message header
             headers = msg.headers() or []
@@ -345,39 +348,45 @@ def run_follow_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfig]
                     original_topic = header_val.decode('utf-8') if isinstance(header_val, bytes) else header_val
                     break
 
+            msg_timestamp = datetime.fromtimestamp(msg.timestamp()[1] / 1000, timezone.utc).replace(tzinfo=None)
+
             if original_topic is None:
-                logger.error(f'Message at offset {msg.offset()} missing cdc_to_kafka_original_topic header, skipping')
-                last_all_changes_offset = msg.offset()  # type: ignore[assignment]
-                last_all_changes_timestamp = msg.timestamp()[1]  # type: ignore[assignment]
+                logger.error(f'Message at offset {offset} missing cdc_to_kafka_original_topic header, skipping')
+                last_all_changes_offset = offset
+                last_all_changes_timestamp = msg_timestamp
                 continue
 
             if original_topic not in table_metadata:
                 # This table isn't in our replay config, skip it
-                last_all_changes_offset = msg.offset()  # type: ignore[assignment]
-                last_all_changes_timestamp = msg.timestamp()[1]  # type: ignore[assignment]
+                last_all_changes_offset = offset
+                last_all_changes_timestamp = msg_timestamp
                 continue
 
             # Deserialize the message
             raw_key = msg.key()
             raw_val = msg.value()
 
-            msg_key: Optional[Dict[str, Any]] = None
-            msg_val: Optional[Dict[str, Any]] = None
-            if raw_key is not None:
-                # noinspection PyNoneFunctionAssignment
-                msg_key = avro_deserializer(raw_key, SerializationContext(original_topic, MessageField.KEY))  # type: ignore[func-returns-value]
-            if raw_val is not None:
-                # noinspection PyNoneFunctionAssignment
-                msg_val = avro_deserializer(raw_val, SerializationContext(original_topic, MessageField.VALUE))  # type: ignore[func-returns-value]
+            if raw_key is None:
+                msg_key = None
+            else:
+                msg_key = avro_deserializer(raw_key, SerializationContext(original_topic, MessageField.KEY))
+
+            if raw_val is None:
+                msg_val = None
+            else:
+                msg_val = avro_deserializer(raw_val, SerializationContext(original_topic, MessageField.VALUE))
 
             # Prepare the operation (without executing)
             metadata = table_metadata[original_topic]
-            msg_timestamp = datetime.fromtimestamp(msg.timestamp()[1] / 1000, timezone.utc).replace(tzinfo=None)
-            op = metadata.prepare_operation(msg_key, msg_val, msg.offset(), msg_timestamp)
+
+            assert isinstance(msg_key, dict)
+            assert isinstance(msg_val, dict)
+
+            op = metadata.prepare_operation(msg_key, msg_val, offset, msg_timestamp)
             if op is not None:
                 ordered_ops.append(op)
 
-            last_all_changes_offset = msg.offset()  # type: ignore[assignment]
+            last_all_changes_offset = offset
             last_all_changes_timestamp = msg_timestamp
 
             if msg_ctr % 5_000 == 0:

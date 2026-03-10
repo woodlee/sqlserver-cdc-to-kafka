@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Iterable
 
 import pyodbc
 
@@ -25,6 +25,7 @@ class ProgressTracker(object):
     def upsert_progress_record(self, cursor: Any, source_topic_name: str, source_topic_partition: int,
                                target_table_schema: str, target_table_name: str, offset: int, timestamp: datetime,
                                use_object_id: bool = True) -> None:
+        params: Iterable[Any]
         if use_object_id:
             # Parameters 3 and 4 (0-indexed: target_table_schema and target_table_name) used in OBJECT_ID
             object_id_expr = "OBJECT_ID(? + '.' + ?)"
