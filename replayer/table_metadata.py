@@ -149,7 +149,7 @@ ORDER BY [ORDINAL_POSITION]
             # Yep, this looks weird--it's a hack to prevent SQL Server from copying over the IDENTITY property
             # of any columns that have it whenever it creates the temp table. https://stackoverflow.com/a/57509258
             cursor.execute(f'SELECT TOP 0 * INTO {self.merge_temp_table_name} FROM {self.fq_target_table_name} '
-                          f'UNION ALL SELECT * FROM {self.fq_target_table_name} WHERE 1 <> 1;')
+                           f'UNION ALL SELECT * FROM {self.fq_target_table_name} WHERE 1 <> 1;')
             for c in itertools.chain(self.cols_to_not_sync, self.computed_cols):
                 cursor.execute(f'ALTER TABLE {self.merge_temp_table_name} DROP COLUMN [{c}];')
 
@@ -178,30 +178,37 @@ TRUNCATE TABLE {self.delete_temp_table_name};
                 if self.identity_col_name else ''
             merge_match_predicates = ' AND '.join([f'tgt.[{c}] = src.[{c}]' for c in self.primary_key_field_names])
 
-            # This is a real edge case, but if all the table cols are in the PK, then SQL always models an
-            # update as an insert+delete in CDC data, so the WHEN MATCHED THEN UPDATE SET would wind up empty
-            # which is syntactically invalid:
             if set(self.field_names) == set(self.primary_key_field_names):
+                # If all the table cols are in the PK, only an insert is needed:
                 self.merge_stmt = f'''
 {set_identity_insert}
-MERGE {self.fq_target_table_name} WITH (TABLOCK) AS tgt
-USING {self.merge_temp_table_name} AS src
-    ON ({merge_match_predicates})
-WHEN NOT MATCHED THEN
-    INSERT ([{'], ['.join(self.field_names)}]) VALUES (src.[{'], src.['.join(self.field_names)}]);
+
+INSERT INTO {self.fq_target_table_name} WITH (TABLOCK) ([{'], ['.join(self.field_names)}])
+SELECT src.[{'], src.['.join(self.field_names)}]
+FROM {self.merge_temp_table_name} AS src WITH (TABLOCK)
+WHERE NOT EXISTS (
+  SELECT 1 FROM {self.fq_target_table_name} AS tgt
+  WHERE {merge_match_predicates}
+);
 
 TRUNCATE TABLE {self.merge_temp_table_name};
                 '''
             else:
                 self.merge_stmt = f'''
 {set_identity_insert}
-MERGE {self.fq_target_table_name} WITH (TABLOCK) AS tgt
-USING {self.merge_temp_table_name} AS src
-    ON ({merge_match_predicates})
-WHEN MATCHED THEN
-    UPDATE SET {", ".join([f'[{x}] = src.[{x}]' for x in self.field_names if x not in self.primary_key_field_names and x != self.identity_col_name])}
-WHEN NOT MATCHED THEN
-    INSERT ([{'], ['.join(self.field_names)}]) VALUES (src.[{'], src.['.join(self.field_names)}]);
+
+UPDATE tgt
+SET {", ".join([f'[{x}] = src.[{x}]' for x in self.field_names if x not in self.primary_key_field_names and x != self.identity_col_name])}
+FROM {self.fq_target_table_name} AS tgt WITH (TABLOCK)
+INNER JOIN {self.merge_temp_table_name} AS src WITH (TABLOCK) ON ({merge_match_predicates});
+
+INSERT INTO {self.fq_target_table_name} WITH (TABLOCK) ([{'], ['.join(self.field_names)}])
+SELECT src.[{'], src.['.join(self.field_names)}]
+FROM {self.merge_temp_table_name} AS src WITH (TABLOCK)
+WHERE NOT EXISTS (
+  SELECT 1 FROM {self.fq_target_table_name} AS tgt
+  WHERE {merge_match_predicates}
+);
 
 TRUNCATE TABLE {self.merge_temp_table_name};
                 '''

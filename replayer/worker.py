@@ -99,6 +99,9 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
             logger.debug(f"Worker for '{config.replay_topic}': Listening for consumed messages.")
             last_worker_heartbeat = proc_start_time
 
+            log_ctr, log_tombstone_cnt, log_delete_cnt, log_upsert_cnt = 0, 0, 0, 0
+            logged_a_delete, logged_a_upsert = False, False
+
             while True:
                 current = time.perf_counter()
                 if current - last_worker_heartbeat > 10.0:
@@ -176,87 +179,97 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                     logger.debug('Entering write loop. Reached cutoff: %s Reached EOF: %s Queued deletes: %s Queued '
                                  'upserts: %s Time since last commit: %s', reached_cutoff, reached_eof,
                                  len(queued_deletes), len(queued_upserts), (datetime.now() - last_commit_time).seconds)
-                    with db_conn.cursor() as cursor:
-                        if queued_deletes:
+
+                    if queued_deletes:
+                        start_time = time.perf_counter()
+                        deletes = list(queued_deletes)
+                        logger.info(f'Deleted keys: {pprint.pformat(deletes)} --- count: {len(deletes)}')
+                        db_conn.bulk_insert(metadata.delete_temp_table_name, deletes, tablock=True)
+                        sql_time_acc += time.perf_counter() - start_time
+                        temp_table_elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+                        start_time = time.perf_counter()
+                        with db_conn.cursor() as cursor:
+                            cursor.execute(metadata.delete_stmt)
+                        if not logged_a_delete:
+                            logger.info(metadata.delete_stmt)
+                            logger.info(pprint.pformat(deletes[:min(10, len(deletes))]))
+                            logged_a_delete = True
+                        sql_time_acc += time.perf_counter() - start_time
+                        elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+                        logger.info('Deleted %s items. Temp table insert: %s ms, delete stmt: %s ms',
+                                    len(queued_deletes), temp_table_elapsed_ms, elapsed_ms)
+
+                    if queued_upserts:
+                        inserts: List[Any] = []
+                        merges: List[Any] = []
+                        for _, (op, val) in queued_upserts.items():
+                            if opts.always_merge:
+                                merges.append(val)
+                            else:
+                                # CTDS unfortunately completely ignores values for target-table IDENTITY cols when doing
+                                # a bulk_insert, so in that case we have to fall back to the slower MERGE mechanism:
+                                if (not metadata.identity_col_name) and op == 'Insert':  # in ('Snapshot', 'Insert'): -- Snapshots can hit PK collisions! :(
+                                    inserts.append(val)
+                                else:
+                                    merges.append(val)
+
+                        # Inserts CAN be treated as merges, and it's probably more efficient to do so if there
+                        # are relatively few of them, to cut down on DB round-trips:
+                        if inserts and merges and len(inserts) < 100 or \
+                                len(inserts) / (len(inserts) + len(merges)) < 0.1:
+                            logger.debug('Rolling %s inserts into %s merges', len(inserts), len(merges))
+                            merges += inserts
+                            inserts = []
+
+                        if inserts:
                             start_time = time.perf_counter()
-                            db_conn.bulk_insert(metadata.delete_temp_table_name, list(queued_deletes), tablock=True)
+                            try:
+                                db_conn.bulk_insert(metadata.fq_target_table_name, inserts, tablock=True)
+                                sql_time_acc += time.perf_counter() - start_time
+                                elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+                                logger.info('Inserted directly to target table: %s items in %s ms',
+                                            len(inserts), elapsed_ms)
+                            except _tds.IntegrityError as e:
+                                # Likely a PK constraint violation due to potential event replay after a process
+                                # restart; retry batch as merges
+                                logger.warning(f'Integrity error while directly inserting into '
+                                               f'{config.replay_topic}: {e}. Will retry operation as a MERGE...')
+                                merges = merges + inserts
+
+                        if merges:
+                            start_time = time.perf_counter()
+                            logger.info(f'Merged keys: {pprint.pformat(queued_upserts.keys())} --- count: {len(queued_upserts.keys())}')
+                            db_conn.bulk_insert(metadata.merge_temp_table_name, merges, tablock=True)
                             sql_time_acc += time.perf_counter() - start_time
                             temp_table_elapsed_ms = int((time.perf_counter() - start_time) * 1000)
                             start_time = time.perf_counter()
-                            cursor.execute(metadata.delete_stmt)
+                            with db_conn.cursor() as cursor:
+                                cursor.execute(metadata.merge_stmt)
+                            if not logged_a_upsert:
+                                logger.info(metadata.merge_stmt)
+                                logger.info(pprint.pformat(merges[:min(10, len(merges))]))
+                                logged_a_upsert = True
                             sql_time_acc += time.perf_counter() - start_time
                             elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-                            logger.info('Deleted %s items. Temp table insert: %s ms, delete stmt: %s ms',
-                                        len(queued_deletes), temp_table_elapsed_ms, elapsed_ms)
+                            logger.info('Merged %s items. Temp table insert: %s ms, merge stmt: %s ms',
+                                        len(merges), temp_table_elapsed_ms, elapsed_ms)
 
-                        if queued_upserts:
-                            inserts: List[Any] = []
-                            merges: List[Any] = []
-                            for _, (op, val) in queued_upserts.items():
-                                if opts.always_merge:
-                                    merges.append(val)
-                                else:
-                                    # CTDS unfortunately completely ignores values for target-table IDENTITY cols when doing
-                                    # a bulk_insert, so in that case we have to fall back to the slower MERGE mechanism:
-                                    if (not metadata.identity_col_name) and op == 'Insert':  # in ('Snapshot', 'Insert'): -- Snapshots can hit PK collisions! :(
-                                        inserts.append(val)
-                                    else:
-                                        merges.append(val)
+                    if queued_upserts or queued_deletes:
+                        queued_upserts.clear()
+                        queued_deletes.clear()
+                        progress_tracker.commit_progress(
+                            worker_opts.target_db_table_schema, worker_opts.target_db_table_name,
+                            worker_opts.replay_topic, last_consume_by_partition)
+                        db_conn.commit()
+                        last_commit_time = datetime.now()
 
-                            # Inserts CAN be treated as merges, and it's probably more efficient to do so if there
-                            # are relatively few of them, to cut down on DB round-trips:
-                            if inserts and merges and len(inserts) < 100 or \
-                                    len(inserts) / (len(inserts) + len(merges)) < 0.1:
-                                logger.debug('Rolling %s inserts into %s merges', len(inserts), len(merges))
-                                merges += inserts
-                                inserts = []
-
-                            if inserts:
-                                start_time = time.perf_counter()
-                                try:
-                                    db_conn.bulk_insert(metadata.fq_target_table_name, inserts, tablock=True)
-                                    sql_time_acc += time.perf_counter() - start_time
-                                    elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-                                    logger.info('Inserted directly to target table: %s items in %s ms',
-                                                len(inserts), elapsed_ms)
-                                except _tds.IntegrityError as e:
-                                    # Likely a PK constraint violation due to potential event replay after a process
-                                    # restart; retry batch as merges
-                                    logger.warning(f'Integrity error while directly inserting into '
-                                                   f'{config.replay_topic}: {e}. Will retry operation as a MERGE...')
-                                    merges = merges + inserts
-
-                            if merges:
-                                start_time = time.perf_counter()
-                                try:
-                                    db_conn.bulk_insert(metadata.merge_temp_table_name, merges, tablock=True)
-                                except _tds.DatabaseError as e:
-                                    pprint.pprint(merges)
-                                    raise e
-                                sql_time_acc += time.perf_counter() - start_time
-                                temp_table_elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-                                start_time = time.perf_counter()
-                                cursor.execute(metadata.merge_stmt)
-                                sql_time_acc += time.perf_counter() - start_time
-                                elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-                                logger.info('Merged %s items. Temp table insert: %s ms, merge stmt: %s ms',
-                                            len(merges), temp_table_elapsed_ms, elapsed_ms)
-
-                        if queued_upserts or queued_deletes:
-                            queued_upserts.clear()
-                            queued_deletes.clear()
-                            progress_tracker.commit_progress(
-                                worker_opts.target_db_table_schema, worker_opts.target_db_table_name,
-                                worker_opts.replay_topic, last_consume_by_partition)
-                            last_commit_time = datetime.now()
-
-                        for partition, prev_offset in start_offsets_by_partition.items():
-                            curr_offset = last_consume_by_partition.get(partition)
-                            if curr_offset is not None:
-                                offset_delta = curr_offset[0] - prev_offset
-                                BackfillProgressTracker.increment_processed(processed_counter, offset_delta)
-                                start_offsets_by_partition[partition] = curr_offset[0]
-                        logger.debug('Incremented progress counters.')
+                    for partition, prev_offset in start_offsets_by_partition.items():
+                        curr_offset = last_consume_by_partition.get(partition)
+                        if curr_offset is not None:
+                            offset_delta = curr_offset[0] - prev_offset
+                            BackfillProgressTracker.increment_processed(processed_counter, offset_delta)
+                            start_offsets_by_partition[partition] = curr_offset[0]
+                    logger.debug('Incremented progress counters.')
 
                     if reached_cutoff or reached_eof:
                         logger.info(f"Worker {config.replay_topic}: flushed remaining work, exiting.")
@@ -272,7 +285,8 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
 
                 if msg_val is None or msg_val['__operation'] == 'Delete':
                     queued_deletes.add(key_val)
-                    queued_upserts.pop(key_val, None)
+                    if queued_upserts.pop(key_val, None):
+                        logger.info(f'Removed key {key_val} from pending upsert batch due to msg at offset {msg_offset}')
                     delete_cnt += 1
                 else:
                     vals = metadata.convert_msg_to_row_values(msg_val, for_bcp=True)
@@ -290,6 +304,19 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                                  config.replay_topic, len(queued_deletes), len(queued_upserts),
                                  queue_get_wait, queue.qsize())
                     queue_get_wait = 0
+
+                log_ctr += 1
+                if msg_val is None:
+                    log_tombstone_cnt += 1
+                elif msg_val['__operation'] == 'Delete':
+                    log_delete_cnt += 1
+                else:
+                    log_upsert_cnt += 1
+
+                if log_ctr >= 1000:
+                    logger.info(
+                        f'{log_upsert_cnt} upserts and {log_delete_cnt} deletes and {log_tombstone_cnt} tombstones since last log; now at offset {msg_offset}')
+                    log_ctr, log_tombstone_cnt, log_delete_cnt, log_upsert_cnt = 0, 0, 0, 0
 
                 last_consume_by_partition[msg_partition] = (msg_offset, msg_timestamp)
     except KeyboardInterrupt:
