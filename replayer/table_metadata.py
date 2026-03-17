@@ -79,6 +79,7 @@ WHERE [TABLE_SCHEMA] = :0
 ORDER BY [ORDINAL_POSITION]
             ''', (config.target_db_table_schema, config.target_db_table_name))
 
+            col_specs = {}
             for col_name, col_type, col_precision, col_is_nullable, col_default in cursor.fetchall():
                 if col_name.lower() in self.cols_to_not_sync or col_name.lower() in self.computed_cols:
                     continue
@@ -90,8 +91,12 @@ ORDER BY [ORDINAL_POSITION]
                 if col_type.lower() in ('nchar', 'nvarchar', 'ntext'):
                     self.nvarchar_field_names.add(col_name)
                 self.column_defaults[col_name] = parse_sql_default(col_default)
-                if col_name in self.primary_key_field_names:
-                    self.pk_col_specs.append((col_name, col_type, col_precision, col_is_nullable))
+                col_specs[col_name.lower()] = (col_name, col_type, col_precision, col_is_nullable)
+
+            for pk_col_name in self.primary_key_field_names:
+                # We need this to be separate from the `for` above because the ordering of the cols within the PK
+                # may differ from those columns' ordering in the table itself:
+                self.pk_col_specs.append(col_specs[pk_col_name.lower()])
 
             # Check for identity column
             cursor.execute('SELECT TOP 1 [name] FROM sys.columns WHERE object_id = OBJECT_ID(:0) AND is_identity = 1',
