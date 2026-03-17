@@ -100,7 +100,7 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
             last_worker_heartbeat = proc_start_time
 
             log_ctr, log_tombstone_cnt, log_delete_cnt, log_upsert_cnt = 0, 0, 0, 0
-            logged_a_delete, logged_a_upsert = False, False
+            logged_a_delete, logged_an_upsert = False, False
 
             while True:
                 current = time.perf_counter()
@@ -183,21 +183,21 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                     if queued_deletes:
                         start_time = time.perf_counter()
                         deletes = list(queued_deletes)
-                        logger.info(f'Deleted keys: {pprint.pformat(deletes)} --- count: {len(deletes)}')
                         db_conn.bulk_insert(metadata.delete_temp_table_name, deletes, tablock=True)
                         sql_time_acc += time.perf_counter() - start_time
                         temp_table_elapsed_ms = int((time.perf_counter() - start_time) * 1000)
                         start_time = time.perf_counter()
                         with db_conn.cursor() as cursor:
                             cursor.execute(metadata.delete_stmt)
-                        if not logged_a_delete:
-                            logger.info(metadata.delete_stmt)
-                            logger.info(pprint.pformat(deletes[:min(10, len(deletes))]))
-                            logged_a_delete = True
                         sql_time_acc += time.perf_counter() - start_time
                         elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-                        logger.info('Deleted %s items. Temp table insert: %s ms, delete stmt: %s ms',
-                                    len(queued_deletes), temp_table_elapsed_ms, elapsed_ms)
+                        if not logged_a_delete:
+                            logger.debug(f'First delete statement text: {metadata.delete_stmt}')
+                            logger.debug(f'Up to 10 first items passed to delete statement: '
+                                         f'{pprint.pformat(deletes[:min(10, len(deletes))])}')
+                            logged_a_delete = True
+                        logger.debug('Deleted %s items. Temp table insert: %s ms, delete stmt: %s ms',
+                                     len(queued_deletes), temp_table_elapsed_ms, elapsed_ms)
 
                     if queued_upserts:
                         inserts: List[Any] = []
@@ -238,17 +238,17 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
 
                         if merges:
                             start_time = time.perf_counter()
-                            logger.info(f'Merged keys: {pprint.pformat(queued_upserts.keys())} --- count: {len(queued_upserts.keys())}')
                             db_conn.bulk_insert(metadata.merge_temp_table_name, merges, tablock=True)
                             sql_time_acc += time.perf_counter() - start_time
                             temp_table_elapsed_ms = int((time.perf_counter() - start_time) * 1000)
                             start_time = time.perf_counter()
                             with db_conn.cursor() as cursor:
                                 cursor.execute(metadata.merge_stmt)
-                            if not logged_a_upsert:
-                                logger.info(metadata.merge_stmt)
-                                logger.info(pprint.pformat(merges[:min(10, len(merges))]))
-                                logged_a_upsert = True
+                            if not logged_an_upsert:
+                                logger.debug(f'First upsert statement(s) text: {metadata.merge_stmt}')
+                                logger.debug(f'Up to 10 first items passed to upsert statement(s): '
+                                             f'{pprint.pformat(merges[:min(10, len(merges))])}')
+                                logged_an_upsert = True
                             sql_time_acc += time.perf_counter() - start_time
                             elapsed_ms = int((time.perf_counter() - start_time) * 1000)
                             logger.info('Merged %s items. Temp table insert: %s ms, merge stmt: %s ms',
@@ -260,7 +260,6 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                         progress_tracker.commit_progress(
                             worker_opts.target_db_table_schema, worker_opts.target_db_table_name,
                             worker_opts.replay_topic, last_consume_by_partition)
-                        db_conn.commit()
                         last_commit_time = datetime.now()
 
                     for partition, prev_offset in start_offsets_by_partition.items():
@@ -286,7 +285,8 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                 if msg_val is None or msg_val['__operation'] == 'Delete':
                     queued_deletes.add(key_val)
                     if queued_upserts.pop(key_val, None):
-                        logger.info(f'Removed key {key_val} from pending upsert batch due to msg at offset {msg_offset}')
+                        logger.debug(f'Removed key {key_val} from pending upsert batch due to msg at '
+                                     f'offset {msg_offset}')
                     delete_cnt += 1
                 else:
                     vals = metadata.convert_msg_to_row_values(msg_val, for_bcp=True)
@@ -314,8 +314,8 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                     log_upsert_cnt += 1
 
                 if log_ctr >= 1000:
-                    logger.info(
-                        f'{log_upsert_cnt} upserts and {log_delete_cnt} deletes and {log_tombstone_cnt} tombstones since last log; now at offset {msg_offset}')
+                    logger.debug(f'Handled {log_upsert_cnt} upserts and {log_delete_cnt} deletes and '
+                                 f'{log_tombstone_cnt} tombstones since last log; now at offset {msg_offset}')
                     log_ctr, log_tombstone_cnt, log_delete_cnt, log_upsert_cnt = 0, 0, 0, 0
 
                 last_consume_by_partition[msg_partition] = (msg_offset, msg_timestamp)
