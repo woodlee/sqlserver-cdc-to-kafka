@@ -168,9 +168,9 @@ def backfill_consumer_process(replay_configs: List[ReplayConfig], opts: argparse
             return all(ev.is_set() for ev in stop_events.values())
 
         while not all_workers_stopped():
-            msg = consumer.poll(0.1)
+            messages = consumer.consume(num_messages=500, timeout=0.1)
 
-            if msg is None:
+            if not messages:
                 # Check if any workers have stopped and we need to pause their topics
                 for topic, event in stop_events.items():
                     if event.is_set() and topic not in paused_topics:
@@ -181,85 +181,86 @@ def backfill_consumer_process(replay_configs: List[ReplayConfig], opts: argparse
                         paused_topics.add(topic)
                 continue
 
-            msg_ctr += 1
+            for msg in messages:
+                msg_ctr += 1
 
-            err = msg.error()
-            if err:
-                if err.code() == KafkaError._PARTITION_EOF:
-                    # Track which partitions have reached EOF
-                    eof_topic = msg.topic()
-                    eof_partition = msg.partition()
-                    assert isinstance(eof_partition, int)
-                    if eof_topic and eof_topic not in topics_at_eof:
-                        eof_partitions[eof_topic].add(eof_partition)
-                        # Check if all partitions for this topic have reached EOF
-                        if eof_partitions[eof_topic] == set(high_watermarks[eof_topic].keys()):
-                            logger.info(f'Consumer: all partitions for topic {eof_topic} have reached EOF, '
-                                       f'sending EOF sentinel to worker')
-                            topics_at_eof.add(eof_topic)
-                            # Send EOF sentinel to the worker (None values signal EOF)
-                            if eof_topic in queues:
-                                queues[eof_topic].put((eof_topic, None, None, None, None, None))
-                    continue
-                else:
-                    raise Exception(msg.error())
-
-            raw_topic = msg.topic()
-            assert isinstance(raw_topic, str)
-            topic = raw_topic
-
-            # Check if this topic's worker has stopped (hit cutoff) - skip and pause if so
-            if topic in stop_events and stop_events[topic].is_set():
-                if topic not in paused_topics:
-                    logger.info(f'Consumer: worker for topic {topic} has stopped, pausing partition(s)')
-                    if topic in topic_to_partitions:
-                        consumer.pause(topic_to_partitions[topic])
-                        logger.debug(f'Pausing topic {topic} (loc 2)')
-                    paused_topics.add(topic)
-                continue
-
-            if topic in paused_topics:
-                continue
-
-            # Route message to the appropriate worker queue
-            if topic not in queues:
-                logger.warning(f'Received message for unexpected topic: {topic}')
-                continue
-
-            msg_ctr_by_topic[topic] += 1
-
-            if msg_ctr_by_topic[topic] % 5_000 == 0:
-                logger.debug(f'Topic {topic}: Reached %s, apx queue depth %s',
-                            format_coordinates(msg), queues[topic].qsize())
-
-            # Pass raw bytes to workers for deserialization
-            raw_key = msg.key()
-            raw_val = msg.value()
-
-            retries: int = 0
-            while True:
-                try:
-                    queues[topic].put_nowait((topic, msg.partition(), msg.offset(), msg.timestamp()[1], raw_key, raw_val))
-                    break
-                except stdlib_queue.Full:
-                    if topic in stop_events and stop_events[topic].is_set():
-                        logger.warning(f'Queue for topic {topic} full but worker for topic has already signaled '
-                                       f'stop. Skipping.')
-                        if topic not in paused_topics:
-                            consumer.pause(topic_to_partitions[topic])
-                            logger.debug(f'Pausing topic {topic} (loc 3)')
-                            paused_topics.add(topic)
-                        break
-                    if retries < 20:
-                        retries += 1
-                        if retries > 1:
-                            logger.warning(f'Retry {retries}. Current apx queue size for topic {topic} '
-                                           f'is {queues[topic].qsize()}')
-                        time.sleep(2)
+                err = msg.error()
+                if err:
+                    if err.code() == KafkaError._PARTITION_EOF:
+                        # Track which partitions have reached EOF
+                        eof_topic = msg.topic()
+                        eof_partition = msg.partition()
+                        assert isinstance(eof_partition, int)
+                        if eof_topic and eof_topic not in topics_at_eof:
+                            eof_partitions[eof_topic].add(eof_partition)
+                            # Check if all partitions for this topic have reached EOF
+                            if eof_partitions[eof_topic] == set(high_watermarks[eof_topic].keys()):
+                                logger.info(f'Consumer: all partitions for topic {eof_topic} have reached EOF, '
+                                           f'sending EOF sentinel to worker')
+                                topics_at_eof.add(eof_topic)
+                                # Send EOF sentinel to the worker (None values signal EOF)
+                                if eof_topic in queues:
+                                    queues[eof_topic].put((eof_topic, None, None, None, None, None))
+                        continue
                     else:
-                        logger.error(f'Persistent queue full attempting to enqueue message for topic {topic}, queue '
-                                     f'apx size {queues[topic].qsize()}')
-                        raise
+                        raise Exception(msg.error())
+
+                raw_topic = msg.topic()
+                assert isinstance(raw_topic, str)
+                topic = raw_topic
+
+                # Check if this topic's worker has stopped (hit cutoff) - skip and pause if so
+                if topic in stop_events and stop_events[topic].is_set():
+                    if topic not in paused_topics:
+                        logger.info(f'Consumer: worker for topic {topic} has stopped, pausing partition(s)')
+                        if topic in topic_to_partitions:
+                            consumer.pause(topic_to_partitions[topic])
+                            logger.debug(f'Pausing topic {topic} (loc 2)')
+                        paused_topics.add(topic)
+                    continue
+
+                if topic in paused_topics:
+                    continue
+
+                # Route message to the appropriate worker queue
+                if topic not in queues:
+                    logger.warning(f'Received message for unexpected topic: {topic}')
+                    continue
+
+                msg_ctr_by_topic[topic] += 1
+
+                if msg_ctr_by_topic[topic] % 5_000 == 0:
+                    logger.debug(f'Topic {topic}: Reached %s, apx queue depth %s',
+                                format_coordinates(msg), queues[topic].qsize())
+
+                # Pass raw bytes to workers for deserialization
+                raw_key = msg.key()
+                raw_val = msg.value()
+
+                retries: int = 0
+                while True:
+                    try:
+                        queues[topic].put_nowait((topic, msg.partition(), msg.offset(), msg.timestamp()[1], raw_key, raw_val))
+                        break
+                    except stdlib_queue.Full:
+                        if topic in stop_events and stop_events[topic].is_set():
+                            logger.warning(f'Queue for topic {topic} full but worker for topic has already signaled '
+                                           f'stop. Skipping.')
+                            if topic not in paused_topics:
+                                consumer.pause(topic_to_partitions[topic])
+                                logger.debug(f'Pausing topic {topic} (loc 3)')
+                                paused_topics.add(topic)
+                            break
+                        if retries < 20:
+                            retries += 1
+                            if retries > 1:
+                                logger.warning(f'Retry {retries}. Current apx queue size for topic {topic} '
+                                               f'is {queues[topic].qsize()}')
+                            time.sleep(2)
+                        else:
+                            logger.error(f'Persistent queue full attempting to enqueue message for topic {topic}, queue '
+                                         f'apx size {queues[topic].qsize()}')
+                            raise
 
             if 0 < opts.consumed_messages_limit <= msg_ctr:
                 logger.info(f'Consumed %s messages total, stopping...', opts.consumed_messages_limit)

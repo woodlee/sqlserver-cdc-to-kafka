@@ -22,6 +22,9 @@ def build_consumer_config(kafka_bootstrap_servers: str, group_id: str, **overrid
         'enable.auto.offset.store': False,
         'enable.auto.commit': False,
         'auto.offset.reset': 'earliest',
+        'fetch.min.bytes': 1048576,
+        'fetch.wait.max.ms': 100,
+        'queued.max.messages.kbytes': 1048576,
         **overrides
     }
     return config
