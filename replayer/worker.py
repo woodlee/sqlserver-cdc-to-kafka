@@ -196,7 +196,7 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                             logger.debug(f'Up to 10 first items passed to delete statement: '
                                          f'{pprint.pformat(deletes[:min(10, len(deletes))])}')
                             logged_a_delete = True
-                        logger.debug('Deleted %s items. Temp table insert: %s ms, delete stmt: %s ms',
+                        logger.info('Deleted %s items. Temp table insert: %s ms, delete stmt: %s ms',
                                      len(queued_deletes), temp_table_elapsed_ms, elapsed_ms)
 
                     if queued_upserts:
@@ -251,7 +251,7 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                                 logged_an_upsert = True
                             sql_time_acc += time.perf_counter() - start_time
                             elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-                            logger.info('Merged %s items. Temp table insert: %s ms, merge stmt: %s ms',
+                            logger.info('Merged %s items. Temp table insert: %s ms, merge stmts: %s ms',
                                         len(merges), temp_table_elapsed_ms, elapsed_ms)
 
                     if queued_upserts or queued_deletes:

@@ -35,9 +35,34 @@ def flush_ordered_operations(db_conn: Any, progress_tracker: ProgressTracker,
     overall_start = time.perf_counter()
 
     try:
-        # Execute all data operations
-        for op in ops:
+        i = 0
+        batched_insert_count = 0
+        while i < len(ops):
+            op = ops[i]
             metadata = table_metadata[op.original_topic]
+
+            # Try to batch consecutive inserts for the same table (up to 10) to minimize network RTT:
+            if op.cdc_operation == 'Insert':
+                run_end = i + 1
+                while (run_end < len(ops)
+                       and run_end - i < 10
+                       and ops[run_end].cdc_operation == 'Insert'
+                       and ops[run_end].original_topic == op.original_topic):
+                    run_end += 1
+
+                run_length = run_end - i
+                if run_length > 1:
+                    start = time.perf_counter()
+                    params_list = [tuple(ops[j].row_values) for j in range(i, run_end)]
+                    cursor.fast_executemany = True
+                    cursor.executemany(metadata.insert_stmt, params_list)
+                    cursor.fast_executemany = False
+                    elapsed_us = (time.perf_counter() - start) * 1_000_000
+                    batched_insert_count += run_length
+                    if elapsed_us > 100_000:
+                        logger.warning(f"SLOW: {elapsed_us:.0f}µs - batched Insert x{run_length} on {op.original_topic}")
+                    i = run_end
+                    continue
 
             start = time.perf_counter()
             if op.cdc_operation == 'Delete':
@@ -52,17 +77,20 @@ def flush_ordered_operations(db_conn: Any, progress_tracker: ProgressTracker,
                 else:
                     params = metadata.build_update_params(op.row_values)
                     cursor.execute(metadata.update_stmt, params)
-                # if cursor.rowcount == 0:
-                #     raise Exception(f'UPDATE affected 0 rows for {metadata.fq_target_table_name} '
-                #                    f'with key {op.key_val} - row does not exist')
             else:
                 raise Exception(f'Unexpected CDC operation type: {op.cdc_operation}')
             elapsed_us = (time.perf_counter() - start) * 1_000_000
             if elapsed_us > 100_000:
                 logger.warning(f"SLOW: {elapsed_us:.0f}µs - {op.cdc_operation} on {op.original_topic}")
+            i += 1
         overall_elapsed = time.perf_counter() - overall_start
 
-        logger.info(f'Executed {len(ops)} ops in {overall_elapsed:.2f}s, mean {(overall_elapsed * 1_000 / len(ops)):.2f} ms / op')
+        if batched_insert_count:
+            logger.info(f'Executed {len(ops)} ops ({batched_insert_count} via batched inserts) in '
+                        f'{overall_elapsed:.2f}s, mean {(overall_elapsed * 1_000 / len(ops)):.2f} ms / op')
+        else:
+            logger.info(f'Executed {len(ops)} ops in {overall_elapsed:.2f}s, mean '
+                        f'{(overall_elapsed * 1_000 / len(ops)):.2f} ms / op')
 
         # Update progress in the same transaction
         progress_tracker.upsert_all_changes_progress(cursor, last_offset, last_timestamp)

@@ -55,9 +55,9 @@ def main() -> None:
 
     # Config for process behavior and tuning
     p.add_argument('--delete-batch-size', type=int,
-                   default=os.environ.get('DELETE_BATCH_SIZE', 2000))
+                   default=os.environ.get('DELETE_BATCH_SIZE', 5_000))
     p.add_argument('--upsert-batch-size', type=int,
-                   default=os.environ.get('UPSERT_BATCH_SIZE', 5000))
+                   default=os.environ.get('UPSERT_BATCH_SIZE', 10_000))
     p.add_argument('--max-commit-latency-seconds', type=int,
                    default=os.environ.get('MAX_COMMIT_LATENCY_SECONDS', 10))
     p.add_argument('--consumed-messages-limit', type=int,

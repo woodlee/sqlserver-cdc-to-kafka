@@ -393,6 +393,9 @@ def run_follow_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfig]
                 logger.debug(f'Follow mode: processed {msg_ctr} messages, at offset {last_all_changes_offset}, '
                             f'pending ops: {len(ordered_ops)}')
 
+            # TODO if needed for perf: separate consuming and Avro deser into a separate process that hands off
+            # deser'd messages to this existing flow via a faster_fifo Queue.
+
             # Periodically flush and commit (but maintain order within each flush)
             # Atomically commits data operations + progress update in a single transaction
             if (datetime.now() - last_commit_time).seconds > opts.max_commit_latency_seconds or \
