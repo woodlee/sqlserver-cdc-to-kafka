@@ -251,12 +251,12 @@ def backfill_consumer_process(replay_configs: List[ReplayConfig], opts: argparse
                                 logger.debug(f'Pausing topic {topic} (loc 3)')
                                 paused_topics.add(topic)
                             break
-                        if retries < 20:
+                        if retries < 60:
                             retries += 1
                             if retries > 1:
                                 logger.warning(f'Retry {retries}. Current apx queue size for topic {topic} '
                                                f'is {queues[topic].qsize()}')
-                            time.sleep(2)
+                            time.sleep(1)
                         else:
                             logger.error(f'Persistent queue full attempting to enqueue message for topic {topic}, queue '
                                          f'apx size {queues[topic].qsize()}')
