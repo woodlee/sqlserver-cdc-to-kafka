@@ -12,7 +12,7 @@ from typing import Dict, Optional, List, Tuple
 import pyodbc
 
 from . import clock_sync, kafka, tracked_tables, constants, options, validation, change_index, progress_tracking, \
-    sql_query_subprocess, sql_queries, helpers
+    sql_query_subprocess, sql_queries, helpers, VERSION
 from .build_startup_state import build_tracked_tables_from_cdc_metadata, determine_start_points_and_finalize_tables, \
     get_latest_capture_instances_by_fq_name, CaptureInstanceMetadata
 from .metric_reporting import accumulator
@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 def run() -> None:
-    logger.info('Starting...')
+    logger.info(f'Starting CDC-to-Kafka version {VERSION}...')
     opts: argparse.Namespace
     opts, reporters, serializer = options.get_options_and_metrics_reporters()
     disable_writes: bool = opts.run_validations or opts.report_progress_only
