@@ -365,3 +365,27 @@ def _get_snapshot_query_bits(pk_cols: Sequence[str], odbc_columns: Tuple[pyodbc.
     where_spec = '\n  AND '.join(comparator_where_clauses)
 
     return declarations, where_spec, params
+
+
+def get_change_table_rows_for_validation(fq_change_table_name: str, max_rows: int) -> \
+        Tuple[str, List[Tuple[int, int, Optional[int]]]]:
+    return f'''
+-- cdc-to-kafka: get_change_table_rows_for_validation
+SELECT TOP ({max_rows})
+    __$start_lsn
+    , __$command_id
+    , __$seqval
+    , __$operation
+FROM {fq_change_table_name} WITH (NOLOCK)
+WHERE __$operation IN (1, 2, 4)
+ORDER BY __$start_lsn, __$command_id, __$seqval, __$operation
+    ''', []
+
+
+def get_tran_end_time_for_lsn() -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
+    return f'''
+-- cdc-to-kafka: get_tran_end_time_for_lsn
+SELECT TOP 1 tran_end_time
+FROM [{constants.CDC_DB_SCHEMA_NAME}].[lsn_time_mapping] WITH (NOLOCK)
+WHERE start_lsn = ?
+    ''', [(pyodbc.SQL_BINARY, 10, None)]
