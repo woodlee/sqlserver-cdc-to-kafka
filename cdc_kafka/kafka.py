@@ -328,7 +328,10 @@ class KafkaClient(object):
             replication_factor = min(len(self._cluster_metadata.brokers), 3)
 
         extra_config = extra_config or {}
-        topic_config = {**{'cleanup.policy': 'compact'}, **extra_config}
+        topic_config = {**{
+            'cleanup.policy': 'compact',
+            'unclean.leader.election.enable': False
+        }, **extra_config}
         topic_config_str = {k: str(v) for k, v in topic_config.items()}
 
         logger.info('Creating Kafka topic "%s" with %s partitions, replication factor %s, and config: %s', topic_name,
