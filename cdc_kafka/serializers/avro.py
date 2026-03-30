@@ -93,6 +93,11 @@ PROGRESS_TRACKING_AVRO_VALUE_SCHEMA = confluent_kafka.avro.loads(json.dumps({
                             "type": "string",
                         },
                         {
+                            "name": constants.COMMAND_ID_NAME,
+                            "type": "int",
+                            "default": 1
+                        },
+                        {
                             "name": constants.SEQVAL_NAME,
                             "type": "string",
                         },
@@ -375,6 +380,10 @@ class AvroSchemaGenerator(object):
                 "type": ["null", "string"]
             },
             {
+                "name": constants.COMMAND_ID_NAME,
+                "type": ["null", "int"]
+            },
+            {
                 "name": constants.SEQVAL_NAME,
                 "type": ["null", "string"]
             },
@@ -510,11 +519,13 @@ class AvroSerializer(SerializerAbstract):
         int_to_int(value_writer, len(as_bytes))
         value_writer.write(struct.pack(f"{len(as_bytes)}s", as_bytes))
         if row.change_idx is None or row.operation_id == constants.SNAPSHOT_OPERATION_ID:
-            value_writer.write(b'\x00\x00')
+            value_writer.write(b'\x00\x00\x00')
         else:
             value_writer.write(b'\x02')
             as_bytes = f',0x{row.change_idx.lsn.hex()}'.encode("utf-8")
             value_writer.write(struct.pack("23s", as_bytes))
+            value_writer.write(b'\x02')
+            int_to_int(value_writer, row.change_idx.command_id)
             value_writer.write(b'\x02')
             as_bytes = f',0x{row.change_idx.seqval.hex()}'.encode("utf-8")
             value_writer.write(struct.pack("23s", as_bytes))
@@ -563,6 +574,7 @@ class AvroSerializer(SerializerAbstract):
         if row.operation_id == constants.SNAPSHOT_OPERATION_ID:
             value_dict[constants.OPERATION_NAME] = constants.SNAPSHOT_OPERATION_NAME
             value_dict[constants.LSN_NAME] = None
+            value_dict[constants.COMMAND_ID_NAME] = None
             value_dict[constants.SEQVAL_NAME] = None
         else:
             change_idx = row.change_idx
@@ -583,7 +595,6 @@ class AvroSerializer(SerializerAbstract):
         comp_key: bytes = self._confluent_serializer.encode_record_with_schema_id(  # type: ignore[assignment]
             metadata.key_schema_id, key_dict, True)
         if serialized_key != comp_key:
-            # import pdb; pdb.set_trace()
             raise Exception(
                 f'Avro serialization does not match the canonical library serialization. Key {key_dict} for message '
                 f'to topic {row.destination_topic} with schema ID {metadata.key_schema_id} serialized as '
@@ -592,7 +603,6 @@ class AvroSerializer(SerializerAbstract):
         comp_value: bytes = self._confluent_serializer.encode_record_with_schema_id(  # type: ignore[assignment]
             metadata.value_schema_id, value_dict, False)
         if serialized_value != comp_value:
-            # import pdb; pdb.set_trace()
             raise Exception(
                 f'Avro serialization does not match the canonical library serialization. Value {value_dict} for '
                 f'message to topic {row.destination_topic} with schema ID {metadata.value_schema_id} serialized '

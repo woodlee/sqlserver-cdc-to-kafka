@@ -6,10 +6,11 @@ from . import constants
 
 @total_ordering
 class ChangeIndex(object):
-    __slots__ = 'lsn', 'seqval', 'operation'
+    __slots__ = 'lsn', 'command_id', 'seqval', 'operation'
 
-    def __init__(self, lsn: bytes, seqval: bytes, operation: int) -> None:
+    def __init__(self, lsn: bytes, command_id: int, seqval: bytes, operation: int) -> None:
         self.lsn: bytes = lsn
+        self.command_id: int = command_id
         self.seqval: bytes = seqval
         self.operation: int
         if isinstance(operation, int):
@@ -28,6 +29,7 @@ class ChangeIndex(object):
             # early when we can, since this will most often return False:
             return not (
                 self.lsn != other.lsn
+                or self.command_id != other.command_id
                 or self.seqval != other.seqval
                 or self.operation != other.operation
             )
@@ -36,6 +38,8 @@ class ChangeIndex(object):
     def __lt__(self, other: 'ChangeIndex') -> bool:
         if self.lsn != other.lsn:
             return self.lsn < other.lsn
+        if self.command_id != other.command_id:
+            return self.command_id < other.command_id
         if self.seqval != other.seqval:
             return self.seqval < other.seqval
         if self.operation != other.operation:
@@ -46,13 +50,14 @@ class ChangeIndex(object):
     def __repr__(self) -> str:
         lsn = self.lsn.hex()
         seqval = self.seqval.hex()
-        return f'0x{lsn[:8]} {lsn[8:16]} {lsn[16:]}:0x{seqval[:8]} {seqval[8:16]} {seqval[16:]}:{self.operation}'
+        return f'0x{lsn[:8]} {lsn[8:16]} {lsn[16:]}:{self.command_id}:0x{seqval[:8]} {seqval[8:16]} {seqval[16:]}:{self.operation}'
 
     # Converts from binary LSN/seqval to a string representation that is more friendly to some things that may
     # consume this data. The stringified form is also "SQL query ready" for pasting into SQL Server queries.
-    def as_dict(self) -> Dict[str, str]:
+    def as_dict(self) -> Dict[str, str | int]:
         return {
             constants.LSN_NAME: f'0x{self.lsn.hex()}',
+            constants.COMMAND_ID_NAME: self.command_id,
             constants.SEQVAL_NAME: f'0x{self.seqval.hex()}',
             constants.OPERATION_NAME: constants.CDC_OPERATION_ID_TO_NAME[self.operation]
         }
@@ -61,6 +66,7 @@ class ChangeIndex(object):
     def from_dict(source_dict: Dict[str, Any]) -> 'ChangeIndex':
         return ChangeIndex(
             int(source_dict[constants.LSN_NAME][2:], 16).to_bytes(10, "big"),
+            source_dict.get(constants.COMMAND_ID_NAME, 1),  # may be absent for progress messages from prior versions
             int(source_dict[constants.SEQVAL_NAME][2:], 16).to_bytes(10, "big"),
             constants.CDC_OPERATION_NAME_TO_ID[source_dict[constants.OPERATION_NAME]]
         )
@@ -70,5 +76,5 @@ class ChangeIndex(object):
         return self.seqval == HIGHEST_CHANGE_INDEX.seqval and self.operation == HIGHEST_CHANGE_INDEX.operation
 
 
-LOWEST_CHANGE_INDEX = ChangeIndex(b'\x00' * 10, b'\x00' * 10, 0)
-HIGHEST_CHANGE_INDEX = ChangeIndex(b'\xff' * 10, b'\xff' * 10, 4)
+LOWEST_CHANGE_INDEX = ChangeIndex(b'\x00' * 10, 1, b'\x00' * 10, 0)
+HIGHEST_CHANGE_INDEX = ChangeIndex(b'\xff' * 10, 2**31 - 1, b'\xff' * 10, 4)

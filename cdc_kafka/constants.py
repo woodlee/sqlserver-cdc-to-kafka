@@ -83,10 +83,12 @@ CDC_OPERATION_NAME_TO_ID = {
 OPERATION_NAME = '__operation'
 EVENT_TIME_NAME = '__event_time'
 LSN_NAME = '__log_lsn'
+COMMAND_ID_NAME = '__command_id'
 SEQVAL_NAME = '__log_seqval'
 UPDATED_FIELDS_NAME = '__updated_fields'
 
 DB_LSN_COL_NAME = '__$start_lsn'
+DB_COMMAND_ID_COL_NAME = '__$command_id'
 DB_SEQVAL_COL_NAME = '__$seqval'
 DB_OPERATION_COL_NAME = '__$operation'
 

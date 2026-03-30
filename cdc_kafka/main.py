@@ -389,7 +389,7 @@ def should_terminate_due_to_capture_instance_change(
                         'types checksum %s\nNew: capture instance name "%s", column types checksum %s',
                         fq_name, current_ci.capture_instance_name, current_ci.types_checksum,
                         new_ci.capture_instance_name, new_ci.types_checksum)
-            new_ci_min_index = change_index.ChangeIndex(new_ci.start_lsn, b'\x00' * 10, 0)
+            new_ci_min_index = change_index.ChangeIndex(new_ci.start_lsn, 1, b'\x00' * 10, 0)
             if current_idx < new_ci_min_index:
                 with db_conn.cursor() as cursor:
                     change_table_name = helpers.quote_name(

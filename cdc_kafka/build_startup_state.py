@@ -156,8 +156,8 @@ def determine_start_points_and_finalize_tables(
                         cursor.execute(q)
                         res = cursor.fetchone()
                         if res:
-                            (lsn, _, seqval, operation) = res
-                            prior_change_table_max_index = change_index.ChangeIndex(lsn, seqval, operation)
+                            (lsn, command_id, seqval, operation) = res
+                            prior_change_table_max_index = change_index.ChangeIndex(lsn, command_id, seqval, operation)
 
                 if publish_duplicate_changes_from_new_instance:
                     logger.info('Will republish any change rows duplicated by the new capture instance.')

@@ -172,6 +172,7 @@ def get_change_table_count_by_operation(fq_change_table_name: str) -> Tuple[str,
 -- cdc-to-kafka: get_change_table_count_by_operation
 DECLARE 
     @LSN BINARY(10) = ?
+    , @COMMAND_ID INT = ?
     , @SEQVAL BINARY(10) = ?
     , @OPERATION INT = ?
 ;
@@ -183,11 +184,12 @@ FROM {fq_change_table_name} WITH (NOLOCK)
 WHERE __$operation != 3 
     AND (
         __$start_lsn < @LSN
-        OR __$start_lsn = @LSN AND __$seqval < @SEQVAL
-        OR __$start_lsn = @LSN AND __$seqval = @SEQVAL AND __$operation <= @OPERATION
+        OR __$start_lsn = @LSN AND __$command_id < @COMMAND_ID
+        OR __$start_lsn = @LSN AND __$command_id = @COMMAND_ID AND __$seqval < @SEQVAL
+        OR __$start_lsn = @LSN AND __$command_id = @COMMAND_ID AND __$seqval = @SEQVAL AND __$operation <= @OPERATION
     )
 GROUP BY __$operation
-    ''', [(pyodbc.SQL_BINARY, 10, None), (pyodbc.SQL_BINARY, 10, None), (pyodbc.SQL_INTEGER, 4, None)]
+    ''', [(pyodbc.SQL_BINARY, 10, None), (pyodbc.SQL_INTEGER, 4, None), (pyodbc.SQL_BINARY, 10, None), (pyodbc.SQL_INTEGER, 4, None)]
 
 
 def get_max_lsn() -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
@@ -203,7 +205,7 @@ WITH lsns AS (
 
     UNION ALL
 
-    SELECT sys.fn_cdc_increment_lsn(start_lsn), 0, 0x00000000000000000000, 0
+    SELECT sys.fn_cdc_increment_lsn(start_lsn), 1, 0x00000000000000000000, 0
     FROM [{constants.CDC_DB_SCHEMA_NAME}].[change_tables]
     WHERE object_id = OBJECT_ID('{fq_change_table_name}')
 )
@@ -228,6 +230,7 @@ def get_change_rows(batch_size: int, fq_change_table_name: str, field_names: Ite
 -- cdc-to-kafka: get_change_rows
 DECLARE 
     @LSN BINARY(10) = ?
+    , @COMMAND_ID INT = ?
     , @SEQ BINARY(10) = ?
     , @MAX_LSN BINARY(10) = ?
 ;
@@ -235,10 +238,16 @@ DECLARE
 WITH ct AS (
     SELECT *
     FROM {fq_change_table_name} AS ct WITH (NOLOCK)
-    WHERE ct.__$start_lsn = @LSN AND ct.__$seqval > @SEQ AND ct.__$start_lsn <= @MAX_LSN
+    WHERE ct.__$start_lsn = @LSN AND ct.__$command_id = @COMMAND_ID AND ct.__$seqval > @SEQ AND ct.__$start_lsn <= @MAX_LSN
 
     UNION ALL
 
+    SELECT *
+    FROM {fq_change_table_name} AS ct WITH (NOLOCK)
+    WHERE ct.__$start_lsn = @LSN AND ct.__$command_id > @COMMAND_ID AND ct.__$start_lsn <= @MAX_LSN
+    
+    UNION ALL
+    
     SELECT *
     FROM {fq_change_table_name} AS ct WITH (NOLOCK)
     WHERE ct.__$start_lsn > @LSN AND ct.__$start_lsn <= @MAX_LSN
@@ -247,6 +256,7 @@ SELECT TOP ({batch_size})
     ct.__$operation AS {constants.OPERATION_NAME}
     , ltm.tran_end_time AS {constants.EVENT_TIME_NAME}
     , ct.__$start_lsn AS {constants.LSN_NAME}
+    , ct.__$command_id AS {constants.COMMAND_ID_NAME}
     , ct.__$seqval AS {constants.SEQVAL_NAME}
     , ct.__$update_mask AS {constants.UPDATED_FIELDS_NAME}
     , {select_column_specs}
@@ -254,7 +264,7 @@ FROM ct
 INNER JOIN [{constants.CDC_DB_SCHEMA_NAME}].[lsn_time_mapping] AS ltm WITH (NOLOCK, FORCESEEK) ON (ct.__$start_lsn = ltm.start_lsn)
 WHERE ct.__$operation = 1 OR ct.__$operation = 2 OR ct.__$operation = 4
 ORDER BY {order_spec}
-    ''', [(pyodbc.SQL_BINARY, 10, None)] * 3
+    ''', [(pyodbc.SQL_BINARY, 10, None), (pyodbc.SQL_INTEGER, 4, None), (pyodbc.SQL_BINARY, 10, None), (pyodbc.SQL_BINARY, 10, None)]
 
 
 def get_snapshot_rows(
@@ -288,6 +298,7 @@ SELECT TOP ({batch_size})
     {constants.SNAPSHOT_OPERATION_ID} AS {constants.OPERATION_NAME}
     , GETDATE() AS {constants.EVENT_TIME_NAME}
     , NULL AS {constants.LSN_NAME}
+    , 1 AS {constants.COMMAND_ID_NAME}
     , NULL AS {constants.SEQVAL_NAME}
     , NULL AS {constants.UPDATED_FIELDS_NAME}
     , {select_column_specs}
