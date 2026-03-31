@@ -124,6 +124,34 @@ def determine_start_points_and_finalize_tables(
             changes_progress = prior_progress.get((table.topic_name, constants.CHANGE_ROWS_KIND))
 
             fq_change_table_name = helpers.get_fq_change_table_name(table.capture_instance_name)
+
+            if changes_progress and changes_progress.is_pre_version_4_4_0_change_progress_entry:
+                # This condition is expected to occur only once per topic upon initial transition from progress messages
+                # written by CDC-to-Kafka versions < 4.4.0 to versions >= 4.4.0, when the __$command_id was first taken
+                # into account:
+                with db_conn.cursor() as cursor:
+                    cursor.execute(f"SELECT {constants.DB_COMMAND_ID_COL_NAME} FROM {fq_change_table_name} "
+                                   f"WHERE {constants.DB_LSN_COL_NAME} = ? "
+                                   f"AND {constants.DB_SEQVAL_COL_NAME} = ? "
+                                   f"AND {constants.DB_OPERATION_COL_NAME} = ?",
+                                   changes_progress.change_index.lsn,
+                                   changes_progress.change_index.seqval,
+                                   changes_progress.change_index.operation)
+                    command_id_from_change_table: int | None = cursor.fetchval()
+
+                if command_id_from_change_table:
+                    changes_progress.change_index.command_id = command_id_from_change_table
+                    logger.info(f'Set progress start point to change index {changes_progress.change_index} for topic '
+                                f'{table.topic_name}, source table {table.fq_name}, based on inferring the starting '
+                                f'command ID from data in change table {fq_change_table_name}.')
+                else:
+                    logger.warning(f'Command ID was not found in the prior recorded progress entry for topic '
+                                   f'{table.topic_name}, source table {table.fq_name}, and could not be inferred from '
+                                   f'data in change table {fq_change_table_name}. Defaulting to command ID '
+                                   f'{changes_progress.change_index.command_id}, but this may create message repeats '
+                                   f'in the destination topic for any initial messages produced by this run that are '
+                                   f'also at LSN {changes_progress.change_index.as_dict()[constants.LSN_NAME]}')
+
             if snapshot_progress and (snapshot_progress.change_table_name != fq_change_table_name):
                 logger.info('Found prior snapshot progress into topic %s, but from an older capture instance '
                             '(prior progress instance: %s; current instance: %s)', table.topic_name,

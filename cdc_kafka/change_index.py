@@ -66,7 +66,7 @@ class ChangeIndex(object):
     def from_dict(source_dict: Dict[str, Any]) -> 'ChangeIndex':
         return ChangeIndex(
             int(source_dict[constants.LSN_NAME][2:], 16).to_bytes(10, "big"),
-            source_dict.get(constants.COMMAND_ID_NAME, 1),  # may be absent for progress messages from prior versions
+            source_dict[constants.COMMAND_ID_NAME],
             int(source_dict[constants.SEQVAL_NAME][2:], 16).to_bytes(10, "big"),
             constants.CDC_OPERATION_NAME_TO_ID[source_dict[constants.OPERATION_NAME]]
         )
