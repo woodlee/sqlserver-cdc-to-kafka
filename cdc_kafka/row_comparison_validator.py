@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import functools
 import logging
 import os
 import re
@@ -25,6 +26,8 @@ FAIL_TAG = f'{RED}[FAIL]{RESET}'
 
 PACIFIC_TZ = zoneinfo.ZoneInfo('America/Los_Angeles')
 CLOCK_SKEW_BUFFER = datetime.timedelta(seconds=30)
+
+print = functools.partial(print, flush=True)
 
 
 def add_args(p: argparse.ArgumentParser) -> None:
