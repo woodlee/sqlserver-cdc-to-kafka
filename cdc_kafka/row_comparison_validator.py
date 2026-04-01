@@ -242,7 +242,7 @@ def consume_and_compare(
                     finished_parts[msg.partition()] = True
                     if all(finished_parts):
                         remaining = len(change_rows) - change_row_idx
-                        if remaining <= 10 and not eof_retried:
+                        if remaining <= 1000 and not eof_retried:
                             # Close to the goal — pause and retry in case the
                             # async CDC-to-Kafka process is still catching up
                             logger.info('Reached end of topic %s with %d rows '
