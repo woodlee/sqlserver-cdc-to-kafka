@@ -36,6 +36,11 @@ def add_args(p: argparse.ArgumentParser) -> None:
                    help='Regex with named capture groups "schema_name" and "table_name" '
                         'used to match Kafka topic names and extract the corresponding '
                         'source table identity.')
+    p.add_argument('--max-age-seconds', type=int,
+                   default=os.environ.get('MAX_AGE_SECONDS'),
+                   help='If specified, only pull change table rows newer than this many '
+                        'seconds ago (according to the DB clock). Useful for limiting '
+                        'validation to recent changes.')
 
 
 def get_matching_topics(kafka_client: kafka.KafkaClient,
@@ -69,12 +74,29 @@ def find_capture_instance(db_conn: pyodbc.Connection, schema_name: str,
     return best_instance
 
 
-def fetch_change_table_rows(db_conn: pyodbc.Connection,
-                            fq_change_table_name: str) -> List[ChangeIndex]:
-    query, _ = sql_queries.get_change_table_rows_for_validation(
-        fq_change_table_name, constants.VALIDATION_MAXIMUM_SAMPLE_SIZE_PER_TOPIC)
+def resolve_min_lsn(db_conn: pyodbc.Connection, max_age_seconds: int) -> Optional[bytes]:
+    query, param_specs = sql_queries.get_min_lsn_for_max_age()
     with db_conn.cursor() as cursor:
-        cursor.execute(query)
+        cursor.setinputsizes(param_specs)
+        cursor.execute(query, max_age_seconds)
+        row = cursor.fetchone()
+    if row is None or row[0] is None:
+        return None
+    return bytes(row[0])
+
+
+def fetch_change_table_rows(db_conn: pyodbc.Connection,
+                            fq_change_table_name: str,
+                            min_lsn: Optional[bytes] = None) -> List[ChangeIndex]:
+    query, param_specs = sql_queries.get_change_table_rows_for_validation(
+        fq_change_table_name, constants.VALIDATION_MAXIMUM_SAMPLE_SIZE_PER_TOPIC,
+        min_lsn)
+    with db_conn.cursor() as cursor:
+        if param_specs:
+            cursor.setinputsizes(param_specs)
+            cursor.execute(query, min_lsn)
+        else:
+            cursor.execute(query)
         rows: List[ChangeIndex] = []
         for row in cursor.fetchall():
             rows.append(ChangeIndex(
@@ -339,6 +361,17 @@ def main() -> None:
     db_conn = pyodbc.connect(opts.db_conn_string)
 
     try:
+        min_lsn: Optional[bytes] = None
+        if opts.max_age_seconds is not None:
+            min_lsn = resolve_min_lsn(db_conn, int(opts.max_age_seconds))
+            if min_lsn is None:
+                print(f'WARNING: No LSN found for --max-age-seconds={opts.max_age_seconds}. '
+                      f'The CDC retention window may not extend that far back. '
+                      f'Proceeding without a time filter.')
+            else:
+                print(f'Using --max-age-seconds={opts.max_age_seconds}: '
+                      f'min LSN = 0x{min_lsn.hex()}\n')
+
         with kafka.KafkaClient(accumulator.NoopAccumulator(), opts.kafka_bootstrap_servers,
                                 opts.extra_kafka_consumer_config, {},
                                 disable_writing=True) as kafka_client:
@@ -362,7 +395,7 @@ def main() -> None:
 
                 fq_change_table = helpers.get_fq_change_table_name(capture_instance)
 
-                change_rows = fetch_change_table_rows(db_conn, fq_change_table)
+                change_rows = fetch_change_table_rows(db_conn, fq_change_table, min_lsn)
                 if not change_rows:
                     print(f'{OK_TAG} {topic_name} ({fq_table}): '
                           f'Change table is empty, nothing to compare')

@@ -367,8 +367,22 @@ def _get_snapshot_query_bits(pk_cols: Sequence[str], odbc_columns: Tuple[pyodbc.
     return declarations, where_spec, params
 
 
-def get_change_table_rows_for_validation(fq_change_table_name: str, max_rows: int) -> \
+def get_change_table_rows_for_validation(fq_change_table_name: str, max_rows: int,
+                                         min_lsn: Optional[bytes] = None) -> \
         Tuple[str, List[Tuple[int, int, Optional[int]]]]:
+    if min_lsn is not None:
+        return f'''
+-- cdc-to-kafka: get_change_table_rows_for_validation
+SELECT TOP ({max_rows})
+    __$start_lsn
+    , __$command_id
+    , __$seqval
+    , __$operation
+FROM {fq_change_table_name} WITH (NOLOCK)
+WHERE __$operation IN (1, 2, 4)
+    AND __$start_lsn >= ?
+ORDER BY __$start_lsn, __$command_id, __$seqval, __$operation
+        ''', [(pyodbc.SQL_BINARY, 10, None)]
     return f'''
 -- cdc-to-kafka: get_change_table_rows_for_validation
 SELECT TOP ({max_rows})
@@ -380,6 +394,13 @@ FROM {fq_change_table_name} WITH (NOLOCK)
 WHERE __$operation IN (1, 2, 4)
 ORDER BY __$start_lsn, __$command_id, __$seqval, __$operation
     ''', []
+
+
+def get_min_lsn_for_max_age() -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
+    return '''
+-- cdc-to-kafka: get_min_lsn_for_max_age
+SELECT sys.fn_cdc_map_time_to_lsn('smallest greater than or equal', DATEADD(second, -?, GETDATE()))
+    ''', [(pyodbc.SQL_INTEGER, 0, None)]
 
 
 def get_tran_end_time_for_lsn() -> Tuple[str, List[Tuple[int, int, Optional[int]]]]:
