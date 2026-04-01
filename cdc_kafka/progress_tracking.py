@@ -35,14 +35,19 @@ class ProgressEntry(object):
         if kind == constants.SNAPSHOT_ROWS_KIND:
             return cls(kind, k['topic_name'], v['source_table_name'], v['change_table_name'],
                        v['last_ack_position']['key_fields'], None, msg_coordinates)
-
         else:
+            is_pre_version_4_4_0_change_progress_entry: bool = False
+            if constants.COMMAND_ID_NAME not in v['last_ack_position']:
+                v['last_ack_position'][constants.COMMAND_ID_NAME] = 1
+                is_pre_version_4_4_0_change_progress_entry = True
             return cls(kind, k['topic_name'], v['source_table_name'], v['change_table_name'],
-                       None, ChangeIndex.from_dict(v['last_ack_position']), msg_coordinates)
+                       None, ChangeIndex.from_dict(v['last_ack_position']), msg_coordinates,
+                       is_pre_version_4_4_0_change_progress_entry)
 
     def __init__(self, progress_kind: str, topic_name: str, source_table_name: str, change_table_name: str,
                  snapshot_index: Optional[Mapping[str, str | int]] = None,
-                 change_index: Optional[ChangeIndex] = None, progress_msg_coordinates: Optional[str] = None) -> None:
+                 change_index: Optional[ChangeIndex] = None, progress_msg_coordinates: Optional[str] = None,
+                 is_pre_version_4_4_0_change_progress_entry: bool = False) -> None:
         if progress_kind not in (constants.CHANGE_ROWS_KIND, constants.SNAPSHOT_ROWS_KIND):
             raise Exception(f'Unrecognized progress kind: {progress_kind}')
 
@@ -53,6 +58,7 @@ class ProgressEntry(object):
         self.snapshot_index: Optional[Mapping[str, str | int]] = snapshot_index
         self.change_index: Optional[ChangeIndex] = change_index
         self.progress_msg_coordinates: Optional[str] = progress_msg_coordinates
+        self.is_pre_version_4_4_0_change_progress_entry: bool = is_pre_version_4_4_0_change_progress_entry
 
     @property
     def key(self) -> Dict[str, str]:

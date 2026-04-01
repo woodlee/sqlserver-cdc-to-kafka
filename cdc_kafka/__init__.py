@@ -5,6 +5,8 @@ import sentry_sdk
 
 sentry_sdk.init()
 
+VERSION = "4.4.0"
+
 log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
 
 logging.config.dictConfig({

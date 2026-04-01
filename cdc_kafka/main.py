@@ -12,7 +12,7 @@ from typing import Dict, Optional, List, Tuple
 import pyodbc
 
 from . import clock_sync, kafka, tracked_tables, constants, options, validation, change_index, progress_tracking, \
-    sql_query_subprocess, sql_queries, helpers
+    sql_query_subprocess, sql_queries, helpers, VERSION
 from .build_startup_state import build_tracked_tables_from_cdc_metadata, determine_start_points_and_finalize_tables, \
     get_latest_capture_instances_by_fq_name, CaptureInstanceMetadata
 from .metric_reporting import accumulator
@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 def run() -> None:
-    logger.info('Starting...')
+    logger.info(f'Starting CDC-to-Kafka version {VERSION}...')
     opts: argparse.Namespace
     opts, reporters, serializer = options.get_options_and_metrics_reporters()
     disable_writes: bool = opts.run_validations or opts.report_progress_only
@@ -389,7 +389,7 @@ def should_terminate_due_to_capture_instance_change(
                         'types checksum %s\nNew: capture instance name "%s", column types checksum %s',
                         fq_name, current_ci.capture_instance_name, current_ci.types_checksum,
                         new_ci.capture_instance_name, new_ci.types_checksum)
-            new_ci_min_index = change_index.ChangeIndex(new_ci.start_lsn, b'\x00' * 10, 0)
+            new_ci_min_index = change_index.ChangeIndex(new_ci.start_lsn, 1, b'\x00' * 10, 0)
             if current_idx < new_ci_min_index:
                 with db_conn.cursor() as cursor:
                     change_table_name = helpers.quote_name(
