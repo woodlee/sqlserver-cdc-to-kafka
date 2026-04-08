@@ -5,7 +5,7 @@ from typing import List
 
 from .logging_config import get_logger
 from .models import ReplayConfig
-from .modes import run_backfill_mode, run_follow_mode, run_redo_mode
+from .modes import run_backfill_mode, run_follow_mode, run_redo_from_beginning_mode, run_redo_continue_mode
 
 logger = get_logger(__name__)
 
@@ -73,10 +73,12 @@ def main() -> None:
     # Mode selection for backfill vs follow vs redo
     p.add_argument('--mode',
                    default=os.environ.get('REPLAYER_MODE', 'backfill'),
-                   choices=['backfill', 'follow', 'redo'],
+                   choices=['backfill', 'follow', 'redo_from_beginning', 'redo_continue'],
                    help='Operation mode: "backfill" replays single-table topics in parallel up to a cutoff LSN, '
                         '"follow" reads the all-changes topic in order to maintain FK constraints, '
-                        '"redo" drops FKs, truncates tables, and replays from topic beginning up to a cutoff')
+                        '"redo_from_beginning" drops FKs, truncates tables, clears progress, and replays from '
+                        'topic beginning up to a cutoff, '
+                        '"redo_continue" resumes an interrupted redo without re-truncating (safe to run repeatedly)')
     p.add_argument('--all-changes-topic',
                    default=os.environ.get('ALL_CHANGES_TOPIC'),
                    help='Name of the unified all-changes topic containing messages from all tables in LSN order')
@@ -139,8 +141,10 @@ def main() -> None:
         run_backfill_mode(opts, replay_configs)
     elif opts.mode == 'follow':
         run_follow_mode(opts, replay_configs)
-    elif opts.mode == 'redo':
-        run_redo_mode(opts, replay_configs)
+    elif opts.mode == 'redo_from_beginning':
+        run_redo_from_beginning_mode(opts, replay_configs)
+    elif opts.mode == 'redo_continue':
+        run_redo_continue_mode(opts, replay_configs)
 
 
 if __name__ == '__main__':

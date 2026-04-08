@@ -3,10 +3,89 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import ctds
+import pyodbc
 
 from .logging_config import get_logger
 from .models import OrderedOperation, ReplayConfig
 from .utils import parse_sql_default
+
+# Map SQL Server data types to pyodbc SQL type constants for setinputsizes().
+# This prevents implicit type conversions (CONVERT_IMPLICIT) in SQL Server execution plans—
+# most critically, pyodbc's default of sending Python str as NVARCHAR when the column is VARCHAR.
+# Simple map for fixed-size types where ColumnSize=0 is fine (the driver knows the width).
+_PYODBC_TYPE_MAP: Dict[str, int] = {
+    'bit': pyodbc.SQL_BIT,
+    'tinyint': pyodbc.SQL_TINYINT,
+    'smallint': pyodbc.SQL_SMALLINT,
+    'int': pyodbc.SQL_INTEGER,
+    'bigint': pyodbc.SQL_BIGINT,
+    'float': pyodbc.SQL_DOUBLE,
+    'real': pyodbc.SQL_REAL,
+    'uniqueidentifier': pyodbc.SQL_GUID,
+}
+
+
+def _get_pyodbc_input_size(data_type: str, char_max_length: Optional[int],
+                           numeric_precision: Optional[int],
+                           numeric_scale: Optional[int],
+                           datetime_precision: Optional[int]) -> Optional[tuple]:
+    """Map a SQL Server data type to a pyodbc setinputsizes() entry.
+
+    Returns a tuple suitable for one element of the list passed to cursor.setinputsizes(),
+    or None to let pyodbc use its default inference for that parameter.
+    """
+    dt = data_type.lower()
+
+    # Decimal/numeric need explicit precision and scale
+    if dt in ('decimal', 'numeric'):
+        return (pyodbc.SQL_DECIMAL, numeric_precision or 18, numeric_scale or 0)
+    if dt == 'money':
+        return (pyodbc.SQL_DECIMAL, 19, 4)
+    if dt == 'smallmoney':
+        return (pyodbc.SQL_DECIMAL, 10, 4)
+
+    # Date/time types: ODBC Driver 18 always maps SQL_TYPE_TIMESTAMP to datetime2 on the wire,
+    # and the SS-specific constant (-150) for legacy datetime isn't supported by pyodbc's
+    # setinputsizes. The resulting CONVERT_IMPLICIT (datetime2 param → datetime column) is a
+    # parameter-side O(1) conversion, not a per-row column scan, so we just let pyodbc default.
+    if dt in ('datetime', 'smalldatetime'):
+        return None
+    if dt == 'datetime2':
+        p = datetime_precision if datetime_precision is not None else 7
+        col_size = (20 + p) if p > 0 else 19
+        return (pyodbc.SQL_TYPE_TIMESTAMP, col_size, p)
+    if dt == 'date':
+        return (pyodbc.SQL_TYPE_DATE, 10, 0)
+
+    # Variable-length character types: use LONG variants for MAX (-1) / LOB,
+    # otherwise provide ColumnSize so the driver doesn't get 0
+    if dt in ('char', 'varchar'):
+        if char_max_length == -1:
+            return (pyodbc.SQL_LONGVARCHAR,)
+        return (pyodbc.SQL_VARCHAR, char_max_length or 1)
+    if dt == 'text':
+        return (pyodbc.SQL_LONGVARCHAR,)
+    if dt in ('nchar', 'nvarchar'):
+        if char_max_length == -1:
+            return (pyodbc.SQL_WLONGVARCHAR,)
+        return (pyodbc.SQL_WVARCHAR, char_max_length or 1)
+    if dt == 'ntext':
+        return (pyodbc.SQL_WLONGVARCHAR,)
+
+    # Binary types: same MAX handling
+    if dt in ('binary', 'varbinary'):
+        if char_max_length == -1:
+            return (pyodbc.SQL_LONGVARBINARY,)
+        return (pyodbc.SQL_VARBINARY, char_max_length or 1)
+    if dt == 'image':
+        return (pyodbc.SQL_LONGVARBINARY,)
+
+    # Fixed-size types where the driver infers width from the type constant alone
+    sql_type = _PYODBC_TYPE_MAP.get(dt)
+    if sql_type is not None:
+        return (sql_type,)
+
+    return None
 
 logger = get_logger(__name__)
 
@@ -64,6 +143,7 @@ WHERE OBJECT_SCHEMA_NAME(object_id) = :0
             self.datetime_field_names: set[str] = set()
             self.varchar_field_names: set[str] = set()
             self.nvarchar_field_names: set[str] = set()
+            self.nullable_column_names: set[str] = set()
             self.column_defaults: Dict[str, Any] = {}
             self.pk_col_specs: List[Tuple[str, str, Optional[int], str]] = []  # (name, type, precision, is_nullable)
 
@@ -81,6 +161,8 @@ ORDER BY [ORDINAL_POSITION]
 
             col_specs = {}
             for col_name, col_type, col_precision, col_is_nullable, col_default in cursor.fetchall():
+                if col_is_nullable:
+                    self.nullable_column_names.add(col_name)
                 if col_name.lower() in self.cols_to_not_sync or col_name.lower() in self.computed_cols:
                     continue
                 self.field_names.append(col_name)
@@ -104,7 +186,7 @@ ORDER BY [ORDINAL_POSITION]
             rows = cursor.fetchall()
             self.identity_col_name: Optional[str] = rows and rows[0][0] or None
 
-    def convert_msg_to_row_values(self, msg_val: Dict[str, Any], for_bcp: bool = False) -> List[Any]:
+    def convert_msg_to_row_values(self, msg_val: Dict[str, Any]) -> List[Any]:
         """Convert a Kafka message value dict to a list of database row values.
 
         Handles datetime conversion, varchar/nvarchar encoding, missing fields, and None values.
@@ -114,27 +196,47 @@ ORDER BY [ORDINAL_POSITION]
         for f in self.field_names:
             fl = f.lower()
             if fl not in msg_val:
-                vals.append(self.column_defaults[f])
+                if f in self.nullable_column_names:
+                    vals.append(None)
+                else:
+                    vals.append(self.column_defaults[f])
             elif msg_val[fl] is None:
                 vals.append(None)
             elif f in self.datetime_field_names:
                 dt: datetime = datetime.fromisoformat(msg_val[fl])
-                if dt.year < 1753 and for_bcp:
+                if dt.year < 1753:
                     # FML--something in either CTDS or FreeTDS gets weird when trying to BCP anything earlier
                     # so we're just going to standardize the cutoff for anything before this (which is likely
                     # bad data anyway):
                     dt = datetime(1753, 1, 1, 0, 0, 0)
                 vals.append(dt)
-            elif f in self.varchar_field_names and for_bcp:
+            elif f in self.varchar_field_names:
                 # The below assumes your DB uses SQL_Latin1_General_CP1_CI_AS collation; if not, you may
                 # need to change 'cp1252' to something else.
                 vals.append(ctds.SqlVarChar(msg_val[fl].encode('cp1252')))
-            elif f in self.nvarchar_field_names and for_bcp:
+            elif f in self.nvarchar_field_names:
                 # See https://zillow.github.io/ctds/bulk_insert.html#text-columns
                 vals.append(ctds.SqlVarChar(msg_val[fl].encode('utf-16le')))
             else:
                 vals.append(msg_val[fl])
         return vals
+
+    def convert_msg_key_to_key_values(self, msg_key: Dict[str, Any]) -> Tuple[Tuple[Any, ...], Tuple[Any, ...]]:
+        key_for_python_hashing: List[Any] = []
+        key_for_bcp: List[Any] = []
+        for f in self.primary_key_field_names:
+            if f in self.varchar_field_names:
+                kv = msg_key[f].rstrip(' ').lower()
+                key_for_python_hashing.append(kv)
+                key_for_bcp.append(ctds.SqlVarChar(msg_key[f].encode('cp1252')))
+            elif f in self.nvarchar_field_names:
+                kv = msg_key[f].rstrip(' ').lower()
+                key_for_python_hashing.append(kv)
+                key_for_bcp.append(ctds.SqlVarChar(msg_key[f].encode('utf-16le')))
+            else:
+                key_for_python_hashing.append(msg_key[f])
+                key_for_bcp.append(msg_key[f])
+        return tuple(key_for_python_hashing), tuple(key_for_bcp)
 
     def create_temp_tables(self, db_conn: ctds.Connection) -> None:
         """Create the temp tables needed for batch delete and merge operations.
@@ -163,7 +265,6 @@ ORDER BY [ORDINAL_POSITION]
             cursor.execute(f'''
 CREATE TABLE {self.delete_temp_table_name} (
     {",".join(delete_temp_table_col_specs)},
-    CONSTRAINT [PK_{self.delete_temp_table_name}]
     PRIMARY KEY ([{"], [".join(self.primary_key_field_names)}])
 );
             ''')
@@ -278,7 +379,10 @@ WHERE OBJECT_SCHEMA_NAME(object_id) = ?
             cursor.execute('''
 SELECT [COLUMN_NAME]
     , [DATA_TYPE]
-    , COALESCE([CHARACTER_MAXIMUM_LENGTH], [DATETIME_PRECISION]) AS [PRECISION_SPEC]
+    , [CHARACTER_MAXIMUM_LENGTH]
+    , [NUMERIC_PRECISION]
+    , [NUMERIC_SCALE]
+    , [DATETIME_PRECISION]
     , [IS_NULLABLE]
     , [COLUMN_DEFAULT]
 FROM [INFORMATION_SCHEMA].[COLUMNS]
@@ -287,7 +391,9 @@ WHERE [TABLE_SCHEMA] = ?
 ORDER BY [ORDINAL_POSITION]
             ''', (config.target_db_table_schema, config.target_db_table_name))
 
-            for col_name, col_type, col_precision, col_is_nullable, col_default in cursor.fetchall():
+            self._col_pyodbc_type: Dict[str, Optional[tuple]] = {}
+
+            for col_name, col_type, char_max_len, num_precision, num_scale, dt_precision, col_is_nullable, col_default in cursor.fetchall():
                 if col_name.lower() in self.cols_to_not_sync or col_name.lower() in self.computed_cols:
                     continue
                 self.field_names.append(col_name)
@@ -298,6 +404,8 @@ ORDER BY [ORDINAL_POSITION]
                 if col_type.lower() in ('nchar', 'nvarchar', 'ntext'):
                     self.nvarchar_field_names.add(col_name)
                 self.column_defaults[col_name] = parse_sql_default(col_default)
+                self._col_pyodbc_type[col_name] = _get_pyodbc_input_size(
+                    col_type, char_max_len, num_precision, num_scale, dt_precision)
 
             # Check for identity column
             cursor.execute('SELECT TOP 1 [name] FROM sys.columns WHERE object_id = OBJECT_ID(?) AND is_identity = 1',
@@ -328,6 +436,12 @@ WHERE {where_clause}
 '''
         single_delete_where_predicates = ' AND '.join([f'[{c}] = ?' for c in self.primary_key_field_names])
         self.single_delete_stmt = f'DELETE FROM {self.fq_target_table_name} WHERE {single_delete_where_predicates}'
+
+        # Pre-compute setinputsizes arrays for each statement type to avoid CONVERT_IMPLICIT
+        self.insert_input_sizes = [self._col_pyodbc_type.get(f) for f in self.field_names]
+        self.delete_input_sizes = [self._col_pyodbc_type.get(f) for f in self.primary_key_field_names]
+        self.update_input_sizes = ([self._col_pyodbc_type.get(f) for f in self._non_pk_fields] +
+                                   [self._col_pyodbc_type.get(f) for f in self.primary_key_field_names])
 
         logger.info(f"Follow mode: initialized table metadata for {self.fq_target_table_name}")
 
@@ -389,14 +503,15 @@ WHERE {where_clause}
         pk_vals = [field_to_val[f] for f in self.primary_key_field_names]
         return tuple(non_pk_vals + pk_vals)
 
-    def build_dynamic_update(self, row_values: List[Any], updated_fields: List[str]) -> Tuple[str, Tuple[Any, ...]]:
+    def build_dynamic_update(self, row_values: List[Any], updated_fields: List[str]) \
+            -> Tuple[str, Tuple[Any, ...], List[Optional[tuple]]]:
         """Build a targeted UPDATE statement that only updates the specified fields.
 
         This reduces index maintenance overhead by only updating columns that actually changed,
         rather than updating all non-PK columns.
 
         Returns:
-            Tuple of (SQL statement, parameter tuple)
+            Tuple of (SQL statement, parameter tuple, setinputsizes list)
         """
         field_to_val = dict(zip(self.field_names, row_values))
 
@@ -413,7 +528,7 @@ WHERE {where_clause}
 
         # If no fields to update (e.g., only PK changed, which shouldn't happen), fall back to full update
         if not fields_to_update:
-            return self.update_stmt, self.build_update_params(row_values)
+            return self.update_stmt, self.build_update_params(row_values), self.update_input_sizes
 
         # Build SET clause with only changed fields
         set_clause = ', '.join([f'[{f}] = ?' for f in fields_to_update])
@@ -428,7 +543,10 @@ WHERE {where_clause}
         params = tuple([field_to_val[f] for f in fields_to_update] +
                        [field_to_val[f] for f in self.primary_key_field_names])
 
-        return stmt, params
+        input_sizes = ([self._col_pyodbc_type.get(f) for f in fields_to_update] +
+                       [self._col_pyodbc_type.get(f) for f in self.primary_key_field_names])
+
+        return stmt, params, input_sizes
 
     def log_stats(self) -> None:
         """Log processing statistics."""

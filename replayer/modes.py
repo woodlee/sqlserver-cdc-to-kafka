@@ -563,8 +563,66 @@ def _drop_foreign_keys(db_conn: pyodbc.Connection, fk_infos: List[Dict[str, Any]
         cursor.close()
 
 
-def run_redo_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfig]) -> None:
-    """Run the replayer in redo mode - drop FKs, truncate, and replay from the beginning.
+def _safe_drop_foreign_keys(db_conn: pyodbc.Connection, replay_configs: List[ReplayConfig]) -> None:
+    """Discover and drop any FK constraints involving the target tables.
+
+    Safe to call even if FKs have already been dropped (e.g. during redo_continue after an
+    interrupted redo_from_beginning). Logs restore commands before dropping.
+    """
+    fk_infos = _discover_foreign_keys(db_conn, replay_configs)
+    if fk_infos:
+        logger.info(f"Found {len(fk_infos)} FK constraint(s) involving target tables")
+
+        restore_commands = _generate_fk_restore_commands(fk_infos)
+        logger.info("=" * 80)
+        logger.info("FK RESTORE COMMANDS - save these for manual execution after redo completes:")
+        logger.info("=" * 80)
+        for cmd in restore_commands:
+            logger.info(cmd)
+        logger.info("=" * 80)
+
+        _drop_foreign_keys(db_conn, fk_infos)
+        logger.info("All FK constraints dropped successfully")
+    else:
+        logger.info("No FK constraints found involving target tables")
+
+
+def run_redo_continue_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfig]) -> None:
+    """Run the replayer in redo_continue mode - resume a previously interrupted redo.
+
+    This mode is safe to run repeatedly. It will:
+      1. Determine the cutoff (from --replay-to or from latest LSN on the all-changes topic)
+      2. Drop any remaining FK constraints (safe no-op if already dropped)
+      3. Replay from existing progress (or beginning if progress was already cleared)
+
+    NOTE: If a prior redo_from_beginning was interrupted during the truncation phase (after
+    some tables were truncated but before progress was cleared for all of them), the data
+    state may be inconsistent. In that case, run redo_from_beginning again instead.
+    """
+    # 1. Determine cutoff
+    if opts.replay_to:
+        cutoff = opts.replay_to
+        logger.info(f"Redo continue: using --replay-to cutoff (lsn={cutoff[0]}, command_id={cutoff[1]})")
+    else:
+        cutoff_lsn, _ = get_latest_lsn_from_all_changes_topic(opts)
+        cutoff = (cutoff_lsn, 2**31 - 1)
+        logger.info(f"Redo continue: using latest all-changes topic LSN as cutoff: {cutoff_lsn}")
+
+    # 2. Safe FK re-check (no-op if already dropped)
+    pyodbc_conn_str = get_pyodbc_conn_string_from_opts(opts)
+    db_conn = pyodbc.connect(pyodbc_conn_str, autocommit=True)
+    try:
+        _safe_drop_foreign_keys(db_conn, replay_configs)
+    finally:
+        db_conn.close()
+
+    # 3. Replay from existing progress with cutoff
+    logger.info("Starting replay phase...")
+    run_backfill_mode(opts, replay_configs, cutoff_override=cutoff, skip_all_changes_progress=True)
+
+
+def run_redo_from_beginning_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfig]) -> None:
+    """Run the replayer in redo_from_beginning mode - drop FKs, truncate, and replay from scratch.
 
     Steps:
       1. Determine the cutoff (from --replay-to or from all-changes topic progress)
@@ -573,6 +631,9 @@ def run_redo_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfig]) 
       4. Truncate the target tables
       5. Clear replay progress for those tables
       6. Replay from the beginning of each topic up to the cutoff
+
+    If this mode is interrupted after step 4/5 but before replay completes, use
+    redo_continue to resume without re-truncating.
     """
     proc_id: str = f'{socket.getfqdn()}+{int(datetime.now().timestamp())}'
     pyodbc_conn_str = get_pyodbc_conn_string_from_opts(opts)
@@ -584,7 +645,7 @@ def run_redo_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfig]) 
     # 1. Determine cutoff
     if opts.replay_to:
         cutoff = opts.replay_to
-        logger.info(f"Redo mode: using --replay-to cutoff (lsn={cutoff[0]}, command_id={cutoff[1]})")
+        logger.info(f"Redo from beginning: using --replay-to cutoff (lsn={cutoff[0]}, command_id={cutoff[1]})")
     else:
         all_changes_progress = progress_tracker.get_all_changes_topic_progress()
         if all_changes_progress is None:
@@ -592,30 +653,14 @@ def run_redo_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfig]) 
                            f'"{opts.all_changes_topic}" in namespace "{opts.progress_tracking_namespace}". '
                            f'Either provide --replay-to or run backfill mode first.')
         cutoff = get_lsn_and_command_id_at_offset(opts, all_changes_progress.last_handled_message_offset)
-        logger.info(f"Redo mode: cutoff from all-changes progress at offset "
+        logger.info(f"Redo from beginning: cutoff from all-changes progress at offset "
                     f"{all_changes_progress.last_handled_message_offset}: "
                     f"(lsn={cutoff[0]}, command_id={cutoff[1]})")
 
-    # 2. Discover and drop FK constraints
+    # 2-3. Discover, log restore commands, and drop FK constraints
     db_conn = pyodbc.connect(pyodbc_conn_str, autocommit=True)
     try:
-        fk_infos = _discover_foreign_keys(db_conn, replay_configs)
-        if fk_infos:
-            logger.info(f"Found {len(fk_infos)} FK constraint(s) involving target tables")
-
-            # 3. Print restore commands BEFORE dropping
-            restore_commands = _generate_fk_restore_commands(fk_infos)
-            logger.info("=" * 80)
-            logger.info("FK RESTORE COMMANDS - save these for manual execution after redo completes:")
-            logger.info("=" * 80)
-            for cmd in restore_commands:
-                logger.info(cmd)
-            logger.info("=" * 80)
-
-            _drop_foreign_keys(db_conn, fk_infos)
-            logger.info("All FK constraints dropped successfully")
-        else:
-            logger.info("No FK constraints found involving target tables")
+        _safe_drop_foreign_keys(db_conn, replay_configs)
 
         # 4. Truncate target tables
         cursor = db_conn.cursor()

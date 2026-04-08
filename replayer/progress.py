@@ -10,6 +10,42 @@ UTC = timezone.utc
 
 logger = get_logger(__name__)
 
+# setinputsizes arrays for progress table statements, derived from the CREATE TABLE DDL below.
+# Column types: source_topic_name VARCHAR(255), source_topic_partition INT,
+# target_table_object_id INT, target_table_schema_name SYSNAME (NVARCHAR(128)),
+# target_table_name SYSNAME (NVARCHAR(128)), last_handled_message_offset BIGINT,
+# last_handled_message_timestamp DATETIME2(3), replayer_progress_namespace VARCHAR(255),
+# replayer_process_id VARCHAR(255)
+
+# For upsert_all_changes_progress and upsert_progress_record(use_object_id=False):
+# params: (topic, partition, schema_name, table_name, offset, timestamp, namespace, process_id)
+_PROGRESS_UPSERT_INPUT_SIZES = [
+    (pyodbc.SQL_VARCHAR, 255),          # source_topic_name
+    (pyodbc.SQL_INTEGER,),              # source_topic_partition
+    (pyodbc.SQL_WVARCHAR, 128),         # target_table_schema_name
+    (pyodbc.SQL_WVARCHAR, 128),         # target_table_name
+    (pyodbc.SQL_BIGINT,),               # last_handled_message_offset
+    (pyodbc.SQL_TYPE_TIMESTAMP, 23, 3), # last_handled_message_timestamp (datetime2(3))
+    (pyodbc.SQL_VARCHAR, 255),          # replayer_progress_namespace
+    (pyodbc.SQL_VARCHAR, 255),          # replayer_process_id
+]
+
+# For upsert_progress_record(use_object_id=True):
+# params: (topic, partition, schema_for_obj_id, name_for_obj_id, schema_name, table_name,
+#          offset, timestamp, namespace, process_id)
+_PROGRESS_UPSERT_WITH_OBJ_ID_INPUT_SIZES = [
+    (pyodbc.SQL_VARCHAR, 255),          # source_topic_name
+    (pyodbc.SQL_INTEGER,),              # source_topic_partition
+    (pyodbc.SQL_WVARCHAR, 128),         # target_table_schema (OBJECT_ID param)
+    (pyodbc.SQL_WVARCHAR, 128),         # target_table_name (OBJECT_ID param)
+    (pyodbc.SQL_WVARCHAR, 128),         # target_table_schema_name
+    (pyodbc.SQL_WVARCHAR, 128),         # target_table_name
+    (pyodbc.SQL_BIGINT,),               # last_handled_message_offset
+    (pyodbc.SQL_TYPE_TIMESTAMP, 23, 3), # last_handled_message_timestamp (datetime2(3))
+    (pyodbc.SQL_VARCHAR, 255),          # replayer_progress_namespace
+    (pyodbc.SQL_VARCHAR, 255),          # replayer_process_id
+]
+
 
 class ProgressTracker(object):
     def __init__(self, pyodbc_conn_string: str, progress_tracking_table_schema: str, progress_tracking_table_name: str,
@@ -26,6 +62,10 @@ class ProgressTracker(object):
                                target_table_schema: str, target_table_name: str, offset: int, timestamp: datetime,
                                use_object_id: bool = True) -> None:
         params: Iterable[Any]
+
+        # Match the SQL param type of DATETIME2(3) for the `last_handled_message_timestamp` col of the progress table:
+        timestamp = timestamp.replace(microsecond=timestamp.microsecond // 1000 * 1000)
+
         if use_object_id:
             # Parameters 3 and 4 (0-indexed: target_table_schema and target_table_name) used in OBJECT_ID
             object_id_expr = "OBJECT_ID(? + '.' + ?)"
@@ -37,6 +77,9 @@ class ProgressTracker(object):
             params = (source_topic_name, source_topic_partition, target_table_schema, target_table_name,
                       offset, timestamp, self.progress_tracking_namespace, self.process_id)
 
+        cursor.setinputsizes(
+            _PROGRESS_UPSERT_WITH_OBJ_ID_INPUT_SIZES if use_object_id
+            else _PROGRESS_UPSERT_INPUT_SIZES)
         cursor.execute(f'''
     MERGE {self.progress_table_fq_name} AS pt
     USING (SELECT
@@ -85,6 +128,7 @@ class ProgressTracker(object):
         , row.[replayer_process_id]
     );
         ''', params)
+        cursor.setinputsizes([])
 
     def get_progress(self, target_db_table_schema: str, target_db_table_name: str,
                      replay_topic: str) -> List[Progress]:
@@ -215,6 +259,7 @@ class ProgressTracker(object):
         This is designed to be called within an existing transaction - it does NOT commit.
         The caller is responsible for committing the transaction.
         """
+        cursor.setinputsizes(_PROGRESS_UPSERT_INPUT_SIZES)
         cursor.execute(f'''
     MERGE {self.progress_table_fq_name} AS pt
     USING (SELECT
@@ -264,3 +309,4 @@ class ProgressTracker(object):
     );
         ''', (self.all_changes_topic, 0, '', '', offset, timestamp,
               self.progress_tracking_namespace, self.process_id))
+        cursor.setinputsizes([])

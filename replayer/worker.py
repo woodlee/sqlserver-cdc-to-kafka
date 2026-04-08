@@ -69,7 +69,7 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
     queue_get_wait: float = 0.0
     last_commit_time: datetime = datetime.now()
     last_consume_by_partition: Dict[int, Tuple[int, int]] = {}
-    queued_deletes: Set[Any] = set()
+    queued_deletes: Dict[Tuple[Any, ...], Tuple[Any, ...]] = {}
     queued_upserts: Dict[Any, Tuple[str, List[Any]]] = {}
     proc_start_time: float = time.perf_counter()
 
@@ -197,7 +197,7 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
 
                 if queued_deletes:
                     start_time = time.perf_counter()
-                    deletes = list(queued_deletes)
+                    deletes = list(queued_deletes.values())
                     db_conn.bulk_insert(metadata.delete_temp_table_name, deletes, tablock=True)
                     sql_time_acc += time.perf_counter() - start_time
                     temp_table_elapsed_ms = int((time.perf_counter() - start_time) * 1000)
@@ -317,22 +317,22 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
             if msg_key is None:
                 continue
 
-            key_val: Tuple[Any, ...] = tuple((msg_key[x] for x in metadata.primary_key_field_names))
+            key_for_python_hashing, key_for_bcp = metadata.convert_msg_key_to_key_values(msg_key)
 
             if msg_val is None or msg_val['__operation'] == 'Delete':
-                queued_deletes.add(key_val)
-                if queued_upserts.pop(key_val, None):
-                    logger.debug(f'Removed key {key_val} from pending upsert batch due to msg at '
+                queued_deletes[key_for_python_hashing] = key_for_bcp
+                if queued_upserts.pop(key_for_python_hashing, None):
+                    logger.debug(f'Removed key {key_for_python_hashing} from pending upsert batch due to msg at '
                                  f'offset {msg_offset}')
                 delete_cnt += 1
             else:
-                vals = metadata.convert_msg_to_row_values(msg_val, for_bcp=True)
-                queued_upserts[key_val] = (msg_val['__operation'], vals)
+                vals = metadata.convert_msg_to_row_values(msg_val)
+                queued_upserts[key_for_python_hashing] = (msg_val['__operation'], vals)
                 # Don't do this: deletes run first in the processing loop. Let that happen--if you don't, there
                 # is a chance that a delete-followed-by-insert happens in one batch and if you don't let that
                 # delete happen first, the insert will encounter a PK constraint violation:
                 #
-                # queued_deletes.discard(key_val)
+                # queued_deletes.pop(key_for_python_hashing)
                 upsert_cnt += 1
 
             if (len(queued_deletes) + len(queued_upserts)) % 5_000 == 0:

@@ -54,6 +54,10 @@ def flush_ordered_operations(db_conn: Any, progress_tracker: ProgressTracker,
                 if run_length > 1:
                     start = time.perf_counter()
                     params_list = [tuple(ops[j].row_values) for j in range(i, run_end)]
+                    # Don't use setinputsizes with fast_executemany — it infers types from the
+                    # first row's data, and combining it with setinputsizes + LONG types + NULLs
+                    # causes the driver to reject ColumnSize=0 for LOB columns.
+                    # Clear any prior setinputsizes still in effect on this cursor.
                     cursor.fast_executemany = True
                     cursor.executemany(metadata.insert_stmt, params_list)
                     cursor.fast_executemany = False
@@ -66,17 +70,25 @@ def flush_ordered_operations(db_conn: Any, progress_tracker: ProgressTracker,
 
             start = time.perf_counter()
             if op.cdc_operation == 'Delete':
+                cursor.setinputsizes(metadata.delete_input_sizes)
                 cursor.execute(metadata.single_delete_stmt, tuple(op.key_val))
+                cursor.setinputsizes([])
             elif op.cdc_operation == 'Insert':
+                cursor.setinputsizes(metadata.insert_input_sizes)
                 cursor.execute(metadata.insert_stmt, tuple(op.row_values))
+                cursor.setinputsizes([])
             elif op.cdc_operation == 'PostUpdate':
                 # Use targeted UPDATE if we have updated_fields info, otherwise fall back to full UPDATE
                 if op.updated_fields:
-                    stmt, params = metadata.build_dynamic_update(op.row_values, op.updated_fields)
+                    stmt, params, input_sizes = metadata.build_dynamic_update(op.row_values, op.updated_fields)
+                    cursor.setinputsizes(input_sizes)
                     cursor.execute(stmt, params)
+                    cursor.setinputsizes([])
                 else:
+                    cursor.setinputsizes(metadata.update_input_sizes)
                     params = metadata.build_update_params(op.row_values)
                     cursor.execute(metadata.update_stmt, params)
+                    cursor.setinputsizes([])
             else:
                 raise Exception(f'Unexpected CDC operation type: {op.cdc_operation}')
             elapsed_us = (time.perf_counter() - start) * 1_000_000
