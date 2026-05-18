@@ -18,6 +18,7 @@ from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroDeserializer
 from confluent_kafka.serialization import MessageField, SerializationContext
 from faster_fifo import Queue
+from requests.structures import CaseInsensitiveDict
 
 from .backfill_progress import BackfillProgressTracker
 from .logging_config import get_logger
@@ -147,8 +148,9 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                 retries = 0  # retries because schema registry calls very occasionally fail
                 while True:
                     try:
-                        msg_key = avro_deserializer(raw_key, SerializationContext(topic, MessageField.KEY))
-                        assert isinstance(msg_key, dict)
+                        msg_key = CaseInsensitiveDict(
+                            avro_deserializer(raw_key, SerializationContext(topic, MessageField.KEY)))
+                        assert isinstance(msg_key, CaseInsensitiveDict)
                         break
                     except Exception as e:
                         if retries >= 3:
@@ -163,8 +165,9 @@ def replay_worker(config: ReplayConfig, opts: argparse.Namespace, stop_event: Ev
                 retries = 0  # retries because schema registry calls very occasionally fail
                 while True:
                     try:
-                        msg_val = avro_deserializer(raw_val, SerializationContext(topic, MessageField.VALUE))
-                        assert isinstance(msg_val, dict)
+                        msg_val = CaseInsensitiveDict(
+                            avro_deserializer(raw_val, SerializationContext(topic, MessageField.VALUE)))
+                        assert isinstance(msg_val, CaseInsensitiveDict)
                         break
                     except Exception as e:
                         if retries >= 3:
