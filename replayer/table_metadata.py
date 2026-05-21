@@ -161,7 +161,7 @@ ORDER BY [ORDINAL_POSITION]
 
             col_specs = {}
             for col_name, col_type, col_precision, col_is_nullable, col_default in cursor.fetchall():
-                if col_is_nullable:
+                if col_is_nullable == 'YES':
                     self.nullable_column_names.add(col_name)
                 if col_name.lower() in self.cols_to_not_sync or col_name.lower() in self.computed_cols:
                     continue
