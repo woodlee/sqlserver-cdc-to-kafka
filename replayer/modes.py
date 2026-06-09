@@ -219,15 +219,7 @@ def run_backfill_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfi
 
         # Final progress report
         logger.info(f"Final: {backfill_progress.format_progress_report()}")
-        logger.info("All replay workers have completed.")
-
-        if not skip_all_changes_progress and cutoff_offset >= 0:
-            progress_tracker.commit_all_changes_topic_progress(cutoff_offset, datetime.now())
-            logger.info(f"Backfill complete. Wrote all-changes topic progress at offset {cutoff_offset} "
-                       f"for follow mode handoff.")
-        else:
-            logger.info("Backfill complete.")
-
+        logger.info("All replay workers have exited.")
     except KeyboardInterrupt:
         logger.info("Received interrupt signal, shutting down workers...")
         for event in stop_events.values():
@@ -255,6 +247,15 @@ def run_backfill_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfi
             worker.join(timeout=5)
         consumer_proc.join(timeout=5)
     finally:
+        if not skip_all_changes_progress and cutoff_offset >= 0 and not error_event.is_set():
+            progress_tracker.commit_all_changes_topic_progress(cutoff_offset, datetime.now())
+            logger.info(f"Backfill complete. Wrote all-changes topic progress at offset {cutoff_offset} "
+                        f"for follow mode handoff.")
+        else:
+            logger.info(f"Backfill complete. ** FINAL ALL-CHANGES TOPIC PROGRESS WAS NOT WRITTEN!! ** "
+                        f"(cutoff_offset value was '{cutoff_offset}')")
+
+        time.sleep(0.5)
         logging.shutdown()
         time.sleep(0.5)
 
@@ -329,9 +330,10 @@ def run_follow_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfig]
     try:
         while True:
             if datetime.now() >= last_heartbeat_time + timedelta(seconds=30):
+                lag_seconds = int((last_commit_time - last_all_changes_timestamp).total_seconds())
                 logger.info(f"Follow mode: heartbeat: last_all_changes_offset {last_all_changes_offset} "
                             f"last_all_changes_timestamp {last_all_changes_timestamp} last_commit_time "
-                            f"{last_commit_time} msg_ctr {msg_ctr}")
+                            f"{last_commit_time} msg_ctr {msg_ctr} lag {lag_seconds} seconds")
                 last_heartbeat_time = datetime.now()
 
             msg = consumer.poll(0.5)

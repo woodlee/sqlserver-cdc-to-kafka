@@ -36,16 +36,17 @@ def flush_ordered_operations(db_conn: Any, progress_tracker: ProgressTracker,
 
     try:
         i = 0
-        batched_insert_count = 0
+        batched_insert_us, single_insert_us, delete_us, update_us = 0, 0, 0, 0
+        batched_insert_count, single_insert_count, delete_count, update_count = 0, 0, 0, 0
         while i < len(ops):
             op = ops[i]
             metadata = table_metadata[op.original_topic]
 
-            # Try to batch consecutive inserts for the same table (up to 10) to minimize network RTT:
+            # Try to batch consecutive inserts for the same table (up to 100) to minimize network RTT:
             if op.cdc_operation == 'Insert':
                 run_end = i + 1
                 while (run_end < len(ops)
-                       and run_end - i < 10
+                       and run_end - i < 100
                        and ops[run_end].cdc_operation == 'Insert'
                        and ops[run_end].original_topic == op.original_topic):
                     run_end += 1
@@ -62,6 +63,7 @@ def flush_ordered_operations(db_conn: Any, progress_tracker: ProgressTracker,
                     cursor.executemany(metadata.insert_stmt, params_list)
                     cursor.fast_executemany = False
                     elapsed_us = (time.perf_counter() - start) * 1_000_000
+                    batched_insert_us += elapsed_us
                     batched_insert_count += run_length
                     if elapsed_us > 100_000:
                         logger.warning(f"SLOW: {elapsed_us:.0f}µs - batched Insert x{run_length} on {op.original_topic}")
@@ -73,10 +75,16 @@ def flush_ordered_operations(db_conn: Any, progress_tracker: ProgressTracker,
                 cursor.setinputsizes(metadata.delete_input_sizes)
                 cursor.execute(metadata.single_delete_stmt, tuple(op.key_val))
                 cursor.setinputsizes([])
+                elapsed_us = (time.perf_counter() - start) * 1_000_000
+                delete_us += elapsed_us
+                delete_count += 1
             elif op.cdc_operation == 'Insert':
                 cursor.setinputsizes(metadata.insert_input_sizes)
                 cursor.execute(metadata.insert_stmt, tuple(op.row_values))
                 cursor.setinputsizes([])
+                elapsed_us = (time.perf_counter() - start) * 1_000_000
+                single_insert_us += elapsed_us
+                single_insert_count += 1
             elif op.cdc_operation == 'PostUpdate':
                 # Use targeted UPDATE if we have updated_fields info, otherwise fall back to full UPDATE
                 if op.updated_fields:
@@ -89,20 +97,23 @@ def flush_ordered_operations(db_conn: Any, progress_tracker: ProgressTracker,
                     params = metadata.build_update_params(op.row_values)
                     cursor.execute(metadata.update_stmt, params)
                     cursor.setinputsizes([])
+                elapsed_us = (time.perf_counter() - start) * 1_000_000
+                update_us += elapsed_us
+                update_count += 1
             else:
                 raise Exception(f'Unexpected CDC operation type: {op.cdc_operation}')
-            elapsed_us = (time.perf_counter() - start) * 1_000_000
+
             if elapsed_us > 100_000:
                 logger.warning(f"SLOW: {elapsed_us:.0f}µs - {op.cdc_operation} on {op.original_topic}")
             i += 1
         overall_elapsed = time.perf_counter() - overall_start
 
-        if batched_insert_count:
-            logger.info(f'Executed {len(ops)} ops ({batched_insert_count} via batched inserts) in '
-                        f'{overall_elapsed:.2f}s, mean {(overall_elapsed * 1_000 / len(ops)):.2f} ms / op')
-        else:
-            logger.info(f'Executed {len(ops)} ops in {overall_elapsed:.2f}s, mean '
-                        f'{(overall_elapsed * 1_000 / len(ops)):.2f} ms / op')
+        logger.info(f'Executed {len(ops)} ops in {overall_elapsed:.2f}s, mean '
+                    f'{(overall_elapsed * 1_000 / len(ops)):.2f} ms / op. Totals: '
+                    f'\n  batched-insert: {batched_insert_count} in {batched_insert_us / 1000.0:.2f} ms (avg {batched_insert_us / 1000.0 / (batched_insert_count or 1.0):.2f} ms); '
+                    f'\n  single-insert: {single_insert_count} in {single_insert_us / 1000.0:.2f} ms (avg {single_insert_us / 1000.0 / (single_insert_count or 1.0):.2f} ms); '
+                    f'\n  deletes: {delete_count} in {delete_us / 1000.0:.2f} ms (avg {delete_us / 1000.0 / (delete_count or 1.0):.2f} ms); '
+                    f'\n  updates: {update_count} in {update_us / 1000.0:.2f} ms (avg {update_us / 1000.0 / (update_count or 1.0):.2f} ms); ')
 
         # Update progress in the same transaction
         progress_tracker.upsert_all_changes_progress(cursor, last_offset, last_timestamp)
