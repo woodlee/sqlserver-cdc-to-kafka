@@ -38,6 +38,7 @@ def flush_ordered_operations(db_conn: Any, progress_tracker: ProgressTracker,
         i = 0
         batched_insert_us, single_insert_us, delete_us, update_us = 0, 0, 0, 0
         batched_insert_count, single_insert_count, delete_count, update_count = 0, 0, 0, 0
+        single_insert_by_table: Dict[str, List[float]] = {}
         while i < len(ops):
             op = ops[i]
             metadata = table_metadata[op.original_topic]
@@ -85,6 +86,7 @@ def flush_ordered_operations(db_conn: Any, progress_tracker: ProgressTracker,
                 elapsed_us = (time.perf_counter() - start) * 1_000_000
                 single_insert_us += elapsed_us
                 single_insert_count += 1
+                single_insert_by_table.setdefault(op.original_topic, []).append(elapsed_us)
             elif op.cdc_operation == 'PostUpdate':
                 # Use targeted UPDATE if we have updated_fields info, otherwise fall back to full UPDATE
                 if op.updated_fields:
@@ -114,6 +116,17 @@ def flush_ordered_operations(db_conn: Any, progress_tracker: ProgressTracker,
                     f'\n  single-insert: {single_insert_count} in {single_insert_us / 1000.0:.2f} ms (avg {single_insert_us / 1000.0 / (single_insert_count or 1.0):.2f} ms); '
                     f'\n  deletes: {delete_count} in {delete_us / 1000.0:.2f} ms (avg {delete_us / 1000.0 / (delete_count or 1.0):.2f} ms); '
                     f'\n  updates: {update_count} in {update_us / 1000.0:.2f} ms (avg {update_us / 1000.0 / (update_count or 1.0):.2f} ms); ')
+
+        if single_insert_by_table:
+            table_avgs = sorted(
+                ((topic, sum(times) / len(times), len(times))
+                 for topic, times in single_insert_by_table.items()),
+                key=lambda x: x[1], reverse=True
+            )
+            top5 = table_avgs[:5]
+            lines = [f'    {topic}: avg {avg_us / 1000.0:.2f} ms ({count} ops)'
+                     for topic, avg_us, count in top5]
+            logger.info('Top 5 worst avg single-insert times by table:\n' + '\n'.join(lines))
 
         # Update progress in the same transaction
         progress_tracker.upsert_all_changes_progress(cursor, last_offset, last_timestamp)

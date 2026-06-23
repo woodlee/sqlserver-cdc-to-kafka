@@ -62,6 +62,12 @@ def main() -> None:
                    default=os.environ.get('MAX_COMMIT_LATENCY_SECONDS', 10))
     p.add_argument('--consumed-messages-limit', type=int,
                    default=os.environ.get('CONSUMED_MESSAGES_LIMIT', 0))
+    p.add_argument('--minimum-lag-seconds', type=int,
+                   default=os.environ.get('MINIMUM_LAG_SECONDS', 0),
+                   help='Intentional processing delay to introduce when handling messages in follow mode only. Can '
+                        'be useful in some cases where you need to run more than one follower to keep up with different '
+                        'subsets of target tables. Lag is calculated as the difference between the system clock and'
+                        'the Kafka message timestamp.')
     p.add_argument('--truncate-existing-data', action='store_true',
                    default=os.environ.get('TRUNCATE_EXISTING_DATA', '').lower() in ('true', '1', 'yes'),
                    help='Truncate target table data if no prior progress exists')

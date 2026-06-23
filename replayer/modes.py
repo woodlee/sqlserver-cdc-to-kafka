@@ -6,7 +6,7 @@ import multiprocessing as mp
 import socket
 import sys
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, UTC
 from multiprocessing.synchronize import Event as EventClass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -417,6 +417,11 @@ def run_follow_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfig]
                                                  last_all_changes_offset, last_all_changes_timestamp)
                         ordered_ops.clear()
                     break
+
+            if opts.minimum_lag_seconds:
+                lag_time = opts.minimum_lag_seconds - (datetime.now(UTC).replace(tzinfo=None) - msg_timestamp).total_seconds()
+                if lag_time > 0:
+                    time.sleep(lag_time)
 
             op = metadata.prepare_operation(msg_key, msg_val, offset, msg_timestamp)
             if op is not None:
