@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sqlserver-cdc-to-kafka"
-version = "4.4.0"
+version = "4.4.1"
 description = "Stream SQL Server Change Data Capture (CDC) events to Apache Kafka"
 readme = "README.md"
 requires-python = ">=3.12"

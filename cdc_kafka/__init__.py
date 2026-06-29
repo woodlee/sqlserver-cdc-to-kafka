@@ -5,7 +5,7 @@ import sentry_sdk
 
 sentry_sdk.init()
 
-VERSION = "4.4.0"
+VERSION = "4.4.1"
 
 log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
 
