@@ -135,6 +135,10 @@ class ProgressTracker(object):
         self._last_recorded_progress_by_topic[topic_name] = progress_entry
 
     def record_snapshot_progress(self, topic_name: str, snapshot_index: Mapping[str, str | int]) -> None:
+        # This handles cases where a SQL table has a BIT col in its PK (which pyodbc maps to a Python bool) without
+        # having to make a forwards-incompatible change to the corresponding Avro schema:
+        snapshot_index = {k: int(v) if isinstance(v, bool) else v for k, v in snapshot_index.items()}
+
         progress_entry = ProgressEntry(
             progress_kind=constants.SNAPSHOT_ROWS_KIND,
             topic_name=topic_name,
@@ -167,6 +171,15 @@ class ProgressTracker(object):
 
         event_time_iso = event_time.isoformat() if event_time is not None \
             else helpers.naive_utcnow().isoformat()
+
+        # This handles cases where a SQL table has a BIT col in its PK (which pyodbc maps to a Python bool) without
+        # having to make a forwards-incompatible change to the corresponding Avro schema:
+        if starting_snapshot_index is not None:
+            starting_snapshot_index = {k: int(v) if isinstance(v, bool) else v for k, v in
+                                       starting_snapshot_index.items()}
+        if ending_snapshot_index is not None:
+            ending_snapshot_index = {k: int(v) if isinstance(v, bool) else v for k, v in
+                                     ending_snapshot_index.items()}
 
         msg = {
             "action": action,
