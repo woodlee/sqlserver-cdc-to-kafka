@@ -120,7 +120,7 @@ PROGRESS_TRACKING_AVRO_VALUE_SCHEMA = confluent_kafka.avro.loads(json.dumps({
                             "name": "key_fields",
                             "type": {
                                 "type": "map",
-                                "values": ["string", "long"]
+                                "values": ["string", "long", "boolean"]
                             }
                         }
                     ]
@@ -182,14 +182,14 @@ SNAPSHOT_LOGGING_AVRO_VALUE_SCHEMA = confluent_kafka.avro.loads(json.dumps({
             "name": "starting_snapshot_index",
             "type": ["null", {
                 "type": "map",
-                "values": ["string", "long"]
+                "values": ["string", "long", "boolean"]
             }]
         },
         {
             "name": "ending_snapshot_index",
             "type": ["null", {
                 "type": "map",
-                "values": ["string", "long"]
+                "values": ["string", "long", "boolean"]
             }]
         }
     ]
