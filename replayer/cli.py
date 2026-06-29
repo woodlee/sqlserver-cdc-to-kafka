@@ -75,6 +75,12 @@ def main() -> None:
                    default=os.environ.get('ALWAYS_MERGE', '').lower() in ('true', '1', 'yes'),
                    help='During backfill, always upsert by merging from a loaded temp table, avoiding direct INSERTs '
                         'to the target table')
+    p.add_argument('--allowed-extra-message-values',
+                   default=os.environ.get('ALLOWED_EXTRA_MESSAGE_VALUES', ''),
+                   help='Comma-separated list of <schema>.<table>.<column> entries that are permitted to appear in '
+                        'topic messages even when no corresponding column exists in the target DB (follow mode only). '
+                        'Case-insensitive; square-bracket quoting is ignored. '
+                        'Example: [dbo].[Orders].[LegacyField],[dbo].[Orders].[AnotherField]')
 
     # Mode selection for backfill vs follow vs redo
     p.add_argument('--mode',
@@ -114,6 +120,24 @@ def main() -> None:
                             f'Expected "0x<lsn>:<command_id>", e.g. "0x00000035000172B00036:5". Error: {e}')
     else:
         opts.replay_to = None
+
+    # Parse --allowed-extra-message-values into a set of normalized (schema, table, column) triples.
+    # Strip square brackets and lowercase everything for case-insensitive matching.
+    def _strip_brackets(s: str) -> str:
+        return s.strip().strip('[]')
+
+    allowed_extra: set = set()
+    raw_allowed = opts.allowed_extra_message_values or ''
+    for entry in raw_allowed.split(','):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split('.')
+        if len(parts) != 3:
+            raise Exception(
+                f'Invalid --allowed-extra-message-values entry "{entry}": expected `<schema>.<table>.<column>`.')
+        allowed_extra.add(tuple(_strip_brackets(p).lower() for p in parts))
+    opts.allowed_extra_message_values = allowed_extra
 
     replay_configs: List[ReplayConfig] = []
 

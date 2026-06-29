@@ -333,12 +333,22 @@ class FollowModeTableMetadata:
     methods to prepare OrderedOperations from Kafka messages.
     """
 
-    def __init__(self, config: ReplayConfig, db_conn: Any) -> None:
+    def __init__(self, config: ReplayConfig, db_conn: Any,
+                 allowed_extra_message_values: Optional[set] = None) -> None:
         """Initialize with a pyodbc connection."""
         self.config = config
         self.fq_target_table_name = f'[{config.target_db_table_schema.strip()}].[{config.target_db_table_name.strip()}]'
         self.cols_to_not_sync: set[str] = set([c.strip().lower() for c in config.cols_to_not_sync.split(',')])
         self.cols_to_not_sync.discard('')
+
+        # Build per-table set of allowed extra column names (lowercased) from the global triples
+        schema_lower = config.target_db_table_schema.strip().lower()
+        table_lower = config.target_db_table_name.strip().lower()
+        self._allowed_extra_columns: set[str] = set()
+        if allowed_extra_message_values:
+            for s, t, c in allowed_extra_message_values:
+                if s == schema_lower and t == table_lower:
+                    self._allowed_extra_columns.add(c)
 
         self.delete_cnt = 0
         self.upsert_cnt = 0
@@ -392,8 +402,10 @@ ORDER BY [ORDINAL_POSITION]
             ''', (config.target_db_table_schema, config.target_db_table_name))
 
             self._col_pyodbc_type: Dict[str, Optional[tuple]] = {}
+            self._all_db_col_names_lower: set[str] = set()
 
             for col_name, col_type, char_max_len, num_precision, num_scale, dt_precision, col_is_nullable, col_default in cursor.fetchall():
+                self._all_db_col_names_lower.add(col_name.lower())
                 if col_name.lower() in self.cols_to_not_sync or col_name.lower() in self.computed_cols:
                     continue
                 self.field_names.append(col_name)
@@ -482,6 +494,20 @@ WHERE {where_clause}
                 timestamp=timestamp
             )
         else:
+            # Check for message values that have no corresponding column in the target DB.
+            # Internal CDC fields (prefixed with __) are always exempt.
+            for msg_field in msg_val:
+                msg_field_lower = msg_field.lower()
+                if msg_field_lower.startswith('__'):
+                    continue
+                if (msg_field_lower not in self._all_db_col_names_lower
+                        and msg_field_lower not in self._allowed_extra_columns):
+                    raise Exception(
+                        f'Message for {self.fq_target_table_name} at offset {offset} contains field '
+                        f'"{msg_field}" which has no corresponding column in the target DB. '
+                        f'Add it to --allowed-extra-message-values as '
+                        f'[{self.config.target_db_table_schema}].[{self.config.target_db_table_name}].[{msg_field}] '
+                        f'to suppress this check.')
             vals = self.convert_msg_to_row_values(msg_val)
             self.upsert_cnt += 1
             # Capture __updated_fields for PostUpdate operations to enable targeted updates

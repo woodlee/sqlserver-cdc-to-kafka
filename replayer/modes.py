@@ -296,7 +296,8 @@ def run_follow_mode(opts: argparse.Namespace, replay_configs: List[ReplayConfig]
 
     table_metadata: Dict[str, FollowModeTableMetadata] = {}
     for config in replay_configs:
-        metadata = FollowModeTableMetadata(config, db_conn)
+        metadata = FollowModeTableMetadata(config, db_conn,
+                                           allowed_extra_message_values=opts.allowed_extra_message_values)
         table_metadata[config.replay_topic] = metadata
 
     consumer_conf = build_consumer_config(opts.kafka_bootstrap_servers, f'replayer-follow-{proc_id}',
