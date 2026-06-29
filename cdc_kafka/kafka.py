@@ -224,7 +224,11 @@ class KafkaClient(object):
             logger.warning(
                 'consume_all: Requested topic %s contains no messages at present. Returning nothing.', topic_name)
             return
-        logger.debug('Progress topic %s ends at offset %s', topic_name, last_offset)
+
+        if part_count == 1:
+            logger.debug('Topic %s ends at offset %s', topic_name, last_offset)
+        else:
+            logger.debug('Topic %s sum of offsets from %s partitions is %s', topic_name, part_count, last_offset)
 
         consumer: confluent_kafka.Consumer = confluent_kafka.Consumer(self.consumer_config)
         if self._use_oauth:
@@ -237,11 +241,15 @@ class KafkaClient(object):
         ctr = 0
 
         while True:
-            msg = consumer.poll(constants.KAFKA_REQUEST_TIMEOUT_SECS)
+            msg = consumer.poll(timeout=1.0)
 
             if msg is None:
-                time.sleep(0.2)
+                time.sleep(0.1)
                 continue
+
+            if part_count == 1 and msg.offset() > last_offset:
+                break
+
             if msg.error():
                 # noinspection PyProtectedMember
                 if (msg.error().code() == confluent_kafka.KafkaError._PARTITION_EOF  # type: ignore[union-attr]
