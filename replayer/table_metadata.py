@@ -482,6 +482,8 @@ WHERE {where_clause}
                           timestamp: datetime) -> Optional[OrderedOperation]:
         key_val = tuple((msg_key[x] for x in self.primary_key_field_names))
         cdc_operation = msg_val['__operation']
+        lsn = msg_val.get('__log_lsn', '')
+        command_id = msg_val.get('__command_id', 0)
 
         if cdc_operation == 'Delete':
             self.delete_cnt += 1
@@ -491,7 +493,9 @@ WHERE {where_clause}
                 key_val=key_val,
                 row_values=[],
                 offset=offset,
-                timestamp=timestamp
+                timestamp=timestamp,
+                lsn=lsn,
+                command_id=command_id,
             )
         else:
             # Check for message values that have no corresponding column in the target DB.
@@ -519,7 +523,9 @@ WHERE {where_clause}
                 row_values=vals,
                 offset=offset,
                 timestamp=timestamp,
-                updated_fields=updated_fields
+                lsn=lsn,
+                command_id=command_id,
+                updated_fields=updated_fields,
             )
 
     def build_update_params(self, row_values: List[Any]) -> Tuple[Any, ...]:

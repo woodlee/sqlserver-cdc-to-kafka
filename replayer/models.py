@@ -9,6 +9,8 @@ class OrderedOperation(NamedTuple):
     row_values: List[Any]
     offset: int
     timestamp: datetime
+    lsn: str = ''
+    command_id: int = 0
     updated_fields: Optional[List[str]] = None  # For PostUpdate: which fields actually changed
 
 

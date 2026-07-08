@@ -37,11 +37,41 @@ def flush_ordered_operations(db_conn: Any, progress_tracker: ProgressTracker,
     try:
         i = 0
         batched_insert_us, single_insert_us, delete_us, update_us = 0, 0, 0, 0
-        batched_insert_count, single_insert_count, delete_count, update_count = 0, 0, 0, 0
+        batched_insert_count, single_insert_count, delete_count, update_count, merge_update_count = 0, 0, 0, 0, 0
         single_insert_by_table: Dict[str, List[float]] = {}
         while i < len(ops):
             op = ops[i]
             metadata = table_metadata[op.original_topic]
+
+            # Detect a MERGE-generated delete+insert pair: immediately adjacent ops for the same
+            # topic+key within the same LSN with successive command IDs. SQL MERGE can record a
+            # matched-row update as CDC op=1 (delete) then op=2 (insert) rather than ops 3+4
+            # (update before/after), and replaying the delete first may violate FK constraints.
+            # Skip the delete and replay the following insert as a full UPDATE instead.
+            # TODO: This detection and handling will fail to fire in the (hopefully rare) case that the
+            # delete and insert are separated across the boundary between successive calls of this function.
+            if (op.cdc_operation == 'Delete'
+                    and i + 1 < len(ops)
+                    and ops[i + 1].cdc_operation == 'Insert'
+                    and ops[i + 1].original_topic == op.original_topic
+                    and ops[i + 1].key_val == op.key_val
+                    and ops[i + 1].lsn == op.lsn
+                    and ops[i + 1].command_id == op.command_id + 1):
+                i += 1  # skip the delete, advance to the insert
+                op = ops[i]
+                logger.debug(f'MERGE-style delete+insert on {op.original_topic} key={op.key_val}; converting to update')
+                start = time.perf_counter()
+                cursor.setinputsizes(metadata.update_input_sizes)
+                cursor.execute(metadata.update_stmt, metadata.build_update_params(op.row_values))
+                cursor.setinputsizes([])
+                elapsed_us = (time.perf_counter() - start) * 1_000_000
+                update_us += elapsed_us
+                update_count += 1
+                merge_update_count += 1
+                if elapsed_us > 100_000:
+                    logger.warning(f"SLOW: {elapsed_us:.0f}µs - MergeUpdate on {op.original_topic}")
+                i += 1
+                continue
 
             # Try to batch consecutive inserts for the same table (up to 100) to minimize network RTT:
             if op.cdc_operation == 'Insert':
@@ -115,7 +145,8 @@ def flush_ordered_operations(db_conn: Any, progress_tracker: ProgressTracker,
                     f'\n  batched-insert: {batched_insert_count} in {batched_insert_us / 1000.0:.2f} ms (avg {batched_insert_us / 1000.0 / (batched_insert_count or 1.0):.2f} ms); '
                     f'\n  single-insert: {single_insert_count} in {single_insert_us / 1000.0:.2f} ms (avg {single_insert_us / 1000.0 / (single_insert_count or 1.0):.2f} ms); '
                     f'\n  deletes: {delete_count} in {delete_us / 1000.0:.2f} ms (avg {delete_us / 1000.0 / (delete_count or 1.0):.2f} ms); '
-                    f'\n  updates: {update_count} in {update_us / 1000.0:.2f} ms (avg {update_us / 1000.0 / (update_count or 1.0):.2f} ms); ')
+                    f'\n  updates: {update_count} in {update_us / 1000.0:.2f} ms (avg {update_us / 1000.0 / (update_count or 1.0):.2f} ms)'
+                    + (f' ({merge_update_count} from MERGE pairs)' if merge_update_count else '') + '; ')
 
         if single_insert_by_table:
             table_avgs = sorted(
