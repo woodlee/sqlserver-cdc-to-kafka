@@ -267,7 +267,8 @@ def build_transfer_plans(
         topic_name_template: str,
         target_db_conn: pyodbc.Connection,
         schema_registry_url: str,
-        schema_generator: AvroSchemaGenerator
+        schema_generator: AvroSchemaGenerator,
+        override_change_index: Optional[ChangeIndex] = None
 ) -> Tuple[List[TableTransferPlan], List[str]]:
     plans: List[TableTransferPlan] = []
     global_warnings: List[str] = []
@@ -316,9 +317,12 @@ def build_transfer_plans(
         prior_change_index = change_progress_entry.change_index if change_progress_entry else None
         prior_snapshot_index = snapshot_progress_entry.snapshot_index if snapshot_progress_entry else None
 
-        new_change_index = get_max_change_index_for_capture_instance(target_db_conn, target_ci.capture_instance_name)
-        if new_change_index is None:
-            warnings.append(f'Could not determine max LSN for target capture instance {target_ci.capture_instance_name}')
+        if override_change_index is not None:
+            new_change_index = override_change_index
+        else:
+            new_change_index = get_max_change_index_for_capture_instance(target_db_conn, target_ci.capture_instance_name)
+            if new_change_index is None:
+                warnings.append(f'Could not determine max LSN for target capture instance {target_ci.capture_instance_name}')
 
         needs_new_snapshot = snapshot_needs_redo(src_cols, tgt_cols, schema_generator, fq_name)
         if needs_new_snapshot:
@@ -334,7 +338,8 @@ def build_transfer_plans(
             snapshot_action = 'NO PRIOR PROGRESS'
             new_snapshot_progress = None
 
-        change_action = 'SET to target DB latest position'
+        change_action = (f'SET to specified LSN {override_change_index!r}'
+                         if override_change_index is not None else 'SET to target DB latest position')
 
         schema_compatible: Optional[bool] = None
         if src_cols and tgt_cols:
@@ -491,13 +496,27 @@ def main() -> None:
     p.add_argument('--extra-kafka-producer-config',
                    default=os.environ.get('EXTRA_KAFKA_PRODUCER_CONFIG', '{}'), type=json.loads,
                    help='Extra Kafka producer config as JSON')
+    p.add_argument('--change-lsn',
+                   default=os.environ.get('CHANGE_LSN'),
+                   help='Override change progress for all topics to start from this LSN (hex, e.g. '
+                        '0x00000034000001D80002). When set, ignores the target DB\'s current max LSN.')
     p.add_argument('--execute', action='store_true', default=False,
                    help='Actually execute the transfer. Without this flag, runs in dry-run mode.')
 
     args = p.parse_args()
 
+    override_change_index: Optional[ChangeIndex] = None
+    if args.change_lsn:
+        lsn_hex = args.change_lsn
+        if lsn_hex.startswith(('0x', '0X')):
+            lsn_hex = lsn_hex[2:]
+        lsn_bytes = int(lsn_hex, 16).to_bytes(10, 'big')
+        override_change_index = ChangeIndex(lsn_bytes, 1, b'\x00' * 10, 0)
+
     logger.info('=== CDC-to-Kafka Topic Ownership Transfer Tool ===')
     logger.info('Mode: %s', 'EXECUTE' if args.execute else 'DRY RUN')
+    if override_change_index:
+        logger.info('Change LSN override: %r', override_change_index)
     logger.info('')
 
     source_db_conn = pyodbc.connect(args.source_db_conn_string)
@@ -541,7 +560,7 @@ def main() -> None:
     plans, global_warnings = build_transfer_plans(
         source_instances, source_columns, target_instances, target_columns,
         prior_progress, args.topic_name_template, target_db_conn,
-        args.schema_registry_url, schema_generator)
+        args.schema_registry_url, schema_generator, override_change_index)
 
     if global_warnings:
         logger.warning('')
