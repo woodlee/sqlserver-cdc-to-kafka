@@ -75,6 +75,10 @@ def main() -> None:
                    default=os.environ.get('ALWAYS_MERGE', '').lower() in ('true', '1', 'yes'),
                    help='During backfill, always upsert by merging from a loaded temp table, avoiding direct INSERTs '
                         'to the target table')
+    p.add_argument('--table-redo-use-delete-statement', action='store_true',
+                   default=os.environ.get('TABLE_REDO_USE_DELETE_STATEMENT', '').lower() in ('true', '1', 'yes'),
+                   help='When initially clearing the table during a `redo`-mode replay, should the process use a DELETE'
+                        'instead of the usual TRUNCATE? Sometimes needed for DBs with e.g. CDC enabled.')
     p.add_argument('--allowed-extra-message-values',
                    default=os.environ.get('ALLOWED_EXTRA_MESSAGE_VALUES', ''),
                    help='Comma-separated list of <schema>.<table>.<column> entries that are permitted to appear in '

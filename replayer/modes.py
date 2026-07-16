@@ -675,8 +675,12 @@ def run_redo_from_beginning_mode(opts: argparse.Namespace, replay_configs: List[
         try:
             for config in replay_configs:
                 fq_name = f'[{config.target_db_table_schema.strip()}].[{config.target_db_table_name.strip()}]'
-                logger.info(f"Truncating table {fq_name}")
-                cursor.execute(f'TRUNCATE TABLE {fq_name};')
+                if opts.table_redo_use_delete_statement:
+                    logger.info(f"Deleting from table {fq_name}")
+                    cursor.execute(f'DELETE FROM {fq_name};')
+                else:
+                    logger.info(f"Truncating table {fq_name}")
+                    cursor.execute(f'TRUNCATE TABLE {fq_name};')
             db_conn.commit()
         finally:
             cursor.close()
