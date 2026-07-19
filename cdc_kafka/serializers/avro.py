@@ -400,6 +400,11 @@ class AvroSchemaGenerator(object):
                         "symbols": [constants.UNRECOGNIZED_COLUMN_DEFAULT_NAME] + source_field_names
                     }
                 }
+            },
+            {
+                "name": constants.EPOCH_VERSION_NAME,
+                "type": "int",
+                "default": 1
             }
         ]
 
@@ -407,10 +412,12 @@ class AvroSchemaGenerator(object):
 class AvroSerializer(SerializerAbstract):
     def __init__(self, schema_registry_url: str, always_use_avro_longs: bool, progress_topic_name: str,
                  snapshot_logging_topic_name: str, metrics_topic_name: str,
-                 avro_type_spec_overrides: Dict[str, str | Dict[str, str | int]], disable_writes: bool) -> None:
+                 avro_type_spec_overrides: Dict[str, str | Dict[str, str | int]], disable_writes: bool,
+                 epoch_version: int = 1) -> None:
         self.always_use_avro_longs: bool = always_use_avro_longs
         self.avro_type_spec_overrides: Dict[str, str | Dict[str, str | int]] = avro_type_spec_overrides
         self.disable_writes: bool = disable_writes
+        self._epoch_version: int = epoch_version
         self._schema_registry: confluent_kafka.avro.CachedSchemaRegistryClient = \
             confluent_kafka.avro.CachedSchemaRegistryClient(schema_registry_url)  # type: ignore[call-arg]
         self._confluent_serializer: confluent_kafka.avro.MessageSerializer = \
@@ -541,6 +548,7 @@ class AvroSerializer(SerializerAbstract):
                 if bit:
                     int_to_int(value_writer, i + 1)
             value_writer.write(b'\x00')
+        int_to_int(value_writer, self._epoch_version)
         for ix, f in enumerate(metadata.ordered_serializers):
             if row.table_data_cols[ix] is None:
                 value_writer.write(b'\x00')
@@ -589,6 +597,7 @@ class AvroSerializer(SerializerAbstract):
             value_dict[constants.UPDATED_FIELDS_NAME] = list(metadata.value_field_names)
 
         value_dict[constants.EVENT_TIME_NAME] = row.event_db_time.isoformat()
+        value_dict[constants.EPOCH_VERSION_NAME] = self._epoch_version
         dates_transformed = {k: v.isoformat() for k, v in value_dict.items() if type(v) is datetime.datetime}
         value_dict.update(dates_transformed)
 
@@ -671,7 +680,7 @@ class AvroSerializer(SerializerAbstract):
         metrics_topic_name: str = hasattr(opts, 'kafka_metrics_topic') and opts.kafka_metrics_topic or ''
         return cls(opts.schema_registry_url, opts.always_use_avro_longs, opts.progress_topic_name,
                    opts.snapshot_logging_topic_name, metrics_topic_name, opts.avro_type_spec_overrides,
-                   disable_writes)
+                   disable_writes, opts.epoch_version)
 
 
 def decimal_to_decimal(writer: io.BytesIO, datum: decimal.Decimal, scale: int) -> None:

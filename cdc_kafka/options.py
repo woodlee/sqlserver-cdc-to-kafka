@@ -284,6 +284,12 @@ def get_options_and_metrics_reporters(
                    default=os.environ.get('DB_ROW_BATCH_SIZE', 2000),
                    help="Maximum number of rows to retrieve in a single change data or snapshot query. Default 2000.")
 
+    p.add_argument('--epoch-version',
+                   type=int,
+                   default=int(os.environ.get('EPOCH_VERSION', 1)),
+                   help="Integer epoch version included as the `__epoch_version` field in every change data message. "
+                        "Increment this value to signal a breaking schema or semantic change to consumers. Default 1.")
+
     kafka_oauth.add_kafka_oauth_arg(p)
     if arg_adder:
         arg_adder(p)
