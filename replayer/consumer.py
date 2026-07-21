@@ -61,9 +61,10 @@ def flush_ordered_operations(db_conn: Any, progress_tracker: ProgressTracker,
                 op = ops[i]
                 logger.debug(f'MERGE-style delete+insert on {op.original_topic} key={op.key_val}; converting to update')
                 start = time.perf_counter()
-                cursor.setinputsizes(metadata.update_input_sizes)
-                cursor.execute(metadata.update_stmt, metadata.build_update_params(op.row_values))
-                cursor.setinputsizes([])
+                if metadata.update_stmt is not None:
+                    cursor.setinputsizes(metadata.update_input_sizes)
+                    cursor.execute(metadata.update_stmt, metadata.build_update_params(op.row_values))
+                    cursor.setinputsizes([])
                 elapsed_us = (time.perf_counter() - start) * 1_000_000
                 update_us += elapsed_us
                 update_count += 1
@@ -121,14 +122,16 @@ def flush_ordered_operations(db_conn: Any, progress_tracker: ProgressTracker,
                 # Use targeted UPDATE if we have updated_fields info, otherwise fall back to full UPDATE
                 if op.updated_fields:
                     stmt, params, input_sizes = metadata.build_dynamic_update(op.row_values, op.updated_fields)
-                    cursor.setinputsizes(input_sizes)
-                    cursor.execute(stmt, params)
-                    cursor.setinputsizes([])
+                    if stmt is not None:
+                        cursor.setinputsizes(input_sizes)
+                        cursor.execute(stmt, params)
+                        cursor.setinputsizes([])
                 else:
-                    cursor.setinputsizes(metadata.update_input_sizes)
-                    params = metadata.build_update_params(op.row_values)
-                    cursor.execute(metadata.update_stmt, params)
-                    cursor.setinputsizes([])
+                    if metadata.update_stmt is not None:
+                        cursor.setinputsizes(metadata.update_input_sizes)
+                        params = metadata.build_update_params(op.row_values)
+                        cursor.execute(metadata.update_stmt, params)
+                        cursor.setinputsizes([])
                 elapsed_us = (time.perf_counter() - start) * 1_000_000
                 update_us += elapsed_us
                 update_count += 1

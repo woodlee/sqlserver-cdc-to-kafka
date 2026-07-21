@@ -439,13 +439,18 @@ VALUES ({', '.join(['?' for _ in self.field_names])})
         # SET clause excludes PK columns and identity column; WHERE clause uses PK columns
         self._non_pk_fields = [f for f in self.field_names
                               if f not in self.primary_key_field_names and f != self.identity_col_name]
-        set_clause = ', '.join([f'[{f}] = ?' for f in self._non_pk_fields])
-        where_clause = ' AND '.join([f'[{pk}] = ?' for pk in self.primary_key_field_names])
-        self.update_stmt = f'''
+        if self._non_pk_fields:
+            set_clause = ', '.join([f'[{f}] = ?' for f in self._non_pk_fields])
+            where_clause = ' AND '.join([f'[{pk}] = ?' for pk in self.primary_key_field_names])
+            self.update_stmt = f'''
 UPDATE {self.fq_target_table_name}
 SET {set_clause}
 WHERE {where_clause}
 '''
+        else:
+            # Table consists entirely of PK columns — UPDATE would have an empty SET clause.
+            # Any update is a no-op; callers must check for None before executing.
+            self.update_stmt = None
         single_delete_where_predicates = ' AND '.join([f'[{c}] = ?' for c in self.primary_key_field_names])
         self.single_delete_stmt = f'DELETE FROM {self.fq_target_table_name} WHERE {single_delete_where_predicates}'
 
@@ -558,7 +563,8 @@ WHERE {where_clause}
             and f.lower() not in self.computed_cols
         ]
 
-        # If no fields to update (e.g., only PK changed, which shouldn't happen), fall back to full update
+        # If no fields to update (e.g., only PK changed, or table has no non-PK columns), fall back to
+        # full update (which may itself be None — callers must check before executing).
         if not fields_to_update:
             return self.update_stmt, self.build_update_params(row_values), self.update_input_sizes
 
