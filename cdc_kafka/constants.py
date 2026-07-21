@@ -86,6 +86,7 @@ LSN_NAME = '__log_lsn'
 COMMAND_ID_NAME = '__command_id'
 SEQVAL_NAME = '__log_seqval'
 UPDATED_FIELDS_NAME = '__updated_fields'
+EPOCH_VERSION_NAME = '__epoch_version'
 
 DB_LSN_COL_NAME = '__$start_lsn'
 DB_COMMAND_ID_COL_NAME = '__$command_id'
