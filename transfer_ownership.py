@@ -233,8 +233,9 @@ def snapshot_needs_redo(source_columns: List[ColumnMetadata], target_columns: Li
     added = set(target_cols_by_name.keys()) - set(source_cols_by_name.keys())
     removed = set(source_cols_by_name.keys()) - set(target_cols_by_name.keys())
 
-    if removed:
-        return True
+    for col_name in removed:
+        if not source_cols_by_name[col_name].is_nullable:
+            return True
 
     for col_name in added:
         if not target_cols_by_name[col_name].is_nullable:
