@@ -1,0 +1,185 @@
+import argparse
+import json
+import os
+from typing import List
+
+from .logging_config import get_logger
+from .models import ReplayConfig
+from .modes import run_backfill_mode, run_follow_mode, run_redo_from_beginning_mode, run_redo_continue_mode
+
+logger = get_logger(__name__)
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description='Replays CDC-to-Kafka topics to SQL Server tables.')
+
+    # Config for data source
+    p.add_argument('--replay-topic',
+                   default=os.environ.get('REPLAY_TOPIC'),
+                   help='Single topic to replay (for backward compatibility)')
+    p.add_argument('--topic-to-table-map',
+                   default=os.environ.get('TOPIC_TO_TABLE_MAP'),
+                   help='JSON mapping of topics to tables, e.g. {"topic1": {"schema": "dbo", "table": "Table1"}, ...}')
+    p.add_argument('--kafka-bootstrap-servers',
+                   default=os.environ.get('KAFKA_BOOTSTRAP_SERVERS'))
+    p.add_argument('--schema-registry-url',
+                   default=os.environ.get('SCHEMA_REGISTRY_URL'))
+    p.add_argument('--extra-kafka-consumer-config',
+                   default=os.environ.get('EXTRA_KAFKA_CONSUMER_CONFIG', {}), type=json.loads)
+
+    # Config for data target / progress tracking
+    p.add_argument('--target-db-server',
+                   default=os.environ.get('TARGET_DB_SERVER'))
+    p.add_argument('--target-db-user',
+                   default=os.environ.get('TARGET_DB_USER'))
+    p.add_argument('--target-db-password',
+                   default=os.environ.get('TARGET_DB_PASSWORD'))
+    p.add_argument('--target-db-database',
+                   default=os.environ.get('TARGET_DB_DATABASE'))
+    p.add_argument('--target-db-table-schema',
+                   default=os.environ.get('TARGET_DB_TABLE_SCHEMA'),
+                   help='Single table schema (for backward compatibility)')
+    p.add_argument('--target-db-table-name',
+                   default=os.environ.get('TARGET_DB_TABLE_NAME'),
+                   help='Single table name (for backward compatibility)')
+    p.add_argument('--cols-to-not-sync',
+                   default=os.environ.get('COLS_TO_NOT_SYNC', ''))
+    p.add_argument('--primary-key-fields-override',
+                   default=os.environ.get('PRIMARY_KEY_FIELDS_OVERRIDE', ''))
+    p.add_argument('--progress-tracking-namespace',
+                   default=os.environ.get('PROGRESS_TRACKING_NAMESPACE', 'default'))
+    p.add_argument('--progress-tracking-table-schema',
+                   default=os.environ.get('PROGRESS_TRACKING_TABLE_SCHEMA', 'dbo'))
+    p.add_argument('--progress-tracking-table-name',
+                   default=os.environ.get('PROGRESS_TRACKING_TABLE_NAME', 'CdcKafkaReplayerProgress'))
+
+    # Config for process behavior and tuning
+    p.add_argument('--delete-batch-size', type=int,
+                   default=os.environ.get('DELETE_BATCH_SIZE', 5_000))
+    p.add_argument('--upsert-batch-size', type=int,
+                   default=os.environ.get('UPSERT_BATCH_SIZE', 10_000))
+    p.add_argument('--max-commit-latency-seconds', type=int,
+                   default=os.environ.get('MAX_COMMIT_LATENCY_SECONDS', 10))
+    p.add_argument('--consumed-messages-limit', type=int,
+                   default=os.environ.get('CONSUMED_MESSAGES_LIMIT', 0))
+    p.add_argument('--minimum-lag-seconds', type=int,
+                   default=os.environ.get('MINIMUM_LAG_SECONDS', 0),
+                   help='Intentional processing delay to introduce when handling messages in follow mode only. Can '
+                        'be useful in some cases where you need to run more than one follower to keep up with different '
+                        'subsets of target tables. Lag is calculated as the difference between the system clock and'
+                        'the Kafka message timestamp.')
+    p.add_argument('--truncate-existing-data', action='store_true',
+                   default=os.environ.get('TRUNCATE_EXISTING_DATA', '').lower() in ('true', '1', 'yes'),
+                   help='Truncate target table data if no prior progress exists')
+    p.add_argument('--always-merge', action='store_true',
+                   default=os.environ.get('ALWAYS_MERGE', '').lower() in ('true', '1', 'yes'),
+                   help='During backfill, always upsert by merging from a loaded temp table, avoiding direct INSERTs '
+                        'to the target table')
+    p.add_argument('--table-redo-use-delete-statement', action='store_true',
+                   default=os.environ.get('TABLE_REDO_USE_DELETE_STATEMENT', '').lower() in ('true', '1', 'yes'),
+                   help='When initially clearing the table during a `redo`-mode replay, should the process use a DELETE'
+                        'instead of the usual TRUNCATE? Sometimes needed for DBs with e.g. CDC enabled.')
+    p.add_argument('--allowed-extra-message-values',
+                   default=os.environ.get('ALLOWED_EXTRA_MESSAGE_VALUES', ''),
+                   help='Comma-separated list of <schema>.<table>.<column> entries that are permitted to appear in '
+                        'topic messages even when no corresponding column exists in the target DB (follow mode only). '
+                        'Case-insensitive; square-bracket quoting is ignored. '
+                        'Example: [dbo].[Orders].[LegacyField],[dbo].[Orders].[AnotherField]')
+
+    # Mode selection for backfill vs follow vs redo
+    p.add_argument('--mode',
+                   default=os.environ.get('REPLAYER_MODE', 'backfill'),
+                   choices=['backfill', 'follow', 'redo_from_beginning', 'redo_continue'],
+                   help='Operation mode: "backfill" replays single-table topics in parallel up to a cutoff LSN, '
+                        '"follow" reads the all-changes topic in order to maintain FK constraints, '
+                        '"redo_from_beginning" drops FKs, truncates tables, clears progress, and replays from '
+                        'topic beginning up to a cutoff, '
+                        '"redo_continue" resumes an interrupted redo without re-truncating (safe to run repeatedly)')
+    p.add_argument('--all-changes-topic',
+                   default=os.environ.get('ALL_CHANGES_TOPIC'),
+                   help='Name of the unified all-changes topic containing messages from all tables in LSN order')
+    p.add_argument('--replay-to',
+                   default=os.environ.get('REPLAY_TO'),
+                   help='Manual cutoff as "0x<lsn>:<command_id>" (inclusive). Overrides automatic cutoff in any mode.')
+
+    opts, _ = p.parse_known_args()
+
+    if not (opts.kafka_bootstrap_servers and opts.schema_registry_url and opts.target_db_server and
+            opts.target_db_user and opts.target_db_password and opts.target_db_database):
+        raise Exception('Arguments kafka_bootstrap_servers, schema_registry_url, target_db_server, '
+                        'target_db_user, target_db_password, and target_db_database are all required.')
+
+    if not opts.all_changes_topic:
+        raise Exception('Argument --all-changes-topic is required.')
+
+    # Parse --replay-to into (lsn_str, command_id_int) tuple if provided
+    if opts.replay_to:
+        try:
+            lsn_part, cmd_id_part = opts.replay_to.rsplit(':', 1)
+            if not lsn_part.startswith('0x'):
+                raise ValueError('LSN must start with 0x')
+            opts.replay_to = (lsn_part, int(cmd_id_part))
+        except (ValueError, IndexError) as e:
+            raise Exception(f'Invalid --replay-to format "{opts.replay_to}". '
+                            f'Expected "0x<lsn>:<command_id>", e.g. "0x00000035000172B00036:5". Error: {e}')
+    else:
+        opts.replay_to = None
+
+    # Parse --allowed-extra-message-values into a set of normalized (schema, table, column) triples.
+    # Strip square brackets and lowercase everything for case-insensitive matching.
+    def _strip_brackets(s: str) -> str:
+        return s.strip().strip('[]')
+
+    allowed_extra: set = set()
+    raw_allowed = opts.allowed_extra_message_values or ''
+    for entry in raw_allowed.split(','):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split('.')
+        if len(parts) != 3:
+            raise Exception(
+                f'Invalid --allowed-extra-message-values entry "{entry}": expected `<schema>.<table>.<column>`.')
+        allowed_extra.add(tuple(_strip_brackets(p).lower() for p in parts))
+    opts.allowed_extra_message_values = allowed_extra
+
+    replay_configs: List[ReplayConfig] = []
+
+    if opts.topic_to_table_map:
+        topic_map = json.loads(opts.topic_to_table_map)
+        for topic, table_info in topic_map.items():
+            config = ReplayConfig(
+                replay_topic=topic,
+                target_db_table_schema=table_info.get('schema', 'dbo'),
+                target_db_table_name=table_info['table'],
+                cols_to_not_sync=table_info.get('cols_to_not_sync', ''),
+                primary_key_fields_override=table_info.get('primary_key_fields_override', '')
+            )
+            replay_configs.append(config)
+    elif opts.replay_topic and opts.target_db_table_schema and opts.target_db_table_name:
+        config = ReplayConfig(
+            replay_topic=opts.replay_topic,
+            target_db_table_schema=opts.target_db_table_schema,
+            target_db_table_name=opts.target_db_table_name,
+            cols_to_not_sync=opts.cols_to_not_sync,
+            primary_key_fields_override=opts.primary_key_fields_override
+        )
+        replay_configs.append(config)
+    else:
+        raise Exception('Either --topic-to-table-map OR (--replay-topic, --target-db-table-schema, '
+                        'and --target-db-table-name) must be provided.')
+
+    logger.info(f"Starting CDC replayer in {opts.mode} mode with {len(replay_configs)} topic(s).")
+
+    if opts.mode == 'backfill':
+        run_backfill_mode(opts, replay_configs)
+    elif opts.mode == 'follow':
+        run_follow_mode(opts, replay_configs)
+    elif opts.mode == 'redo_from_beginning':
+        run_redo_from_beginning_mode(opts, replay_configs)
+    elif opts.mode == 'redo_continue':
+        run_redo_continue_mode(opts, replay_configs)
+
+
+if __name__ == '__main__':
+    main()

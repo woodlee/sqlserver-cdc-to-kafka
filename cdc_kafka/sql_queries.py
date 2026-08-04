@@ -245,9 +245,9 @@ WITH ct AS (
     SELECT *
     FROM {fq_change_table_name} AS ct WITH (NOLOCK)
     WHERE ct.__$start_lsn = @LSN AND ct.__$command_id > @COMMAND_ID AND ct.__$start_lsn <= @MAX_LSN
-    
+
     UNION ALL
-    
+
     SELECT *
     FROM {fq_change_table_name} AS ct WITH (NOLOCK)
     WHERE ct.__$start_lsn > @LSN AND ct.__$start_lsn <= @MAX_LSN

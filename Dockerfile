@@ -27,6 +27,7 @@ RUN pip install --no-cache-dir --upgrade pip \
   && pip install --no-cache-dir .[replayer]
 
 COPY cdc_kafka cdc_kafka
+COPY replayer replayer
 
 ENTRYPOINT ["dumb-init", "--rewrite", "15:2", "--"]
 CMD ["python", "-m", "cdc_kafka"]
